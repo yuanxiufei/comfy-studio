@@ -9,11 +9,17 @@ let cachedScript: string | null = null
  * python, see `lib/comfy_studio`). All the actual work — MCP servers, skill
  * catalog, the LLM loop — happens in that host; this file is just the surface.
  *
- * Turn model: one turn at a time. `agent/event` notifications are not addressed
- * to a specific turn (they carry the request id, not something the surface
- * tracks), so the drawer only paints events while a turn is in flight and
- * ignores `final` — the final answer already comes back as the request result,
- * and painting both would duplicate it.
+ * Turn model: one turn at a time. `agent/event` notifications carry a session id
+ * rather than a turn id, so the drawer paints events only while one of its turns
+ * is in flight, and only those of the session it talks to. `final` is deliberately
+ * left unpainted: the same text comes back as the request result, and painting
+ * both would duplicate it.
+ *
+ * Rendering: an event is a node and each kind draws itself. The host's stream is
+ * coarse — narration, tool call, tool result — not token-by-token, so nothing
+ * here fakes a token stream. A tool result pairs with its call by the `id` both
+ * events carry, so it updates the card that call opened instead of appending a
+ * second row; long arguments and results fold behind a button.
  *
  * The header carries a model picker (`agent/models` for the catalog, then
  * `agent/model` to switch). Switching is disabled mid-turn: the host replaces the
@@ -38,6 +44,52 @@ var SURFACE = 'var(--interface-panel-surface, var(--comfy-menu-bg,#202020))';
 var BORDER = 'var(--border-color,#4e4e4e)';
 var INPUT_BG = 'var(--comfy-input-bg,#333)';
 
+var STYLE_ID = 'comfy-desktop-studio-chat-style';
+
+// 消息区的样式走一张 <style>，不走内联：一行/一张卡的状态是会变的
+// （工具从"运行中"到"完成/失败"），内联只能靠改 style 一条条追，而
+// [data-state=...] 这种选择器写不出来。这跟参考实现里 data-streaming /
+// data-state 驱动样式的约定是一回事。
+// 全部规则都收在 #DRAWER_ID 下面，不往托管页面上撒全局类名。
+var CHAT_CSS =
+  '@keyframes cs-pulse{0%,100%{opacity:.25}50%{opacity:1}}' +
+  '#' + DRAWER_ID + '{--cs-radius:6px;--cs-mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}' +
+  '#' + DRAWER_ID + ' .cs-row{white-space:pre-wrap;word-break:break-word;padding:6px 8px;border-radius:var(--cs-radius);}' +
+  '#' + DRAWER_ID + ' .cs-user{align-self:flex-end;max-width:85%;background:var(--comfy-input-bg,#3a3a3a);}' +
+  '#' + DRAWER_ID + ' .cs-agent{align-self:flex-start;max-width:90%;background:transparent;}' +
+  // 最终答案是这一轮的主角（narration 只是过程中的话），给它加一条左侧标记
+  '#' + DRAWER_ID + ' .cs-agent[data-variant="final"]{border-left:2px solid ' + BORDER + ';padding-left:8px;}' +
+  '#' + DRAWER_ID + ' .cs-error{align-self:stretch;color:#ff8080;border:1px solid #ff808055;background:#ff80800f;}' +
+  '#' + DRAWER_ID + ' .cs-pending{align-self:flex-start;display:flex;align-items:center;gap:6px;color:' + MUTED + ';font-size:12px;}' +
+  '#' + DRAWER_ID + ' .cs-pending .cs-dot{animation:cs-pulse 1.2s ease-in-out infinite;}' +
+  '#' + DRAWER_ID + ' .cs-tool{align-self:stretch;border:1px solid ' + BORDER + ';padding:0;overflow:hidden;}' +
+  '#' + DRAWER_ID + ' .cs-tool-head{display:flex;align-items:center;gap:6px;width:100%;box-sizing:border-box;' +
+  'border:none;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer;padding:6px 8px;}' +
+  '#' + DRAWER_ID + ' .cs-tool-head:hover{background:' + INPUT_BG + ';}' +
+  '#' + DRAWER_ID + ' .cs-dot{flex:none;width:7px;height:7px;border-radius:50%;background:' + MUTED + ';}' +
+  '#' + DRAWER_ID + ' .cs-tool[data-state="running"] .cs-dot{background:#e0b400;animation:cs-pulse 1.2s ease-in-out infinite;}' +
+  '#' + DRAWER_ID + ' .cs-tool[data-state="done"] .cs-dot{background:#3fa34d;}' +
+  '#' + DRAWER_ID + ' .cs-tool[data-state="error"] .cs-dot{background:#d9534f;}' +
+  '#' + DRAWER_ID + ' .cs-tool-name{font-family:var(--cs-mono);font-size:12px;}' +
+  '#' + DRAWER_ID + ' .cs-tool-server{color:' + MUTED + ';font-size:11px;}' +
+  '#' + DRAWER_ID + ' .cs-tool-state{margin-left:auto;color:' + MUTED + ';font-size:11px;white-space:nowrap;}' +
+  '#' + DRAWER_ID + ' .cs-tool[data-state="error"] .cs-tool-state{color:#ff8080;}' +
+  '#' + DRAWER_ID + ' .cs-tool-body{border-top:1px solid ' + BORDER + ';padding:6px 8px;}' +
+  '#' + DRAWER_ID + ' .cs-tool[data-collapsed="1"] .cs-tool-body{display:none;}' +
+  '#' + DRAWER_ID + ' .cs-block-label{color:' + MUTED + ';font-size:11px;margin:4px 0 2px;}' +
+  '#' + DRAWER_ID + ' .cs-block{margin:0;font-family:var(--cs-mono);font-size:11px;white-space:pre-wrap;' +
+  'word-break:break-word;max-height:220px;overflow:auto;}' +
+  '#' + DRAWER_ID + ' .cs-block-more{border:1px solid ' + BORDER + ';border-radius:4px;background:transparent;' +
+  'color:' + MUTED + ';cursor:pointer;font:inherit;font-size:11px;padding:1px 6px;margin-top:4px;}';
+
+function ensureStyle() {
+  if (document.getElementById(STYLE_ID)) return;
+  var style = document.createElement('style');
+  style.id = STYLE_ID;
+  style.textContent = CHAT_CSS;
+  (document.head || document.body).appendChild(style);
+}
+
 function message(err) {
   if (!err) return '未知错误';
   if (typeof err === 'string') return err;
@@ -51,6 +103,7 @@ function truncate(text, max) {
 // ---- 抽屉 --------------------------------------------------------------
 
 function buildDrawer() {
+  ensureStyle();
   var drawer = document.createElement('aside');
   drawer.id = DRAWER_ID;
   drawer.style.cssText =
@@ -195,26 +248,204 @@ function refreshModelEnabled() {
   setModelEnabled(!STATE.busy && model.options.length > 0);
 }
 
-function appendMessage(kind, text) {
-  var log = document.getElementById(LOG_ID);
-  if (!log) return null;
+// ---- 消息节点 ----------------------------------------------------------
+//
+// 一种事件 = 一种节点，各画各的（跟参考实现里 kind → 渲染器那张表一个意思）。
+// 关键的一条：**节点才是唯一真相**，事件来了改已有节点，而不是永无止境地往下
+// 追加行。工具调用就是最明显的例子——事件里带 id，调用与它的结果配对成同一张
+// 卡：结果回来时改那张卡的状态与正文。早先的写法把两者画成两条互不相干的等宽
+// 文本行，靠人脑去对齐 id。
+
+//: 卡里正文默认铺多少字符，超出给一个"展开全部"。
+var RESULT_FOLD = 600;
+var ARGS_FOLD = 1200;
+
+function logEl() {
+  return document.getElementById(LOG_ID);
+}
+
+// 用户往上翻着看历史时，别拿新行把他拽回底部。
+function scrollLog(log) {
+  if (log.scrollHeight - log.scrollTop - log.clientHeight < 40) {
+    log.scrollTop = log.scrollHeight;
+  }
+}
+
+function makeRow(kind) {
   var row = document.createElement('div');
   row.setAttribute('data-kind', kind);
-  var base = 'white-space:pre-wrap;word-break:break-word;padding:6px 8px;border-radius:6px;';
-  if (kind === 'user') {
-    row.style.cssText = base + 'align-self:flex-end;max-width:85%;background:var(--comfy-input-bg,#3a3a3a);';
-  } else if (kind === 'agent') {
-    row.style.cssText = base + 'align-self:flex-start;max-width:90%;background:transparent;';
-  } else if (kind === 'tool') {
-    row.style.cssText =
-      base + 'align-self:flex-start;max-width:90%;color:' + MUTED + ';font-family:monospace;font-size:11px;';
-  } else {
-    row.style.cssText = base + 'align-self:stretch;color:#ff8080;';
-  }
-  row.textContent = text;
-  log.appendChild(row);
-  log.scrollTop = log.scrollHeight;
+  row.className = 'cs-row cs-' + kind;
   return row;
+}
+
+// 在飞的"正在思考"标记永远占最后一行：新节点插在它前面，它掉到哪儿都还是末尾。
+function appendNode(row) {
+  var log = logEl();
+  if (!log) return null;
+  var pending = STATE.pending;
+  if (pending && pending.parentNode === log) log.insertBefore(row, pending);
+  else log.appendChild(row);
+  scrollLog(log);
+  return row;
+}
+
+function addUser(text) {
+  var row = makeRow('user');
+  row.textContent = text;
+  return appendNode(row);
+}
+
+function addPending() {
+  var log = logEl();
+  if (!log || STATE.pending) return STATE.pending;
+  var row = makeRow('pending');
+  var dot = document.createElement('span');
+  dot.className = 'cs-dot';
+  var label = document.createElement('span');
+  label.textContent = '正在思考…';
+  row.appendChild(dot);
+  row.appendChild(label);
+  log.appendChild(row);
+  scrollLog(log);
+  STATE.pending = row;
+  return row;
+}
+
+function removePending() {
+  var row = STATE.pending;
+  STATE.pending = null;
+  if (row && row.parentNode) row.parentNode.removeChild(row);
+}
+
+// variant: final = 这一轮的回答，intermediate = 过程中的话（模型一边要工具一边说的）
+function addAssistant(text, variant) {
+  var row = makeRow('assistant');
+  row.setAttribute('data-variant', variant || 'intermediate');
+  row.textContent = text;
+  return appendNode(row);
+}
+
+function addError(text, code) {
+  var row = makeRow('error');
+  row.textContent = text;
+  if (typeof code === 'number') {
+    row.setAttribute('data-error-code', String(code));
+    row.textContent = text + '（错误码 ' + code + '）';
+  }
+  return appendNode(row);
+}
+
+// 一段可能很长的正文：默认折叠，点一下展开全部（原文不动，只改显示）。
+function makeBlock(label, text, fold) {
+  var wrap = document.createElement('div');
+  var head = document.createElement('div');
+  head.className = 'cs-block-label';
+  head.textContent = label;
+  var pre = document.createElement('pre');
+  pre.className = 'cs-block';
+  pre.textContent = truncate(text, fold);
+  wrap.appendChild(head);
+  wrap.appendChild(pre);
+  if (text.length > fold) {
+    var more = document.createElement('button');
+    more.type = 'button';
+    more.className = 'cs-block-more';
+    more.textContent = '展开全部（' + text.length + ' 字符）';
+    more.addEventListener('click', function () {
+      pre.textContent = text;
+      if (more.parentNode) more.parentNode.removeChild(more);
+    });
+    wrap.appendChild(more);
+  }
+  return wrap;
+}
+
+// 工具名是 <server>__<tool>；分开显示，好认是哪个 server 报上来的
+function splitToolName(name) {
+  var at = name.indexOf('__');
+  if (at <= 0) return { server: '', tool: name };
+  return { server: name.slice(0, at), tool: name.slice(at + 2) };
+}
+
+function makeToolCard(params) {
+  var name = String((params && params.name) || '未知工具');
+  var parts = splitToolName(name);
+  var card = makeRow('tool');
+  card.setAttribute('data-tool', name);
+  card.setAttribute('data-state', 'running');
+
+  var head = document.createElement('button');
+  head.type = 'button';
+  head.className = 'cs-tool-head';
+  head.setAttribute('aria-expanded', 'true');
+
+  var dot = document.createElement('span');
+  dot.className = 'cs-dot';
+  head.appendChild(dot);
+
+  if (parts.server) {
+    var server = document.createElement('span');
+    server.className = 'cs-tool-server';
+    server.textContent = parts.server;
+    head.appendChild(server);
+  }
+  var label = document.createElement('span');
+  label.className = 'cs-tool-name';
+  label.textContent = parts.tool;
+  head.appendChild(label);
+
+  var state = document.createElement('span');
+  state.className = 'cs-tool-state';
+  state.textContent = '运行中…';
+  head.appendChild(state);
+
+  var body = document.createElement('div');
+  body.className = 'cs-tool-body';
+
+  head.addEventListener('click', function () {
+    var collapsed = card.getAttribute('data-collapsed') === '1';
+    card.setAttribute('data-collapsed', collapsed ? '0' : '1');
+    head.setAttribute('aria-expanded', collapsed ? 'true' : 'false');
+  });
+
+  card.appendChild(head);
+  card.appendChild(body);
+  card.csBody = body;
+  card.csState = state;
+  return card;
+}
+
+function addToolCall(params) {
+  var card = makeToolCard(params);
+  if (params && params.id != null) STATE.cards[String(params.id)] = card;
+  if (params && params.arguments) {
+    card.csBody.appendChild(makeBlock('参数', JSON.stringify(params.arguments, null, 2), ARGS_FOLD));
+  }
+  return appendNode(card);
+}
+
+// 工具执行失败不算协议错误：宿主把 isError 的结果标成 "ERROR: ..." 文本喂回来
+// （见 lib/comfy_studio/mcp/result.py 的 tool_text），这里按同一个约定上红点。
+function addToolResult(params) {
+  var id = params && params.id != null ? String(params.id) : '';
+  var card = id ? STATE.cards[id] : null;
+  var orphan = false;
+  if (!card) {
+    // 结果没配上前面的调用：不静默丢，单独画一张并说明它没配上。
+    orphan = true;
+    card = makeToolCard(params);
+    card.setAttribute('data-orphan', '1');
+    card.setAttribute('data-collapsed', '0');
+    appendNode(card);
+  }
+  var text = String((params && params.text) || '');
+  var failed = text.indexOf('ERROR:') === 0;
+  // 状态与文案只在这一处定：先写一句再被下面盖掉，就白写了。
+  card.setAttribute('data-state', failed ? 'error' : 'done');
+  card.csState.textContent = (failed ? '失败' : '完成') + (orphan ? '（没等到调用事件）' : '');
+  card.csBody.appendChild(makeBlock('结果', text, RESULT_FOLD));
+  scrollLog(logEl());
+  return card;
 }
 
 // ---- 模型切换 ----------------------------------------------------------
@@ -283,7 +514,7 @@ function switchModel(name) {
       if (!response || response.ok !== true) {
         var error = (response && response.error) || {};
         model.value = previous;
-        appendMessage('error', '切换模型失败: ' + (error.message || '未知错误'));
+        addError('切换模型失败: ' + (error.message || '未知错误'), error.code);
         setStatus('模型仍是 ' + (previous || '未知'), 'error');
         return;
       }
@@ -299,7 +530,7 @@ function switchModel(name) {
     },
     function (err) {
       model.value = previous;
-      appendMessage('error', '切换模型失败: ' + message(err));
+      addError('切换模型失败: ' + message(err));
       setStatus('模型仍是 ' + (previous || '未知'), 'error');
     }
   ).then(settle, settle);
@@ -311,17 +542,19 @@ function onEvent(payload) {
   // 只有一轮在跑：这期间来的事件都属于它。
   if (!STATE.turn) return;
   var params = (payload && payload.params) || {};
+  // 宿主上的会话可以不止一条，事件自带 session_id：别的会话在跑，别画进这个抽屉。
+  if (params.session_id && params.session_id !== STATE.session) return;
   var type = params.type;
   if (type === 'assistant') {
-    appendMessage('agent', String(params.text || ''));
+    addAssistant(String(params.text || ''), 'intermediate');
     return;
   }
   if (type === 'tool_call') {
-    appendMessage('tool', '调用 ' + params.name + ' ' + JSON.stringify(params.arguments || {}));
+    addToolCall(params);
     return;
   }
   if (type === 'tool_result') {
-    appendMessage('tool', '← ' + truncate(String(params.text || ''), 400));
+    addToolResult(params);
     return;
   }
   // final 不画：最终文本由请求结果给，画两遍就重复了。
@@ -338,12 +571,17 @@ function sendTurn() {
   setSendEnabled(false);
   refreshModelEnabled(); // 一轮在飞时不换模型，免得把这一轮打断
   input.value = '';
-  appendMessage('user', text);
+  addUser(text);
   setStatus('agent 正在处理…');
 
   STATE.turn = {};
+  STATE.cards = {};
+  addPending();
   var finish = function () {
+    // 收尾统一摘掉"正在思考"：成功时回答已经插在它前面，失败时错误行也是。
+    removePending();
     STATE.turn = null;
+    STATE.cards = {};
     STATE.busy = false;
     setSendEnabled(true);
     refreshModelEnabled();
@@ -353,16 +591,16 @@ function sendTurn() {
     function (response) {
       if (!response || response.ok !== true) {
         var error = (response && response.error) || {};
-        appendMessage('error', '失败: ' + (error.message || '未知错误'));
+        addError('失败: ' + (error.message || '未知错误'), error.code);
         setStatus('这一轮失败了', 'error');
         return;
       }
       var answer = response.result && response.result.text;
-      appendMessage('agent', typeof answer === 'string' ? answer : JSON.stringify(response.result));
+      addAssistant(typeof answer === 'string' ? answer : JSON.stringify(response.result), 'final');
       setStatus('就绪');
     },
     function (err) {
-      appendMessage('error', '失败: ' + message(err));
+      addError('失败: ' + message(err));
       setStatus('这一轮失败了', 'error');
     }
   ).then(finish, finish);
@@ -500,7 +738,8 @@ export function getComfyStudioChatContentScript(): string {
     `if (typeof window === 'undefined' || !window.__comfyDesktop2) return;\n` +
     `if (!window.__comfyDesktop2.ComfyStudio) return;\n` +
     `if (window.__comfyStudioChat) return;\n` +
-    `window.__comfyStudioChat = { started: false, open: false, busy: false, turn: null, model: '' };\n` +
+    `window.__comfyStudioChat = { started: false, open: false, busy: false, turn: null, ` +
+    `model: '', session: 'default', pending: null, cards: {} };\n` +
     STUDIO_CHAT_MAIN_JS +
     `})();\n`
   return cachedScript

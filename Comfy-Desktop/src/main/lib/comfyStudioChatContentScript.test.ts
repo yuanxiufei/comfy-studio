@@ -187,13 +187,13 @@ describe('getComfyStudioChatContentScript', () => {
 
     expect(bridge.request).toHaveBeenCalledWith('agent/chat', { text: '帮我把这张图放大两倍' })
     expect(rows('user').map((r) => r.textContent)).toEqual(['帮我把这张图放大两倍'])
-    expect(rows('agent').map((r) => r.textContent)).toEqual(['答案在此'])
+    expect(rows('assistant').map((r) => r.textContent)).toEqual(['答案在此'])
     const input = document.getElementById(INPUT_ID) as HTMLTextAreaElement
     expect(input.value, 'composer is cleared after sending').toBe('')
     expect((document.getElementById(SEND_ID) as HTMLButtonElement).disabled).toBe(false)
   })
 
-  it('paints assistant/tool events of the running turn but not the duplicate final', async () => {
+  it('marks the turn in flight and paints the final answer as the final node', async () => {
     installBridge()
     setupDom()
     new Function(script)()
@@ -203,23 +203,134 @@ describe('getComfyStudioChatContentScript', () => {
     input.value = '跑个 skill'
     document.getElementById(SEND_ID)?.click() // 不 await：先让这一轮处于在飞行中
 
-    emit({
-      params: { type: 'assistant', text: '先查一下可用的 skill' }
-    })
-    emit({
-      params: { type: 'tool_call', name: 'comfy-studio__comfy_list_skills', arguments: {} }
-    })
-    emit({
-      params: { type: 'tool_result', name: 'comfy-studio__comfy_list_skills', text: '[{...}]' }
-    })
-    emit({ params: { type: 'final', text: '答案在此' } })
+    expect(rows('pending'), 'a turn in flight says where the answer will land').toHaveLength(1)
+
+    emit({ params: { session_id: 'default', type: 'assistant', text: '先查一下可用的 skill' } })
+    emit({ params: { session_id: 'default', type: 'final', text: '答案在此' } })
 
     await flush()
 
-    expect(rows('agent').map((r) => r.textContent)).toEqual(['先查一下可用的 skill', '答案在此'])
-    const toolRows = rows('tool').map((r) => r.textContent ?? '')
-    expect(toolRows[0]).toContain('comfy-studio__comfy_list_skills')
-    expect(toolRows[1]).toContain('←')
+    expect(rows('pending'), 'the pending row goes away when the turn settles').toHaveLength(0)
+    // final 事件本身不画：同一段文本由请求结果带回，画两遍就重复了
+    expect(rows('assistant').map((r) => r.textContent)).toEqual(['先查一下可用的 skill', '答案在此'])
+    expect(rows('assistant')[0]?.getAttribute('data-variant')).toBe('intermediate')
+    expect(rows('assistant')[1]?.getAttribute('data-variant')).toBe('final')
+  })
+
+  it('pairs a tool result with the card its call opened', async () => {
+    installBridge()
+    setupDom()
+    new Function(script)()
+    await openPanel()
+
+    const input = document.getElementById(INPUT_ID) as HTMLTextAreaElement
+    input.value = '跑个 skill'
+    document.getElementById(SEND_ID)?.click() // 不 await：这一轮在飞行中
+
+    emit({
+      params: {
+        session_id: 'default',
+        type: 'tool_call',
+        id: 'call_1',
+        name: 'comfy-studio__comfy_list_skills',
+        arguments: { limit: 5 }
+      }
+    })
+
+    expect(rows('tool'), 'one card per call').toHaveLength(1)
+    const card = rows('tool')[0]
+    if (!card) throw new Error('Expected a tool card')
+    expect(card.getAttribute('data-state'), 'a call with no result yet is running').toBe('running')
+    expect(card.querySelector('.cs-tool-server')?.textContent).toBe('comfy-studio')
+    expect(card.querySelector('.cs-tool-name')?.textContent).toBe('comfy_list_skills')
+    expect(card.querySelector('.cs-block')?.textContent, 'arguments are shown').toContain('"limit": 5')
+
+    emit({
+      params: {
+        session_id: 'default',
+        type: 'tool_result',
+        id: 'call_1',
+        name: 'comfy-studio__comfy_list_skills',
+        text: '[{...}]'
+      }
+    })
+
+    expect(rows('tool'), 'the result updates that card instead of adding a row').toHaveLength(1)
+    expect(card.getAttribute('data-state')).toBe('done')
+    expect(card.querySelector('.cs-tool-state')?.textContent).toBe('完成')
+    expect(card.textContent).toContain('[{...}]')
+  })
+
+  it('flags a failed tool result, and keeps one whose call never arrived', async () => {
+    installBridge()
+    setupDom()
+    new Function(script)()
+    await openPanel()
+
+    const input = document.getElementById(INPUT_ID) as HTMLTextAreaElement
+    input.value = '跑个 skill'
+    document.getElementById(SEND_ID)?.click() // 不 await：这一轮在飞行中
+
+    emit({ params: { session_id: 'default', type: 'tool_call', id: 'call_1', name: 'srv__run', arguments: {} } })
+    // 宿主把 isError 的结果标成 "ERROR: ..." 文本喂回来（mcp/result.py 的 tool_text）
+    emit({
+      params: { session_id: 'default', type: 'tool_result', id: 'call_1', name: 'srv__run', text: 'ERROR: 显存不够' }
+    })
+
+    expect(rows('tool')[0]?.getAttribute('data-state')).toBe('error')
+    expect(rows('tool')[0]?.querySelector('.cs-tool-state')?.textContent).toBe('失败')
+
+    emit({ params: { session_id: 'default', type: 'tool_result', id: 'call_9', name: 'srv__run', text: '结果' } })
+
+    const cards = rows('tool')
+    expect(cards, 'a result without its call must not be dropped').toHaveLength(2)
+    expect(cards[1]?.getAttribute('data-orphan')).toBe('1')
+    expect(cards[1]?.textContent).toContain('没等到调用事件')
+  })
+
+  it('folds a long tool result behind a button instead of losing it', async () => {
+    installBridge()
+    setupDom()
+    new Function(script)()
+    await openPanel()
+
+    const input = document.getElementById(INPUT_ID) as HTMLTextAreaElement
+    input.value = '跑个 skill'
+    document.getElementById(SEND_ID)?.click() // 不 await：这一轮在飞行中
+
+    const long = 'x'.repeat(700)
+    emit({ params: { session_id: 'default', type: 'tool_call', id: 'call_1', name: 'srv__run', arguments: {} } })
+    emit({ params: { session_id: 'default', type: 'tool_result', id: 'call_1', name: 'srv__run', text: long } })
+
+    const card = rows('tool')[0]
+    if (!card) throw new Error('Expected the tool card')
+    const blocks = (): string[] =>
+      Array.from(card.querySelectorAll('.cs-block')).map((b) => b.textContent ?? '')
+    const more = card.querySelector('.cs-block-more') as HTMLButtonElement | null
+    expect(more?.textContent, 'the button says how much is hidden').toContain('700')
+    expect(blocks()[blocks().length - 1]?.length, 'the card shows a folded copy').toBeLessThan(
+      long.length
+    )
+
+    more?.click()
+
+    expect(blocks()[blocks().length - 1], 'expanding shows the whole text').toBe(long)
+    expect(card.querySelector('.cs-block-more')).toBeNull()
+  })
+
+  it('ignores events belonging to another session', async () => {
+    installBridge()
+    setupDom()
+    new Function(script)()
+    await openPanel()
+
+    const input = document.getElementById(INPUT_ID) as HTMLTextAreaElement
+    input.value = '你好'
+    document.getElementById(SEND_ID)?.click() // 不 await：这一轮在飞行中
+
+    emit({ params: { session_id: 'someone-else', type: 'assistant', text: '别的会话的话' } })
+
+    expect(rows('assistant'), 'another session is not this drawer turn').toHaveLength(0)
   })
 
   it('ignores host events when no turn is in flight', async () => {
@@ -241,7 +352,8 @@ describe('getComfyStudioChatContentScript', () => {
 
     await send('你好')
 
-    expect(rows('error').map((r) => r.textContent)).toEqual(['失败: 模型没配'])
+    expect(rows('error').map((r) => r.textContent)).toEqual(['失败: 模型没配（错误码 -32603）'])
+    expect(rows('error')[0]?.getAttribute('data-error-code')).toBe('-32603')
     expect(document.getElementById(STATUS_ID)?.textContent).toContain('失败')
   })
 
@@ -352,7 +464,9 @@ describe('getComfyStudioChatContentScript', () => {
     await flush()
 
     expect(picker.value, 'selection falls back to the model actually in use').toBe('a:3b')
-    expect(rows('error').map((r) => r.textContent)).toEqual(['切换模型失败: 没有这个模型'])
+    expect(rows('error').map((r) => r.textContent)).toEqual([
+      '切换模型失败: 没有这个模型（错误码 -32602）'
+    ])
     expect(picker.disabled).toBe(false)
   })
 
