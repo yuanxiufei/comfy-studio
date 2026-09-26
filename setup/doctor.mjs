@@ -12,7 +12,7 @@ import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
-import { inspect } from './lib/overlay.mjs'
+import { gitTry, inspect, loadManifest, planSide } from './lib/overlay.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const repoRoot = path.dirname(here)
@@ -98,6 +98,32 @@ try {
   }
 } catch (err) {
   check('覆盖层可核对', false, String(err?.message ?? err), '先跑 npm run attach -- --check 看覆盖层清单')
+}
+
+// 覆盖层里的每个文件都必须被父仓跟踪 —— 这是"自己方代码不会丢"的全部依据。
+// 引擎侧的落点正好落在 ComfyUI/.gitignore 的 /custom_nodes/ 里面：往 studio/overlay
+// 新加一个文件、attach 装进检出之后，git status 看不到它，不手工 git add -f 就会静默漏掉，
+// 于是老问题在新文件上复发。这里机械核对，不靠人记。
+try {
+  for (const side of loadManifest(repoRoot).sides) {
+    const plan = planSide(repoRoot, side)
+    const tracked = new Set(
+      gitTry(['ls-files', '-z', '--', side.checkout], repoRoot).out.split('\0').filter(Boolean)
+    )
+    const rel = plan.files.map((f) => `${side.checkout}/${f.rel}`)
+    const untracked = rel.filter((p) => !tracked.has(p))
+    check(
+      `${side.checkout} 覆盖层已被父仓跟踪`,
+      untracked.length === 0,
+      untracked.length === 0
+        ? `${rel.length}/${rel.length}`
+        : `${rel.length - untracked.length}/${rel.length}，没被跟踪 ${untracked.length} 个：` +
+          `${untracked.slice(0, 3).join('、')}${untracked.length > 3 ? ' …' : ''}`,
+      `逐个 git add -f <文件>：${side.checkout}/ 落在上游 .gitignore 里，普通 git add 加不上`
+    )
+  }
+} catch (err) {
+  check('覆盖层入库状态可核对', false, String(err?.message ?? err), '先跑 npm run attach -- --check 看覆盖层清单')
 }
 
 console.log('\n== 后端：ComfyUI 引擎 ==')

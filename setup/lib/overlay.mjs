@@ -71,10 +71,13 @@ function sha256(file) {
 export function gitTry(args, cwd) {
   try {
     const out = execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
-    return { ok: true, out: out.trim() }
+    return { ok: true, code: 0, out: out.trim() }
   } catch (err) {
+    // out 失败时是 stderr/stdout/err.message 拼的"给人看"的串，别当命令输出用。
+    // code 才是 git 的退出码：有些查询把非 0 当"正常空结果"（check-ignore 的 1 =
+    // 一个都没被忽略），调用方必须能把它和真出错分开。
     const detail = [err?.stderr, err?.stdout, err?.message].filter(Boolean).join(' ').trim()
-    return { ok: false, out: detail }
+    return { ok: false, code: typeof err?.status === 'number' ? err.status : null, out: detail }
   }
 }
 
@@ -218,6 +221,25 @@ function backupBeforeDamage(repoRoot, entries, kind) {
   return dir
 }
 
+/**
+ * 这批文件里哪些被 git 忽略（父仓工作树口径）。
+ * 被忽略的新文件连 git status 都不显示，必须显式 git add -f —— 所以要把它们挑出来点名，
+ * 否则"自己方代码不会丢"只对已入库的旧文件成立，新文件会静默漏掉。
+ *
+ * 返回 null = 没能确认（git check-ignore 非正常退出）：调用方必须显式报出来，
+ * 不许当成"一个都没被忽略"——那正好是把新文件放跑的方向。
+ */
+function ignoredAmong(repoRoot, checkout, rels) {
+  if (rels.length === 0) return []
+  const paths = rels.map((rel) => `${checkout}/${rel}`)
+  const r = gitTry(['check-ignore', '--', ...paths], repoRoot)
+  if (r.ok) return r.out.split('\n').filter(Boolean)
+  // 退出码 1 是正常"空结果"：没有任何路径被 .gitignore 匹配上。
+  // 不能拿 r.out 判断：失败时它是 "Command failed: …" 那段给人看的串，会被当成忽略名单。
+  if (r.code === 1) return []
+  return null
+}
+
 function removeEmptyDirs(dirs, stopAt) {
   const sorted = [...new Set(dirs)].sort((a, b) => b.length - a.length)
   for (const dir of sorted) {
@@ -316,6 +338,7 @@ export function attach(repoRoot, { force = false, rebaseline = false, log = cons
     }
     let written = 0
     let kept = 0
+    const created = []
     for (const f of plan.files) {
       if (f.state === 'same') {
         kept++
@@ -324,6 +347,7 @@ export function attach(repoRoot, { force = false, rebaseline = false, log = cons
       fs.mkdirSync(path.dirname(f.dst), { recursive: true })
       fs.copyFileSync(f.src, f.dst)
       written++
+      if (f.state === 'missing') created.push(f.rel)
     }
     let patched = 0
     for (const p of plan.patches) {
@@ -341,9 +365,25 @@ export function attach(repoRoot, { force = false, rebaseline = false, log = cons
     )
     if (plan.mode === 'embedded' && (written > 0 || patched > 0)) {
       log(
-        `[!]    ${plan.side.checkout} 的内容由父仓跟踪：这次落盘会显示成父仓的改动` +
-          `（在仓库根跑 git status -- ${plan.side.checkout} 能看到），确认无误就连同 studio/ 一起提交`
+        `[!]    ${plan.side.checkout} 的内容由父仓跟踪：已跟踪文件那部分改动在仓库根用` +
+          ` git status -- ${plan.side.checkout} 能看到，确认无误就连同 studio/ 一起提交`
       )
+      const ignored = ignoredAmong(repoRoot, plan.side.checkout, created)
+      if (ignored === null) {
+        // 这是装配完之后的提醒，不是装配本身：确认不了就明说，别让 attach 拿它假装成功，
+        // 也别因为一句提醒失败就把已装好的结果否掉。真门禁在 npm run doctor（它按父仓
+        // 跟踪状态判，不依赖 .gitignore，确认不出来的情况它照样抓得到）。
+        log(
+          `[!]    没能确认这批新文件会不会被上游 .gitignore 吞掉（git check-ignore 非正常退出）。\n` +
+            `      别跳过：跑 npm run doctor，它按父仓跟踪状态核对覆盖层里每个文件都被跟踪。`
+        )
+      } else if (ignored.length > 0) {
+        log(
+          `[!]    另有 ${ignored.length} 个新文件落在上游 .gitignore 的忽略范围里 —— 那些连\n` +
+            `      git status 都不显示，不显式强加就会静默漏掉（老问题会只在新文件上复发）。现在就加：\n` +
+            `      git add -f ${ignored.join(' ')}`
+        )
+      }
     }
   }
 }
