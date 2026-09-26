@@ -2,21 +2,22 @@
   "name": "comfy-studio",
   "version": "0.1.0",
   "private": true,
-  "description": "ComfyUI 桌面工作台：画布 + Agent/Skill 双模式的本地整合方案",
-  "workspaces": [
-    "packages/*",
-    "apps/*"
-  ],
-  "scripts": {
-    "build": "npm run build -w comfy-sdk && npm run build -w comfy-skills && npm run build -w comfy-mcp && npm run build -w @comfy-studio/desktop",
-    "app": "npm run build && npm run start --workspace @comfy-studio/desktop",
-    "mcp": "node packages/comfy-mcp/dist/index.js",
-    "typecheck": "npm run typecheck --workspaces"
-  },
-  "devDependencies": {
-    "typescript": "^5.6.0"
-  },
+  "type": "module",
+  "description": "ComfyUI（引擎）+ Comfy-Desktop（桌面壳）打通成的工作台",
   "engines": {
-    "node": ">=18.17.0"
+    "node": ">=22"
+  },
+  "scripts": {
+    "setup": "powershell -NoProfile -ExecutionPolicy Bypass -File setup/install-engine.ps1",
+    "setup:desktop": "pnpm --dir Comfy-Desktop install",
+    "setup:all": "npm run setup && npm run setup:desktop",
+    "seed": "node setup/seed-desktop.mjs",
+    "dev": "npm run seed && pnpm --dir Comfy-Desktop dev",
+    "engine": "node setup/run-engine.mjs",
+    "engine:help": "node setup/run-engine.mjs --help",
+    "mcp": "node setup/run-mcp.mjs",
+    "studio": "node setup/run-studio.mjs",
+    "doctor": "node setup/doctor.mjs",
+    "clear:web-cache": "node setup/clear-web-cache.mjs"
   }
 }

@@ -1,0 +1,117 @@
+- main [ref=e9]:
+  - generic [ref=e11]:
+    - text: .. .. ..
+    - generic:
+      - generic:
+        - generic [ref=e14]:
+          - group [ref=e18]:
+            - button "Unsaved Workflow" [pressed] [ref=e19] [cursor=pointer]:
+              - generic [ref=e22]: Unsaved Workflow
+          - button "创建空白工作流" [ref=e25] [cursor=pointer]:
+            - generic [ref=e26]: 
+          - button "登录" [ref=e28] [cursor=pointer]
+        - generic:
+          - navigation [ref=e31]:
+            - generic [ref=e32]:
+              - generic [ref=e33]:
+                - img [ref=e37] [cursor=pointer]
+                - button "资产（a）" [ref=e39] [cursor=pointer]
+                - button "节点库（n）" [ref=e43] [cursor=pointer]
+                - button "模型库（m）" [ref=e47] [cursor=pointer]
+                - button "工作流（w）" [ref=e51] [cursor=pointer]
+                - button "应用" [ref=e55] [cursor=pointer]
+                - button "模板" [ref=e59] [cursor=pointer]
+              - generic [ref=e63]:
+                - button "帮助中心" [ref=e64] [cursor=pointer]:
+                  - generic [ref=e67]: 
+                - button "底部面板" [ref=e68] [cursor=pointer]
+                - button "键盘快捷键 (Ctrl + Shift + k)" [ref=e72] [cursor=pointer]
+                - button "设置 (Ctrl + ,)" [ref=e76] [cursor=pointer]
+          - generic:
+            - generic:
+              - generic:
+                - generic:
+                  - generic:
+                    - generic:
+                      - group "工作流操作" [ref=e80]:
+                        - generic [ref=e81]:
+                          - button "进入应用模式" [ref=e82] [cursor=pointer]:
+                            - generic:
+                              - generic: 应用
+                          - button "图形模式，工作流操作" [ref=e85] [cursor=pointer]:
+                            - generic [ref=e88]: 图形
+                      - text: 
+                  - generic [ref=e91]:
+                    - generic [ref=e94]:
+                      - button "ComfyUI Manager" [ref=e95] [cursor=pointer]:
+                        - generic [ref=e96]: 󰐱
+                        - generic [ref=e97]: Manager
+                      - button "Show favorite custom node list" [ref=e98] [cursor=pointer]:
+                        - generic [ref=e99]: 󰓎
+                      - button "Unload Models" [ref=e100] [cursor=pointer]:
+                        - generic [ref=e101]: 󱦢
+                      - button "Free model and node cache" [ref=e102] [cursor=pointer]:
+                        - generic [ref=e103]: 󱦡
+                      - button "Share" [ref=e104] [cursor=pointer]:
+                        - generic [ref=e105]: 󰒖
+                    - region [ref=e108]:
+                      - generic [ref=e110]:
+                        - generic [ref=e111]: .. .. ..
+                        - generic [ref=e112]:
+                          - generic "批次数量" [ref=e113]:
+                            - generic [ref=e114]:
+                              - textbox "批次数量" [ref=e115]: "1"
+                              - generic [ref=e116]:
+                                - button "增加" [ref=e117] [cursor=pointer]:
+                                  - img
+                                - button "减小" [disabled]:
+                                  - img
+                          - button "运行" [ref=e118] [cursor=pointer]: 运行
+                          - button "运行选项" [ref=e120] [cursor=pointer]:
+                            - img
+                        - button "取消当前任务" [disabled]
+                        - button "0 个活动任务 展开任务队列" [ref=e121] [cursor=pointer]:
+                          - generic [ref=e122]: 0 个活动任务
+                          - generic [ref=e123]: 展开任务队列
+              - generic:
+                - generic:
+                  - toolbar "画布工具栏" [ref=e124]:
+                    - button "画布模式" [ref=e125] [cursor=pointer]
+                    - button "适应视图 (.)" [ref=e131] [cursor=pointer]
+                    - button "缩放控制" [ref=e133] [cursor=pointer]:
+                      - generic [ref=e135]: 90%
+                    - button "隐藏小地图 (ALT + SHIFT + M)" [ref=e138] [cursor=pointer]
+                    - button "隐藏链接" [ref=e140] [cursor=pointer]
+                  - generic [ref=e143]:
+                    - button "设置" [ref=e144] [cursor=pointer]
+                    - button "关闭" [ref=e146] [cursor=pointer]
+                    - separator [ref=e148]
+                - text: 
+            - separator [ref=e150]
+            - generic [ref=e153]:
+              - generic [ref=e154]:
+                - generic [ref=e155]:
+                  - heading "工作流总览" [level=3] [ref=e156]
+                  - button "开关属性面板" [pressed] [ref=e158] [cursor=pointer]
+                - navigation [ref=e160]:
+                  - tablist [ref=e161]:
+                    - tab "参数" [selected] [ref=e162] [cursor=pointer]
+                    - tab "节点" [ref=e163] [cursor=pointer]
+                    - tab "全局设置" [ref=e164] [cursor=pointer]
+              - generic [ref=e165]:
+                - textbox [ref=e169]:
+                  - /placeholder: 搜索 ...
+                - generic [ref=e171]:
+                  - button "暂无已收藏输入" [disabled] [ref=e173]:
+                    - generic [ref=e177]: 暂无已收藏输入
+                  - generic [ref=e179]:
+                    - paragraph [ref=e180]: 你收藏的输入会显示在这里
+                    - paragraph [ref=e181]:
+                      - text: 在参数标签页，点击任意输入项的
+                      - text: 可将其添加到这里
+    - generic:
+      - generic "The text to be encoded." [ref=e185]:
+        - textbox "text" [ref=e186]: anime RPG game style, cute anime girl with gigantic fennec ears and a big fluffy fox tail with long wavy blonde hair and large blue eyes blonde colored eyelashes wearing a pink sweater a large oversized gold trimmed black winter coat and a long blue maxi skirt and a red scarf, she is sitting beside a campfire in the wilderness at night playing guitar with a milky way galaxy sky
+      - generic "The text to be encoded." [ref=e187]:
+        - textbox "text" [ref=e188]: low quality, bad anatomy, extra digits, missing digits, extra limbs, missing limbs
+  - text: 
