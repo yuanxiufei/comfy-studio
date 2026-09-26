@@ -109,6 +109,10 @@ export function resolveStudioCommand(installation: InstallationRecord): ComfyStu
       // Same for `plan__submit` / `plan__progress`: the panel paints the step
       // list and posts the verdict back through `agent/plan_result`.
       '--plan'
+      // Long-term memory is deliberately absent here: nobody has to answer it
+      // (it is a JSON file under the user's data dir), so the host turns it on
+      // by itself. `--memory-dir` / `--no-memory` exist for builds that need to
+      // move or drop it.
     ],
     cwd: getBundledLibDir(),
     comfyuiDir

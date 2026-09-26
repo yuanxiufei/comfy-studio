@@ -106,6 +106,20 @@ agent / skill / mcp 三件能力**前后端各有一份**，按各自项目里�
   filename）、`localfiles__read_text` 读本机文本。它不推事件、不等谁回话，只要
   `--comfyui-dir` 给了就挂上；换过引擎的 `--input-directory` / `--output-directory` 时
   用 `--input-dir` / `--output-dir`（或 `COMFY_INPUT_DIR` / `COMFY_OUTPUT_DIR`）跟着指。
+* `memory.py` —— 跨会话的长期记忆：会话历史只活在宿主进程里，宿主一退出就没了，于是
+  "我喜欢方形构图"、"这台是 24G 的 4090"这类话每次都得重说。这里用三张工具把它记下来：
+  `memory__remember`（一条只说一件事，内容重复不会记两条）、`memory__recall`（不给关键词就
+  列最近的，给了就只回匹配的）、`memory__forget`（删记错/过时的，id 从 recall 拿）。
+  除了工具，它还会把 :meth:`MemoryStore.digest` 拼进**系统提示词**，而且
+  `AgentSession.ask` 每轮重算一次 —— 这一轮刚记住的事，下一轮人设里就有，不用模型自己
+  想起来去查；素材多了才靠 `memory__recall` 挑（提示词里只放最近 20 条 / 1200 字，超出的
+  部分会如实写明"另有 N 条"）。它同样不推事件、不等谁回话，**默认就开着**：一份 JSON 落在
+  用户数据目录（Windows `%APPDATA%\comfy-studio\memory.json`），`--memory-dir`（或
+  `COMFY_STUDIO_MEMORY_DIR`）换地方，`--no-memory` 整个关掉。放在**用户目录**而不是
+  ComfyUI 检出里是有意的：检出和 `.venv` 随时可以删掉重建，用户的记性不该跟着一起没。
+  文件坏了（不是 JSON / 版本不认识 / 形状不对）会**报错而不是静默重建** —— 悄悄从空开始
+  会变成"助手莫名其妙把记性丢了"，比报错难查；`host/info` 里会如实报出 `memory_file`、
+  `memory_entries` 与 `memory_error`（记忆坏了也不挡握手，否则连"记忆坏了"这句话都传不到面板上）。
 
 对话要模型，配在环境变量里（不落盘、不进仓库）：`COMFY_STUDIO_LLM_MODEL`（必填）、
 `COMFY_STUDIO_LLM_BASE_URL`、`COMFY_STUDIO_LLM_API_KEY`。没配的话 `agent/config` 会明确
@@ -142,6 +156,15 @@ agent / skill / mcp 三件能力**前后端各有一份**，按各自项目里�
 `plan__submit` 拆出几步交给你过目（要好几步才能做完的事尤其如此）；你点了「就按这个来」，
 它才开跑，并逐步用 `plan__progress` 在清单上打勾。已经在清楚地下命令（"用 SDXL 跑 4 张"）
 就不用麻烦这一趟 —— 这条只用在"听得出要干什么、看不出该怎么落地"的时候。
+
+它还认得你：说"记住我喜欢方形构图"，模型会 `memory__remember` 记下来（面板上就是一张
+`memory__remember` 工具卡，返回的 id 写在结果里），**关掉面板、重启宿主、换一天再来**，
+你问"你记得我什么"它照样答得出来 —— 那条偏好每轮都拼在系统提示词里，不必先查。想删就说
+"忘掉那条方形构图的"，它会 `memory__recall` 找到 id 再 `memory__forget` 删掉。什么该记
+（问过的偏好、惯用的模型和尺寸、这台机器的显卡）什么不该记（一次性的临时要求、密钥之类的
+敏感信息、敏感内容）都写在那三张工具的描述里 —— 那是模型判断的唯一依据。记忆档就是
+`%APPDATA%\comfy-studio\memory.json`（Linux/macOS 按各自惯例的用户数据目录），一个能直接
+打开看的 JSON，想清空就关掉宿主把文件删了。
 
 ## 打通是怎么做到的
 
@@ -213,7 +236,8 @@ cd ComfyUI/custom_nodes
 ```powershell
 cd Comfy-Desktop/lib
 ..\..\ComfyUI\.venv\Scripts\python.exe -m unittest comfy_studio.tests.test_host_e2e -v
-# 纯逻辑用例（本机文件 / 计划通道，不拉子进程）：test_local_files.py、test_plan_tools.py
+# 纯逻辑用例（本机文件 / 计划通道 / 长期记忆，不拉子进程）：
+# test_local_files.py、test_plan_tools.py、test_memory_tools.py
 ..\..\ComfyUI\.venv\Scripts\python.exe -m unittest discover -s comfy_studio/tests
 ```
 
@@ -223,6 +247,15 @@ cd Comfy-Desktop/lib
 回程那三条通道各有端到端用例：审核（问完真的停住等人答）、本机素材进出（素材真落进
 `input/`、产出报回盘上的真实路径）、计划（一句想法拆成清单等人点头、点头后才逐步播报），
 测试自己就是那个"桌面壳"，收事件再按 RPC 把结果送回去。
+长期记忆那条也一样：这一轮说"记住…"（假模型真的调 `memory__remember`），断言 `memory.json`
+里确实多了那条（换个进程再读也在）、`host/info` 如实报出文件与条数，下一轮**不调任何工具**
+也答得出 —— 也就是"每轮重算人设"这条路真通了（真假模型的系统提示词里都带着它）。
+e2e 壳启动宿主时给记忆目录一个临时目录（`--memory-dir`），免得测试去动开发机上真人那份。
+`test_memory_tools.py` 另外把存储层的硬约束钉住：重复内容不记两条、条数上限满了明确拒绝、
+`recall` 只读不写盘、坏文件报错且原样留着不重建、提示词那段的条数与字数上限、以及
+`compose_system_prompt` 里收尾要求永远在最后一条。
 桌面壳自己的 TypeScript 侧测试走 `pnpm test`（新增面板脚本的用例在
 `src/main/lib/comfyStudioChatContentScript.test.ts`，含模型下拉：填充、切换、
-被拒时回滚、一轮在飞时禁用；以及审核卡与计划清单卡：画清单、点头/要改、进度打勾）。
+被拒时回滚、一轮在飞时禁用；以及审核卡与计划清单卡：画清单、点头/要改、进度打勾。
+长期记忆没加面板代码：`memory__remember` / `__recall` / `__forget` 就是普通工具调用，
+抽屉里那套工具卡本来就会把参数与返回的 id 画出来 —— 另起一条提示条是同一份信息的重复）。

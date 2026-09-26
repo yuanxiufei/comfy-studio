@@ -37,13 +37,23 @@ from __future__ import annotations
 
 import sys
 from dataclasses import replace
-from typing import Any
+from typing import Any, Callable
 
-from .agent import AgentError, AgentSession, LLMConfig, LLMError, OpenAIChatClient, create_session
+from .agent import (
+    DEFAULT_SYSTEM_PROMPT,
+    AgentError,
+    AgentSession,
+    LLMConfig,
+    LLMError,
+    OpenAIChatClient,
+    compose_system_prompt,
+    create_session,
+)
 from .canvas import CanvasChannel, CanvasClient
 from .cancel import CancelToken, Cancelled
 from .channel import bind_emit, unbind_emit
 from .localfiles import LocalFiles, LocalFilesClient
+from .memory import MemoryClient, MemoryStore, MemoryStoreError, memory_home
 from .mcp import McpHub, McpServerConfig
 from .plan import PlanChannel, PlanClient
 from .review import ReviewChannel, ReviewClient
@@ -92,6 +102,7 @@ class StudioHost:
         review: ReviewChannel | None = None,
         plan: PlanChannel | None = None,
         local_files: LocalFilesClient | None = None,
+        memory: MemoryClient | None = None,
     ) -> None:
         self.hub = hub
         self.catalog = catalog
@@ -106,6 +117,9 @@ class StudioHost:
         self.plan = plan
         #: 本机文件工具（知道 ComfyUI 装在哪才有）；None 时工具表里不会有 localfiles__*。
         self.local_files = local_files
+        #: 跨会话的长期记忆（默认就有，`--no-memory` 关掉）；None 时工具表里不会有 memory__*，
+        #: 系统提示词里也不会带"你记得什么"那一段。
+        self.memory = memory
         #: 面板里切过的模型；None = 用环境变量里那个（进程内有效，不落盘）。
         self.default_model: str | None = None
         self._sessions: dict[str, AgentSession] = {}
@@ -138,6 +152,7 @@ class StudioHost:
 
     def info(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
         _object(params, "host/info")
+        memory_entries, memory_error = self._memory_status()
         return {
             "name": SERVER_NAME,
             "version": SERVER_VERSION,
@@ -153,6 +168,10 @@ class StudioHost:
             "review": self.review is not None,
             "plan": self.plan is not None,
             "local_files": self.local_files is not None,
+            "memory": self.memory is not None,
+            "memory_file": str(self.memory.store.path) if self.memory is not None else None,
+            "memory_entries": memory_entries,
+            "memory_error": memory_error,
         }
 
     def mcp_servers(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
@@ -400,6 +419,31 @@ class StudioHost:
         config = self._llm_config()
         return replace(config, model=self._selected_model(config))
 
+    def _memory_status(self) -> tuple[int | None, str | None]:
+        """记忆的条数与读盘错误，供 ``host/info`` 如实报出。
+
+        读不了时**不抛**：连握手都失败了，面板就没法把"记忆文件坏了"这句话传到界面上，
+        用户只会看到助手连不上。错误照样报出来（``memory_error``），只是不拿它挡门。
+        """
+        if self.memory is None:
+            return None, None
+        try:
+            return self.memory.store.count, None
+        except MemoryStoreError as err:
+            return None, str(err)
+
+    def _prompt_source(self) -> str | Callable[[], str]:
+        """会话的人设来源。
+
+        挂了记忆时给一个**每次重算**的零参函数（:meth:`AgentSession.ask` 每轮都会叫它）：
+        这一轮刚记下的偏好，下一轮就得出现在提示词里，否则模型得自己想起来去 recall。
+        没挂记忆时就是一份固定人设，行为与从前完全一样。
+        """
+        if self.memory is None:
+            return DEFAULT_SYSTEM_PROMPT
+        store = self.memory.store
+        return lambda: compose_system_prompt(store.digest())
+
     def _session(self, session_id: str) -> AgentSession:
         existing = self._sessions.get(session_id)
         if existing is not None:
@@ -410,7 +454,9 @@ class StudioHost:
                 f"会话数已达上限 {self.max_sessions}；先 agent/reset 掉不用的，或复用已有 session_id",
             )
         try:
-            session = create_session(self.hub, config=self._session_config())
+            session = create_session(
+                self.hub, system_prompt=self._prompt_source(), config=self._session_config()
+            )
         except (LLMError, AgentError) as err:
             raise RpcError(INTERNAL_ERROR, str(err)) from err
         self._sessions[session_id] = session
@@ -443,6 +489,8 @@ async def serve_stdio(
     plan: bool = False,
     input_dir: str | None = None,
     output_dir: str | None = None,
+    memory: bool = True,
+    memory_dir: str | None = None,
 ) -> None:
     """拉起全部 MCP server，然后在 stdin/stdout 上服务到 EOF。
 
@@ -454,6 +502,9 @@ async def serve_stdio(
     本机文件那几张（:mod:`comfy_studio.localfiles`）不需要谁接话，只要 ``comfyui_dir``
     给了就挂上；``input_dir`` / ``output_dir`` 用来对应引擎启动参数
     ``--input-directory`` / ``--output-directory``（默认就是 comfyui_dir 下的同名目录）。
+    长期记忆（:mod:`comfy_studio.memory`）同样不需要谁接话，而且它是这个工作台该有的
+    记性，所以**默认开着**：一份落在用户数据目录的 JSON，``memory_dir`` 换地方，
+    ``memory=False`` 整个关掉（工具表里就没有 memory__* 了）。
     """
     canvas_channel = CanvasChannel() if canvas else None
     review_channel = ReviewChannel() if review else None
@@ -462,6 +513,9 @@ async def serve_stdio(
         LocalFilesClient(LocalFiles(comfyui_dir, input_dir=input_dir, output_dir=output_dir))
         if comfyui_dir
         else None
+    )
+    memory_client = (
+        MemoryClient(MemoryStore(memory_dir or memory_home())) if memory else None
     )
     extra: list[Any] = []
     if canvas_channel is not None:
@@ -472,6 +526,8 @@ async def serve_stdio(
         extra.append(PlanClient(plan_channel))
     if local_files is not None:
         extra.append(local_files)
+    if memory_client is not None:
+        extra.append(memory_client)
     hub = McpHub(configs, request_timeout=request_timeout, extra_clients=extra)
     await hub.start()
     host: StudioHost | None = None
@@ -485,6 +541,7 @@ async def serve_stdio(
             review=review_channel,
             plan=plan_channel,
             local_files=local_files,
+            memory=memory_client,
         )
         # stdin 一关（面板退出）就先叫停在飞的轮次，别让退出卡在长任务上。
         host.server.on_close = lambda: host.cancel_turns("宿主退出")

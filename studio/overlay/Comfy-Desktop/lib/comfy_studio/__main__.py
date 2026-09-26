@@ -97,6 +97,23 @@ def build_parser() -> argparse.ArgumentParser:
             "引擎用 --output-directory 改过时才需要给"
         ),
     )
+    parser.add_argument(
+        "--no-memory",
+        action="store_true",
+        help=(
+            "关掉长期记忆（memory__* 工具与系统提示词里的记忆段）。"
+            "默认是开的：记忆落在用户数据目录，见 --memory-dir"
+        ),
+    )
+    parser.add_argument(
+        "--memory-dir",
+        default=None,
+        help=(
+            "长期记忆的存放目录（memory.json 落在里面）；"
+            "默认按操作系统惯例取用户数据目录（也可用 COMFY_STUDIO_MEMORY_DIR）。"
+            "记忆是**用户级**的：放在这里而不是 ComfyUI 检出里，换个检出也还认得你"
+        ),
+    )
     return parser
 
 
@@ -125,6 +142,8 @@ def main(argv: list[str] | None = None) -> int:
                 plan=args.plan,
                 input_dir=args.input_dir or os.environ.get("COMFY_INPUT_DIR"),
                 output_dir=args.output_dir or os.environ.get("COMFY_OUTPUT_DIR"),
+                memory=not args.no_memory,
+                memory_dir=args.memory_dir or os.environ.get("COMFY_STUDIO_MEMORY_DIR"),
             )
         )
     except KeyboardInterrupt:  # 桌面壳正常退出时是关掉 stdin，这条只为手动 Ctrl+C

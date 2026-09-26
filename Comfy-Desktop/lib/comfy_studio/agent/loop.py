@@ -23,12 +23,13 @@ from ..mcp import McpError, McpHub, McpTool, tool_text
 from .llm import LLMConfig, LLMError, OpenAIChatClient
 from .types import ChatMessage, ToolCall, system_message, tool_message, user_message
 
-#: 面板里对话时的默认人设。
-DEFAULT_SYSTEM_PROMPT = (
+#: 面板里对话时的默认人设（规则部分）。各能力可以往后面插自己的补充段，
+#: 收尾要求永远排在最后 —— 见 :func:`compose_system_prompt`。
+BASE_SYSTEM_PROMPT = (
     "你是运行在用户电脑上的 ComfyUI 助手，工作在一个叫 comfy-studio 的桌面工作台里。"
     "能用哪些工具以工具列表为准，大致包括：查本机模型、列出/运行/保存 skill（参数化工作流模板）、"
     "提交工作流、查看队列与历史、中断任务、读写用户本机的文件，"
-    "以及（若已开启）在画布上摆放、向用户提问、把一句想法拆成多步计划。\n"
+    "以及（若已开启）在画布上摆放、向用户提问、把一句想法拆成多步计划、记住用户的偏好。\n"
     "规则：\n"
     "1) 需要模型文件名时先用模型列表工具查，不要凭空编造文件名；\n"
     "2) 不确定某个 skill 有哪些参数时先列一遍 skill；\n"
@@ -41,9 +42,25 @@ DEFAULT_SYSTEM_PROMPT = (
     "7) 用户提到的本机文件走 localfiles 那几张工具：要当素材（参考图/音视频）先用 "
     "localfiles__import_file 接进 input，再把返回的 value 填进对应节点字段 —— "
     "ComfyUI 的加载类节点认不了磁盘绝对路径；问「产出存哪了」用 localfiles__list_files 查真实路径，"
-    "别拿 filename 拼；要读提示词之类的文本才用 localfiles__read_text；\n"
-    "8) 拿到结果后用一句中文总结，图片用返回的 url 原样给出。"
+    "别拿 filename 拼；要读提示词之类的文本才用 localfiles__read_text。"
 )
+
+#: 收尾要求：不管插进来多少补充段，它都在最后一条 —— 免得被补充段淹掉。
+CLOSING_SYSTEM_PROMPT = "拿到结果后用一句中文总结，图片用返回的 url 原样给出。"
+
+#: 一个补充段都不插时的人设，就是它。
+DEFAULT_SYSTEM_PROMPT = f"{BASE_SYSTEM_PROMPT}\n\n{CLOSING_SYSTEM_PROMPT}"
+
+
+def compose_system_prompt(*sections: str) -> str:
+    """默认人设 + 各能力自己的补充段，收尾要求排在最后。
+
+    补充段由能力自己写（记忆那边是 :meth:`comfy_studio.memory.MemoryStore.digest`）：
+    "某段话该放在提示词的哪个位置"只由这里说了算，能力只管自己那段读得通、说得对。
+    空段直接跳过，免得提示词里多出空行。
+    """
+    extra = [section.strip() for section in sections if section and section.strip()]
+    return "\n\n".join([BASE_SYSTEM_PROMPT, *extra, CLOSING_SYSTEM_PROMPT])
 
 #: 一次 ask 里最多允许几轮「模型要工具 → 执行」。
 DEFAULT_MAX_STEPS = 8
@@ -97,7 +114,7 @@ class AgentSession:
         hub: McpHub,
         tools: list[McpTool],
         llm: OpenAIChatClient | None = None,
-        system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+        system_prompt: str | Callable[[], str] = DEFAULT_SYSTEM_PROMPT,
         max_steps: int = DEFAULT_MAX_STEPS,
         max_parallel_tools: int = DEFAULT_MAX_PARALLEL_TOOLS,
     ) -> None:
@@ -110,8 +127,18 @@ class AgentSession:
         self.llm = llm if llm is not None else OpenAIChatClient(LLMConfig.from_env())
         self.max_steps = max_steps
         self.max_parallel_tools = max_parallel_tools
+        #: 人设文本，或者一个**每次重算**它的零参函数（记忆那种每轮都在变的补充段要用它）。
+        self.system_prompt = system_prompt
         self._schemas = tool_schemas(tools)
-        self.messages: list[ChatMessage] = [system_message(system_prompt)]
+        self.messages: list[ChatMessage] = [system_message(self._system_text())]
+
+    def _system_text(self) -> str:
+        """当前的人设文本。是可调用对象时现算一次 —— 于是这一轮刚记住的事，下一轮就在提示词里。"""
+        source = self.system_prompt
+        text = source() if callable(source) else source
+        if not isinstance(text, str) or text.strip() == "":
+            raise AgentError("system_prompt 算出来是空的：补充段或人设本身不对劲")
+        return text
 
     @property
     def model(self) -> str:
@@ -256,6 +283,8 @@ class AgentSession:
         被真的放弃，历史补齐后抛 :class:`~comfy_studio.cancel.Cancelled`。会话本身**仍然
         可用**——历史是配对的，用户可以接着问下一句。
         """
+        # 人设每轮重算一次：上一轮刚记下的偏好，这一轮就得看得见（记忆是这么进提示词的）。
+        self.messages[0] = system_message(self._system_text())
         self.messages.append(user_message(text))
 
         async def report_retry(attempt: int, total: int, delay: float, reason: str) -> None:
@@ -295,7 +324,7 @@ class AgentSession:
 def create_session(
     hub: McpHub,
     tools: list[McpTool] | None = None,
-    system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+    system_prompt: str | Callable[[], str] = DEFAULT_SYSTEM_PROMPT,
     max_steps: int = DEFAULT_MAX_STEPS,
     max_parallel_tools: int = DEFAULT_MAX_PARALLEL_TOOLS,
     config: LLMConfig | None = None,
@@ -304,6 +333,7 @@ def create_session(
 
     不给 ``config`` 就读环境变量（默认模型）；调用方想在 env 之外再指定模型
     （面板里切过的那种）就自己传一份 ``LLMConfig`` 进来。
+    ``system_prompt`` 也可以给一个零参函数（每轮重算，见 :meth:`AgentSession._system_text`）。
     """
     return AgentSession(
         hub,
@@ -319,11 +349,14 @@ __all__ = [
     "AgentError",
     "AgentEvent",
     "AgentSession",
+    "BASE_SYSTEM_PROMPT",
+    "CLOSING_SYSTEM_PROMPT",
     "DEFAULT_MAX_PARALLEL_TOOLS",
     "DEFAULT_MAX_STEPS",
     "DEFAULT_SYSTEM_PROMPT",
     "EventListener",
     "LLMError",
+    "compose_system_prompt",
     "create_session",
     "tool_schemas",
 ]

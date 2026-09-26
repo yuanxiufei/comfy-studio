@@ -75,6 +75,10 @@ class _FakeCompletions(BaseHTTPRequestHandler):
         {"title": "先用 SDXL 出一版草稿", "tool": "comfy_run_skill"},
         "再把草稿放大到 2K",
     ]
+    #: 长期记忆用例：先说一句"记住…"，下一轮（同一会话）不调工具也该说得出这条偏好。
+    REMEMBER_MARKER = "记住这个"
+    RECALL_MARKER = "你记得我什么"
+    MEMORY_TEXT = "用户喜欢方形构图（1:1）"
     SAVE_SKILL = {
         "id": "e2e-saved",
         "title": "对话里存下来的",
@@ -254,6 +258,40 @@ class _FakeCompletions(BaseHTTPRequestHandler):
                 message = {"role": "assistant", "content": f"用户要改：{verdict['feedback']}"}
             else:
                 message = {"role": "assistant", "content": f"按计划开工（approved={verdict['approved']}）"}
+        elif self.REMEMBER_MARKER in _last_user_text(messages):
+            # 长期记忆用例的前半：把用户那句话交给 memory__remember 记下来，再念出拿到的 id。
+            tool_messages = [m for m in messages if m.get("role") == "tool"]
+            if tool_messages:
+                payload = json.loads(tool_messages[0]["content"])
+                message = {"role": "assistant", "content": f"记住了，id 是 {payload['id']}"}
+            else:
+                fact = _last_user_text(messages).split(self.REMEMBER_MARKER, 1)[1].strip()
+                message = {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_remember",
+                            "type": "function",
+                            "function": {
+                                "name": "memory__remember",
+                                "arguments": json.dumps(
+                                    {"text": fact, "tags": ["偏好"]}, ensure_ascii=False
+                                ),
+                            },
+                        }
+                    ],
+                }
+        elif self.RECALL_MARKER in _last_user_text(messages):
+            # 长期记忆用例的后半：这一轮**一个工具都不调**。能说出那条偏好，只可能是宿主
+            # 把它拼进了系统提示词；说不出来就老老实实回一句找不到，别编。
+            system = next(
+                (str(m.get("content") or "") for m in messages if m.get("role") == "system"), ""
+            )
+            if self.MEMORY_TEXT in system:
+                message = {"role": "assistant", "content": self.MEMORY_TEXT}
+            else:
+                message = {"role": "assistant", "content": "系统提示词里没有这条记忆"}
         else:
             tool_messages = [m for m in messages if m.get("role") == "tool"]
             if tool_messages:
@@ -314,6 +352,10 @@ class StudioHostE2ETest(unittest.TestCase):
         cls.input_dir = cls.files_root / "input"
         cls.output_dir = cls.files_root / "output"
         cls.output_dir.mkdir(parents=True)
+        # 长期记忆默认落在**用户数据目录**（开发机上就是你自己的那份记忆）：这个测试壳
+        # 也要记忆是真的落盘，所以给它一个临时目录，别去动真人的记性。
+        cls._memory_tmp = tempfile.TemporaryDirectory(prefix="comfy-studio-memory-")
+        cls.memory_dir = Path(cls._memory_tmp.name)
         cls.llm = ThreadingHTTPServer(("127.0.0.1", 0), _FakeCompletions)
         threading.Thread(target=cls.llm.serve_forever, daemon=True).start()
         port = cls.llm.server_address[1]
@@ -339,6 +381,9 @@ class StudioHostE2ETest(unittest.TestCase):
                 str(cls.input_dir),
                 "--output-dir",
                 str(cls.output_dir),
+                # 记忆默认就开着（它是工作台该有的记性），只是把落点换成临时目录。
+                "--memory-dir",
+                str(cls.memory_dir),
             ],
             cwd=str(LIB_DIR),
             stdin=subprocess.PIPE,
@@ -368,6 +413,7 @@ class StudioHostE2ETest(unittest.TestCase):
         cls.llm.shutdown()
         cls._skills_tmp.cleanup()
         cls._files_tmp.cleanup()
+        cls._memory_tmp.cleanup()
 
     @classmethod
     def _pump_stdout(cls) -> None:
@@ -449,6 +495,9 @@ class StudioHostE2ETest(unittest.TestCase):
         self.assertIn("review__ask_user", names)
         self.assertIn("plan__submit", names)
         self.assertIn("plan__progress", names)
+        self.assertIn("memory__remember", names)
+        self.assertIn("memory__recall", names)
+        self.assertIn("memory__forget", names)
         # 每把工具都严格是 <server>__<tool>：回程那条通道（review）也不破例。
         for tool in tools:
             self.assertTrue(tool["qualified_name"].startswith(f"{tool['server']}__"), tool)
@@ -736,6 +785,51 @@ class StudioHostE2ETest(unittest.TestCase):
         # 幂等：这一轮早不等了，晚了再点一遍只是白点，不是错误。
         late = self.call(36, "agent/plan_result", {"call_id": call_id, "approved": True})
         self.assertIs(late.get("result", {}).get("delivered"), False, late)
+
+    def test_20_the_assistant_remembers_the_user_across_turns(self) -> None:
+        """长期记忆：这一轮记下的偏好，下一轮不必查、也照样认得（且在盘上找得到）。"""
+        memory_file = self.memory_dir / "memory.json"
+        self.assertFalse(memory_file.exists(), "跑之前不该有记忆文件")
+
+        session = "memory-e2e"
+        self.send(
+            37,
+            "agent/chat",
+            {
+                "text": f"{_FakeCompletions.REMEMBER_MARKER} {_FakeCompletions.MEMORY_TEXT}",
+                "session_id": session,
+            },
+        )
+        reply = self.wait(37, SKILLS_TIMEOUT)
+        self.assertNotIn("error", reply, reply)
+        # 模型真的调到了 memory__remember（工具表里那一栏是真的），并且拿到了 id。
+        self.assertIn("记住了", reply.get("result", {}).get("text", ""), reply)
+
+        # 落了盘：宿主换个进程再开，这份记忆还在（这里直接读那份文件）。
+        self.assertTrue(memory_file.exists(), f"没写出记忆文件：{memory_file}")
+        raw = json.loads(memory_file.read_text(encoding="utf-8"))
+        self.assertEqual([e["text"] for e in raw["entries"]], [_FakeCompletions.MEMORY_TEXT])
+        self.assertEqual(raw["entries"][0]["tags"], ["偏好"])
+
+        # 宿主如实报出记忆放在哪、有几条 —— 面板与用户都能知道自己的记性存在哪。
+        info = self.call(38, "host/info", {}).get("result", {})
+        self.assertIs(info.get("memory"), True)
+        self.assertEqual(info.get("memory_file"), str(memory_file))
+        self.assertEqual(info.get("memory_entries"), 1)
+        self.assertIsNone(info.get("memory_error"))
+
+        # 同一会话接着问：这一轮**一个工具都不调**（假模型不会调），能说出那条偏好只可能
+        # 因为宿主把它拼进了系统提示词 —— "每轮重算人设"这条路真的通了。
+        self.send(39, "agent/chat", {"text": _FakeCompletions.RECALL_MARKER, "session_id": session})
+        second = self.wait(39, SKILLS_TIMEOUT)
+        self.assertNotIn("error", second, second)
+        self.assertEqual(second.get("result", {}).get("text", ""), _FakeCompletions.MEMORY_TEXT)
+        calls = [
+            e["params"]["name"]
+            for e in self.notifications(39)
+            if e["params"].get("type") == "tool_call"
+        ]
+        self.assertEqual(calls, [], "这一轮不该有任何工具调用：记忆是从提示词里知道的")
 
 
 if __name__ == "__main__":
