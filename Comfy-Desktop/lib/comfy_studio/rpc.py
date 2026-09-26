@@ -61,6 +61,10 @@ class StdioRpcServer:
         self._server_info = dict(server_info)
         self._handlers: dict[str, RpcHandler] = {}
         self._write_lock = asyncio.Lock()
+        #: stdin 一关就调一次（在等剩余任务之前）。用来叫停在飞的长任务——否则
+        #: 关面板时一轮跑 skill 的对话会让退出卡到工具的 1800 秒超时上。
+        #: 返回值忽略；返回 awaitable 会被 await。
+        self.on_close: Callable[[], Any] | None = None
 
     def on(self, method: str, handler: RpcHandler) -> "StdioRpcServer":
         self._handlers[method] = handler
@@ -85,6 +89,10 @@ class StdioRpcServer:
                 tasks.add(task)
                 task.add_done_callback(tasks.discard)
         finally:
+            if self.on_close is not None:
+                closed = self.on_close()
+                if asyncio.iscoroutine(closed):
+                    await closed
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
 

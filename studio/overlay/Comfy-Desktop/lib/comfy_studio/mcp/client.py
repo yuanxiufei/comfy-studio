@@ -14,7 +14,10 @@ import asyncio
 import json
 import os
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any
+
+from ..cancel import CancelToken, Cancelled, race
 
 
 class McpError(RuntimeError):
@@ -145,7 +148,11 @@ class McpStdioClient:
             msg_id = message.get("id")
             future = self._pending.pop(msg_id, None) if msg_id is not None else None
             if future is None:
-                continue  # notification 或已经超时丢掉的响应
+                continue  # notification 或已经超时/取消丢掉的响应
+            if future.done():
+                # 被超时或取消先一步收掉的响应，晚到了就当没看见：不检查的话
+                # set_result 会抛 InvalidStateError，把这个读循环整个打死。
+                continue
             if "error" in message:
                 error = message["error"] or {}
                 future.set_exception(
@@ -166,7 +173,13 @@ class McpStdioClient:
         self._proc.stdin.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
         await self._proc.stdin.drain()
 
-    async def _request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def _request(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        cancel: CancelToken | None = None,
+    ) -> dict[str, Any]:
         if self._proc is None:
             raise McpError(f"MCP server {self.config.name} 没有在运行")
         self._next_id += 1
@@ -175,13 +188,40 @@ class McpStdioClient:
         self._pending[request_id] = future
         await self._write({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}})
         try:
-            result = await asyncio.wait_for(future, timeout=self.request_timeout)
+            result = await race(
+                partial(asyncio.wait_for, future, timeout=self.request_timeout),
+                cancel,
+                what=f"MCP {method}",
+            )
+        except Cancelled:
+            # 我们不等了，但 server 可能还在算（跑 skill 就是这种情况）：照 MCP 的规矩
+            # 告诉它别再算了。引擎侧的 comfy_studio 目前把通知一律丢掉
+            # （``mcp/protocol.py`` 里 ``if msg_id is None: return``），所以这条通知
+            # 现在是"发出去了但还没人接"，等引擎侧补齐后才会真的停下队列里的活。
+            await self._abandon(request_id, method, "客户端取消")
+            raise
         except asyncio.TimeoutError as err:
-            self._pending.pop(request_id, None)
+            await self._abandon(request_id, method, "客户端超时")
             raise McpError(f"{method} 超过 {self.request_timeout} 秒没响应") from err
         if method == "initialize":
             self.server_info = result
         return result
+
+    async def _abandon(self, request_id: int, method: str, reason: str) -> None:
+        """放弃一条已发出的请求：从待收表里摘掉，并补一条 ``notifications/cancelled``。
+
+        发不出去也**不覆盖**真正的原因——连接已经断了的话，调用方该看到的是"取消"，
+        而不是"写管道失败"。
+        """
+        self._pending.pop(request_id, None)
+        if self._proc is None or self._proc.returncode is not None:
+            return
+        try:
+            await self._notify(
+                "notifications/cancelled", {"requestId": request_id, "reason": f"{method}: {reason}"}
+            )
+        except (McpError, OSError):
+            pass
 
     async def _notify(self, method: str, params: dict[str, Any] | None = None) -> None:
         await self._write({"jsonrpc": "2.0", "method": method, "params": params or {}})
@@ -207,8 +247,10 @@ class McpStdioClient:
             )
         return tools
 
-    async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        return await self._request("tools/call", {"name": name, "arguments": arguments})
+    async def call_tool(
+        self, name: str, arguments: dict[str, Any], *, cancel: CancelToken | None = None
+    ) -> dict[str, Any]:
+        return await self._request("tools/call", {"name": name, "arguments": arguments}, cancel=cancel)
 
 
 __all__ = ["McpError", "McpServerConfig", "McpStdioClient", "McpTool"]

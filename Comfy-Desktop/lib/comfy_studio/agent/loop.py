@@ -3,6 +3,10 @@
 一轮 ask 的流程：把用户这句话追加进历史 → 交给模型 → 模型要工具就通过 MCP 执行、
 把结果以 tool 消息喂回去 → 反复直到模型不再要工具，最后那条 assistant 文本就是回答。
 
+一条 assistant 消息里要了多个工具时**并行跑、但按模型给的顺序落账**（见
+:meth:`AgentSession._run_tools`）；整轮可以被 :class:`~comfy_studio.cancel.CancelToken`
+取消，取消后历史仍然配对完整，会话还能接着用。
+
 工具集**不另起一套**：直接用 :class:`~comfy_studio.mcp.McpHub` 汇出来的那张表
 （引擎的 skills / 队列 / 历史，加上用户自己配的 server），所以「谁能当 MCP 宿主
 调到的能力」与「面板里对话能用的能力」永远一致。
@@ -10,9 +14,11 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field, replace
 from typing import Any, Awaitable, Callable
 
+from ..cancel import CancelToken, Cancelled
 from ..mcp import McpError, McpHub, McpTool, tool_text
 from .llm import LLMConfig, LLMError, OpenAIChatClient
 from .types import ChatMessage, ToolCall, system_message, tool_message, user_message
@@ -31,6 +37,13 @@ DEFAULT_SYSTEM_PROMPT = (
 
 #: 一次 ask 里最多允许几轮「模型要工具 → 执行」。
 DEFAULT_MAX_STEPS = 8
+
+#: 同一条 assistant 消息里的工具调用，最多几个同时在飞。
+#:
+#: 故意**不照抄**参考实现那个 10：我们这边多数工具是"真的去跑一张图"，并发吃的是
+#: 显存而不是 CPU，而引擎的队列本来就会把任务串起来执行——同时放两个已经在重叠
+#: "等"的时间了，再加只会把 VRAM 顶上去。要更激进就调大这个值，但先确认显存留得住。
+DEFAULT_MAX_PARALLEL_TOOLS = 2
 
 
 class AgentError(RuntimeError):
@@ -76,13 +89,17 @@ class AgentSession:
         llm: OpenAIChatClient | None = None,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         max_steps: int = DEFAULT_MAX_STEPS,
+        max_parallel_tools: int = DEFAULT_MAX_PARALLEL_TOOLS,
     ) -> None:
         if not tools:
             raise AgentError("一个工具都没有：MCP server 还没 start()，或工具表是空的")
+        if max_parallel_tools < 1:
+            raise AgentError(f"max_parallel_tools 必须 ≥ 1，给的是 {max_parallel_tools}")
         self.hub = hub
         self.tools = tools
         self.llm = llm if llm is not None else OpenAIChatClient(LLMConfig.from_env())
         self.max_steps = max_steps
+        self.max_parallel_tools = max_parallel_tools
         self._schemas = tool_schemas(tools)
         self.messages: list[ChatMessage] = [system_message(system_prompt)]
 
@@ -118,19 +135,134 @@ class AgentSession:
         if result is not None:
             await result
 
-    async def _run_tool(self, call: ToolCall) -> str:
+    async def _run_tool(self, call: ToolCall, cancel: CancelToken | None) -> str:
+        """跑一个工具并把结果压成文本。
+
+        MCP 层的失败翻成 ``ERROR: ...`` 交给模型自己消化（模型经常能换个参数再来一次）；
+        :class:`~comfy_studio.cancel.Cancelled` **不在这里吞掉**，它要一路冒到
+        :meth:`_run_tools` 去补账。
+        """
         try:
-            result = await self.hub.call_tool(call.name, call.arguments)
+            result = await self.hub.call_tool(call.name, call.arguments, cancel=cancel)
         except McpError as err:
             return f"ERROR: {err}"
         return tool_text(result)
 
-    async def ask(self, text: str, on_event: EventListener | None = None) -> str:
-        """问一句，返回最终回答文本。"""
+    async def _run_tools(
+        self, calls: list[ToolCall], on_event: EventListener | None, cancel: CancelToken | None
+    ) -> None:
+        """跑完一条 assistant 消息里的全部工具调用，结果**按模型给的顺序**写进历史。
+
+        为什么不是逐条 await：模型经常一口气要查好几样东西（模型清单 + skill 目录 +
+        队列），串着等纯属白等。这里用滚动池——最多 ``max_parallel_tools`` 个在飞，
+        谁先回来不一定，但**只从头部按顺序落账**（``committed`` 只在连续前缀就绪时
+        前进）：tool 消息必须与 assistant 的 ``tool_calls`` 顺序对齐，乱序写进历史，
+        下一轮请求就是非法的。
+        """
+        results: list[str | None] = [None] * len(calls)
+        in_flight: dict[asyncio.Task[None], int] = {}
+        finished: set[int] = set()
+        dispatched = 0
+        committed = 0
+
+        async def one(index: int) -> None:
+            call = calls[index]
+            await self._emit(
+                on_event,
+                AgentEvent("tool_call", {"id": call.id, "name": call.name, "arguments": call.arguments}),
+            )
+            results[index] = await self._run_tool(call, cancel)
+
+        try:
+            while committed < len(calls):
+                while dispatched < len(calls) and len(in_flight) < self.max_parallel_tools:
+                    task = asyncio.create_task(one(dispatched))
+                    in_flight[task] = dispatched
+                    dispatched += 1
+                if not in_flight:
+                    # 到不了的：还有没落账的结果，就一定还有在飞或等落账的
+                    raise AgentError("工具调度器状态不一致：没有在飞的任务，但仍有调用未落账")
+                done, _ = await asyncio.wait(set(in_flight), return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    finished.add(in_flight.pop(task))
+                    task.result()  # 工具自身的失败已在 _run_tool 里翻成文本；这里只重抛取消
+                while committed in finished:
+                    call = calls[committed]
+                    text = results[committed] or ""
+                    await self._emit(
+                        on_event, AgentEvent("tool_result", {"id": call.id, "name": call.name, "text": text})
+                    )
+                    self.messages.append(tool_message(call, text))
+                    committed += 1
+        except BaseException:
+            # 取消（或别的意外）：先把在飞的收干净，再给没落账的调用补上结果。
+            for task in in_flight:
+                task.cancel()
+            if in_flight:
+                await asyncio.gather(*in_flight, return_exceptions=True)
+            reason = cancel.reason if cancel is not None and cancel.cancelled else "本轮已中止"
+            await self._fill_unrecorded(calls, results, dispatched, committed, on_event, reason)
+            raise
+
+    async def _fill_unrecorded(
+        self,
+        calls: list[ToolCall],
+        results: list[str | None],
+        dispatched: int,
+        committed: int,
+        on_event: EventListener | None,
+        reason: str,
+    ) -> None:
+        """给还没落账的工具调用补一条 tool 消息。
+
+        OpenAI 的形状要求 assistant 的每个 ``tool_call`` 都有对应的 tool 消息，缺一条
+        下一轮请求就是非法的。取消之后用户还要接着聊，所以这一步**不是可选的**：
+        跑了一半的、以及压根没派出去的，都得补上（跑了一半的那条用它的真实结果）。
+        参考实现 deepseek-harness 在中断时补 ``TOOL_ABORTED_BEFORE_DISPATCH``
+        合成结果，是同一个道理。
+        """
+        for index in range(committed, len(calls)):
+            call = calls[index]
+            text = results[index]
+            if text is None:
+                text = f"ERROR: {reason}（{'已中止' if index < dispatched else '未执行'}）"
+            if index >= dispatched:
+                # 没派出去的调用还没有 tool_call 事件，补一条，免得界面上的卡片对不上。
+                await self._emit(
+                    on_event,
+                    AgentEvent("tool_call", {"id": call.id, "name": call.name, "arguments": call.arguments}),
+                )
+            await self._emit(
+                on_event, AgentEvent("tool_result", {"id": call.id, "name": call.name, "text": text})
+            )
+            self.messages.append(tool_message(call, text))
+
+    async def ask(
+        self, text: str, on_event: EventListener | None = None, cancel: CancelToken | None = None
+    ) -> str:
+        """问一句，返回最终回答文本。
+
+        ``cancel`` 置位（面板上点了停止）时这一轮尽快收敛：正在飞的模型请求与工具调用
+        被真的放弃，历史补齐后抛 :class:`~comfy_studio.cancel.Cancelled`。会话本身**仍然
+        可用**——历史是配对的，用户可以接着问下一句。
+        """
         self.messages.append(user_message(text))
 
+        async def report_retry(attempt: int, total: int, delay: float, reason: str) -> None:
+            await self._emit(
+                on_event,
+                AgentEvent(
+                    "retry",
+                    {"attempt": attempt, "total": total, "delay": round(delay, 2), "reason": reason},
+                ),
+            )
+
         for _step in range(self.max_steps):
-            reply = await self.llm.complete(self.messages, self._schemas)
+            if cancel is not None:
+                cancel.raise_if_cancelled("下一轮模型请求")
+            reply = await self.llm.complete(
+                self.messages, self._schemas, cancel=cancel, on_retry=report_retry
+            )
             self.messages.append(reply)
 
             if not reply.tool_calls:
@@ -139,16 +271,7 @@ class AgentSession:
 
             if reply.content:
                 await self._emit(on_event, AgentEvent("assistant", {"text": reply.content}))
-            for call in reply.tool_calls:
-                await self._emit(
-                    on_event,
-                    AgentEvent("tool_call", {"id": call.id, "name": call.name, "arguments": call.arguments}),
-                )
-                output = await self._run_tool(call)
-                await self._emit(
-                    on_event, AgentEvent("tool_result", {"id": call.id, "name": call.name, "text": output})
-                )
-                self.messages.append(tool_message(call, output))
+            await self._run_tools(reply.tool_calls, on_event, cancel)
 
         raise AgentError(
             f"{self.max_steps} 轮之内模型一直在调用工具而没有给出结论；"
@@ -164,6 +287,7 @@ def create_session(
     tools: list[McpTool] | None = None,
     system_prompt: str = DEFAULT_SYSTEM_PROMPT,
     max_steps: int = DEFAULT_MAX_STEPS,
+    max_parallel_tools: int = DEFAULT_MAX_PARALLEL_TOOLS,
     config: LLMConfig | None = None,
 ) -> AgentSession:
     """按 MCP hub 汇出来的工具表组装一个会话。
@@ -177,6 +301,7 @@ def create_session(
         llm=OpenAIChatClient(config) if config is not None else None,
         system_prompt=system_prompt,
         max_steps=max_steps,
+        max_parallel_tools=max_parallel_tools,
     )
 
 
@@ -184,6 +309,7 @@ __all__ = [
     "AgentError",
     "AgentEvent",
     "AgentSession",
+    "DEFAULT_MAX_PARALLEL_TOOLS",
     "DEFAULT_MAX_STEPS",
     "DEFAULT_SYSTEM_PROMPT",
     "EventListener",

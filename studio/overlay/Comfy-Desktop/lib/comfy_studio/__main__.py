@@ -52,6 +52,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_REQUEST_TIMEOUT,
         help=f"单次 MCP 调用超时秒数（默认 {DEFAULT_REQUEST_TIMEOUT:g}；跑 skill 会长时间占用）",
     )
+    parser.add_argument(
+        "--canvas",
+        action="store_true",
+        help=(
+            "挂上画布工具（canvas__snapshot / canvas__load_workflow）。"
+            "这些动作要靠桌面壳接住 agent/event 并回 agent/canvas_result，"
+            "单独喂给别的 MCP 客户端时别开"
+        ),
+    )
     return parser
 
 
@@ -75,6 +84,7 @@ def main(argv: list[str] | None = None) -> int:
                 request_timeout=args.request_timeout,
                 comfyui_dir=args.comfyui_dir or os.environ.get("COMFYUI_DIR"),
                 comfy_url=args.comfy_url,
+                canvas=args.canvas,
             )
         )
     except KeyboardInterrupt:  # 桌面壳正常退出时是关掉 stdin，这条只为手动 Ctrl+C

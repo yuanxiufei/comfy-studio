@@ -14,4 +14,4 @@ from __future__ import annotations
 __version__ = "0.1.0"
 
 #: 子包名，仅作文档性声明；真正的导入交给调用方。
-__all__ = ["__version__", "agent", "mcp", "skills"]
+__all__ = ["__version__", "agent", "canvas", "mcp", "skills"]

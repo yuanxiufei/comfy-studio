@@ -97,7 +97,11 @@ export function resolveStudioCommand(installation: InstallationRecord): ComfyStu
       '--comfyui-dir',
       comfyuiDir,
       '--request-timeout',
-      String(STUDIO_REQUEST_TIMEOUT_MS / 1000)
+      String(STUDIO_REQUEST_TIMEOUT_MS / 1000),
+      // Canvas tools need somebody to answer `canvas_call` (see
+      // `comfyStudioCanvasRelay`); this shell is that somebody, so the extra
+      // tool table is asked for here and nowhere else.
+      '--canvas'
     ],
     cwd: getBundledLibDir(),
     comfyuiDir

@@ -15,7 +15,10 @@
 ``agent/config``         模型是否配好（读环境变量，不回显密钥）
 ``agent/models``         面板下拉用：可选模型清单（问服务端 ``/models``）+ 当前模型
 ``agent/model``          ``{model?}`` → 读当前模型 / 切到指定模型（会话内当场生效）
-``agent/chat``           ``{text, session_id?}`` → 最终回答；过程中推 ``agent/event`` 通知
+``agent/chat``           ``{text, session_id?}`` → 最终回答；过程中推 ``agent/event`` 通知。
+                         被 ``agent/cancel`` 叫停时回 ``cancelled: true``（不是错误）
+``agent/cancel``         ``{session_id?}`` → 让正在跑的那一轮尽快停下（幂等）
+``agent/canvas_result``   画布通道的回程：桌面壳把页面执行画布动作的结果送回来
 ``agent/reset``          清空某个会话的历史
 ======================  ==============================================
 """
@@ -27,6 +30,8 @@ from dataclasses import replace
 from typing import Any
 
 from .agent import AgentError, AgentSession, LLMConfig, LLMError, OpenAIChatClient, create_session
+from .canvas import CanvasChannel, CanvasClient, bind_emit, unbind_emit
+from .cancel import CancelToken, Cancelled
 from .mcp import McpHub, McpServerConfig
 from .rpc import INTERNAL_ERROR, INVALID_PARAMS, RpcContext, RpcError, StdioRpcServer
 from .skills import SkillCatalog, SkillsError
@@ -69,17 +74,21 @@ class StudioHost:
         comfyui_dir: str | None = None,
         comfy_url: str | None = None,
         max_sessions: int = MAX_SESSIONS,
+        canvas: CanvasChannel | None = None,
     ) -> None:
         self.hub = hub
         self.catalog = catalog
         self.comfyui_dir = comfyui_dir
         self.comfy_url = comfy_url
         self.max_sessions = max_sessions
+        #: 画布通道（桌面壳在场时才有）；None 时工具表里也不会有 canvas__* 那两个。
+        self.canvas = canvas
         #: 面板里切过的模型；None = 用环境变量里那个（进程内有效，不落盘）。
         self.default_model: str | None = None
         self._sessions: dict[str, AgentSession] = {}
-        #: 正在跑一轮的 session_id：这些会话不能被换模型打断。
-        self._busy: set[str] = set()
+        #: 正在跑一轮的会话：session_id → 那一轮的取消令牌。
+        #: 这些会话不能被换模型打断（换客户端会把在飞的一轮劈了）。
+        self._turns: dict[str, CancelToken] = {}
         self.server = StdioRpcServer({"name": SERVER_NAME, "version": SERVER_VERSION})
         self._register()
 
@@ -96,6 +105,8 @@ class StudioHost:
         self.server.on("agent/models", self.agent_models)
         self.server.on("agent/model", self.agent_model)
         self.server.on("agent/chat", self.agent_chat)
+        self.server.on("agent/cancel", self.agent_cancel)
+        self.server.on("agent/canvas_result", self.agent_canvas_result)
         self.server.on("agent/reset", self.agent_reset)
 
     # ---- 方法 -----------------------------------------------------------
@@ -112,7 +123,8 @@ class StudioHost:
             "sessions": sorted(self._sessions),
             "skills_cached": len(self.catalog.entries),
             "default_model": self.default_model,
-            "busy": sorted(self._busy),
+            "busy": sorted(self._turns),
+            "canvas": self.canvas is not None,
         }
 
     def mcp_servers(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
@@ -199,7 +211,7 @@ class StudioHost:
 
         切换改的是**宿主级默认值**：新会话直接用它，已经建好的会话也当场换掉
         （历史保留）。正忙的会话跳过——那会儿换客户端会把在飞的一轮打断，改由
-        调用方决定是等它跑完还是换个 session。
+        调用方决定是等它跑完、``agent/cancel`` 掉它，还是换个 session。
         """
         args = _object(params, "agent/model")
         config = self._llm_config()
@@ -214,7 +226,7 @@ class StudioHost:
         applied: list[str] = []
         skipped: list[str] = []
         for session_id, session in self._sessions.items():
-            if session_id in self._busy:
+            if session_id in self._turns:
                 skipped.append(session_id)
                 continue
             await session.use_model(name)
@@ -227,8 +239,11 @@ class StudioHost:
         session_id = args.get("session_id") or DEFAULT_SESSION
         if not isinstance(session_id, str):
             raise RpcError(INVALID_PARAMS, "session_id 必须是字符串")
-        if session_id in self._busy:
-            raise RpcError(INVALID_PARAMS, f"会话 {session_id} 已有一轮在跑；等它结束或换个 session_id")
+        if session_id in self._turns:
+            raise RpcError(
+                INVALID_PARAMS,
+                f"会话 {session_id} 已有一轮在跑；等它结束、agent/cancel 掉它，或换个 session_id",
+            )
         session = self._session(session_id)
 
         async def on_event(event: object) -> None:
@@ -237,14 +252,59 @@ class StudioHost:
                 return
             await ctx.emit("agent/event", {"session_id": session_id, **to_json()})
 
-        self._busy.add(session_id)
+        cancel = CancelToken()
+        self._turns[session_id] = cancel
+        # 画布工具靠这条 ctx 把动作推给桌面壳：绑在当前 context 上，工具执行时
+        # （`asyncio.create_task` 起的任务会继承 context）才找得到这一轮的出口。
+        token = bind_emit(ctx.emit)
         try:
-            answer = await session.ask(text, on_event)
+            answer = await session.ask(text, on_event, cancel=cancel)
+        except Cancelled as err:
+            # 取消**不是失败**：回一个正常结果，面板把气泡收成"已停止"就行。
+            return {"session_id": session_id, "text": "", "cancelled": True, "reason": str(err)}
         except (LLMError, AgentError) as err:
             raise RpcError(INTERNAL_ERROR, f"{type(err).__name__}: {err}") from err
         finally:
-            self._busy.discard(session_id)
-        return {"session_id": session_id, "text": answer}
+            unbind_emit(token)
+            self._turns.pop(session_id, None)
+        return {"session_id": session_id, "text": answer, "cancelled": False}
+
+    def agent_cancel(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
+        """让某一轮尽快停下。幂等：没有在跑的轮次就回 ``cancelled: false``。
+
+        "停下"的分工要说清：宿主这边**立刻**不再等模型、也不再等引擎（在飞的 HTTP
+        请求会被真的断开）；引擎那侧目前收不到这个消息（``mcp/protocol.py`` 把通知
+        一律丢掉），所以已经排进 ComfyUI 队列的活还会自己跑完。要真停下队列里的事，
+        得等引擎侧认 ``notifications/cancelled``。
+        """
+        args = _object(params, "agent/cancel")
+        session_id = args.get("session_id") or DEFAULT_SESSION
+        if not isinstance(session_id, str):
+            raise RpcError(INVALID_PARAMS, "session_id 必须是字符串")
+        token = self._turns.get(session_id)
+        if token is None:
+            return {"session_id": session_id, "cancelled": False}
+        token.cancel()
+        return {"session_id": session_id, "cancelled": True}
+
+    def agent_canvas_result(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
+        """画布通道的回程：桌面壳把页面执行画布动作的结果送回来。
+
+        幂等：这一轮已经不等了（超时、被取消、已经收过）就回 ``delivered: false``——
+        结果来晚了不是错误，桌面壳不需要为此报错。
+        """
+        args = _object(params, "agent/canvas_result")
+        call_id = _text(args, "call_id")
+        ok = args.get("ok")
+        if not isinstance(ok, bool):
+            raise RpcError(INVALID_PARAMS, "ok 必须是布尔值")
+        error = args.get("error")
+        if error is not None and not isinstance(error, str):
+            raise RpcError(INVALID_PARAMS, "error 必须是字符串")
+        if self.canvas is None:
+            return {"call_id": call_id, "delivered": False}
+        delivered = self.canvas.resolve(call_id, ok=ok, result=args.get("result"), error=error)
+        return {"call_id": call_id, "delivered": delivered}
 
     def agent_reset(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
         args = _object(params, "agent/reset")
@@ -290,11 +350,21 @@ class StudioHost:
         self._sessions[session_id] = session
         return session
 
+    def cancel_turns(self, reason: str) -> list[str]:
+        """把正在跑的一轮都要求停下，返回被叫停的 session_id（已排序）。
+
+        宿主退出时会用（见 :func:`serve_stdio`）：面板把 stdin 关掉之后，不该还等着
+        一轮跑 skill 的对话慢慢收尾——那一次等待最长能到工具的 1800 秒超时上。
+        """
+        return sorted(sid for sid, token in self._turns.items() if token.cancel(reason))
+
     async def close(self) -> None:
+        # 先叫停在飞的轮次（它们会补齐历史后抛 Cancelled），再关会话。
+        self.cancel_turns("宿主退出")
         for session in self._sessions.values():
             await session.close()
         self._sessions.clear()
-        self._busy.clear()
+        self._turns.clear()
 
 
 async def serve_stdio(
@@ -302,13 +372,29 @@ async def serve_stdio(
     request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
     comfyui_dir: str | None = None,
     comfy_url: str | None = None,
+    canvas: bool = False,
 ) -> None:
-    """拉起全部 MCP server，然后在 stdin/stdout 上服务到 EOF。"""
-    hub = McpHub(configs, request_timeout=request_timeout)
+    """拉起全部 MCP server，然后在 stdin/stdout 上服务到 EOF。
+
+    ``canvas=True`` 时额外挂上画布通道（见 :mod:`comfy_studio.canvas`）：那张工具表
+    要靠桌面壳接住 ``agent/event`` 里的 ``canvas_call``、再把结果送回
+    ``agent/canvas_result``，所以默认**不开**——单独给别的 MCP 客户端用时开了也没人接。
+    """
+    channel = CanvasChannel() if canvas else None
+    extra: list[Any] = [CanvasClient(channel)] if channel is not None else []
+    hub = McpHub(configs, request_timeout=request_timeout, extra_clients=extra)
     await hub.start()
     host: StudioHost | None = None
     try:
-        host = StudioHost(hub, SkillCatalog(hub), comfyui_dir=comfyui_dir, comfy_url=comfy_url)
+        host = StudioHost(
+            hub,
+            SkillCatalog(hub),
+            comfyui_dir=comfyui_dir,
+            comfy_url=comfy_url,
+            canvas=channel,
+        )
+        # stdin 一关（面板退出）就先叫停在飞的轮次，别让退出卡在长任务上。
+        host.server.on_close = lambda: host.cancel_turns("宿主退出")
         names = ", ".join(str(s["name"]) for s in hub.servers())
         print(
             f"[{SERVER_NAME}] MCP server: {names}；工具 {len(hub.tools)} 个",

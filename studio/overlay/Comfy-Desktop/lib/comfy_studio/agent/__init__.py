@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from ..cancel import CancelToken, Cancelled
 from .llm import LLMConfig, LLMError, OpenAIChatClient
 from .loop import (
+    DEFAULT_MAX_PARALLEL_TOOLS,
     DEFAULT_MAX_STEPS,
     DEFAULT_SYSTEM_PROMPT,
     AgentError,
@@ -19,7 +21,10 @@ __all__ = [
     "AgentError",
     "AgentEvent",
     "AgentSession",
+    "CancelToken",
+    "Cancelled",
     "ChatMessage",
+    "DEFAULT_MAX_PARALLEL_TOOLS",
     "DEFAULT_MAX_STEPS",
     "DEFAULT_SYSTEM_PROMPT",
     "EventListener",

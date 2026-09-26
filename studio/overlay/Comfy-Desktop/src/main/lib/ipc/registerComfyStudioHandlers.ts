@@ -1,9 +1,10 @@
 import { app, ipcMain } from 'electron'
 import type { IpcMainInvokeEvent } from 'electron'
 import * as installations from '../../installations'
-import { findInstallationIdByComfySender } from '../../host/registry'
+import { findInstallationIdByComfySender, getEntryByInstallationId } from '../../host/registry'
 import { ComfyStudioError, ComfyStudioHost, resolveStudioCommand } from '../comfyStudioHost'
 import type { ComfyStudioNotification } from '../comfyStudioHost'
+import { isCanvasCall, relayCanvasCall } from '../comfyStudioCanvasRelay'
 import { _broadcastToRenderer } from './broadcast'
 
 /**
@@ -18,6 +19,11 @@ import { _broadcastToRenderer } from './broadcast'
  * `agent/event` notifications from the host are rebroadcast on
  * `comfy-studio:event` (carrying the installationId) so a panel can paint
  * tool calls while the agent loop is still running.
+ *
+ * A `canvas_call` event is the one notification that also needs an answer: the
+ * graph lives in the page, not in the host, so it is run in that installation's
+ * comfyView and the result goes back over `agent/canvas_result`
+ * (see `comfyStudioCanvasRelay`).
  *
  * Callers come in two shapes, same as the logs/terminal IPC:
  *   - the desktop renderer passes its installationId explicitly;
@@ -90,6 +96,10 @@ async function hostFor(installationId: string): Promise<ComfyStudioHost> {
   const host = new ComfyStudioHost(command)
   host.on('notification', (message: ComfyStudioNotification) => {
     _broadcastToRenderer('comfy-studio:event', { installationId, ...message })
+    if (!isCanvasCall(message.method, message.params)) return
+    // Fire-and-forget: the notification stream must not stall on one op.
+    const view = getEntryByInstallationId(installationId)?.comfyView ?? null
+    void relayCanvasCall(host, view ? view.webContents : null, message.params).catch(() => {})
   })
   host.on('exit', () => {
     hosts.delete(installationId)

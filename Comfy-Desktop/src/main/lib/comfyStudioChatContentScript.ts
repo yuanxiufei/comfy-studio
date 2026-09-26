@@ -25,6 +25,19 @@ let cachedScript: string | null = null
  * `agent/model` to switch). Switching is disabled mid-turn: the host replaces the
  * HTTP client behind each idle session, and doing that under a turn in flight
  * would cut it off.
+ *
+ * A turn in flight can be stopped from the composer (`agent/cancel`). Stopping is
+ * not a failure: the host still answers `agent/chat` normally, with `cancelled:
+ * true`, and the history stays paired so the next message just continues the
+ * conversation. That is why the answer paints a muted `已停止` row rather than an
+ * error, and why the transport-level rejection path below stays for real failures
+ * only.
+ *
+ * Canvas: the host's `canvas__*` tools need the live graph, which only this page
+ * has, so the shell reaches back with `executeJavaScript` and calls
+ * `window.__comfyStudioChat.canvasCall(op, args)` here. Every op is a thin wrapper
+ * over the ComfyUI frontend's own `window.comfyAPI.app.app`, and a missing global
+ * is reported as an error rather than as an empty graph.
  */
 const STUDIO_CHAT_MAIN_JS = `
 var STATE = window.__comfyStudioChat;
@@ -36,6 +49,7 @@ var LOG_ID = 'comfy-desktop-studio-chat-log';
 var STATUS_ID = 'comfy-desktop-studio-chat-status';
 var INPUT_ID = 'comfy-desktop-studio-chat-input';
 var SEND_ID = 'comfy-desktop-studio-chat-send';
+var STOP_ID = 'comfy-desktop-studio-chat-stop';
 var MODEL_ID = 'comfy-desktop-studio-chat-model';
 
 var MUTED = 'var(--content-fg,#9b9b9b)';
@@ -60,6 +74,9 @@ var CHAT_CSS =
   // 最终答案是这一轮的主角（narration 只是过程中的话），给它加一条左侧标记
   '#' + DRAWER_ID + ' .cs-agent[data-variant="final"]{border-left:2px solid ' + BORDER + ';padding-left:8px;}' +
   '#' + DRAWER_ID + ' .cs-error{align-self:stretch;color:#ff8080;border:1px solid #ff808055;background:#ff80800f;}' +
+  // 停下的一轮不是错误：一条灰色括注就够，别用错误那条红边框把人吓一跳
+  '#' + DRAWER_ID + ' .cs-stopped{align-self:flex-start;color:' + MUTED + ';font-size:12px;' +
+  'border-left:2px solid ' + BORDER + ';padding-left:8px;}' +
   '#' + DRAWER_ID + ' .cs-pending{align-self:flex-start;display:flex;align-items:center;gap:6px;color:' + MUTED + ';font-size:12px;}' +
   '#' + DRAWER_ID + ' .cs-pending .cs-dot{animation:cs-pulse 1.2s ease-in-out infinite;}' +
   '#' + DRAWER_ID + ' .cs-tool{align-self:stretch;border:1px solid ' + BORDER + ';padding:0;overflow:hidden;}' +
@@ -193,6 +210,18 @@ function buildDrawer() {
     }
   });
 
+  var stopTurn = document.createElement('button');
+  stopTurn.id = STOP_ID;
+  stopTurn.type = 'button';
+  stopTurn.textContent = '停止';
+  stopTurn.title = '让这一轮尽快停下：已经跑完的工具结果会留下，会话还能接着说下一句';
+  stopTurn.style.cssText =
+    'display:none;align-self:flex-end;border:1px solid ' + BORDER + ';border-radius:4px;' +
+    'background:transparent;color:#ff8080;cursor:pointer;font:inherit;padding:6px 12px;';
+  stopTurn.addEventListener('click', function () {
+    cancelTurn();
+  });
+
   var send = document.createElement('button');
   send.id = SEND_ID;
   send.type = 'button';
@@ -205,6 +234,7 @@ function buildDrawer() {
   });
 
   composer.appendChild(input);
+  composer.appendChild(stopTurn);
   composer.appendChild(send);
   header.appendChild(title);
   header.appendChild(stop);
@@ -231,6 +261,16 @@ function setSendEnabled(enabled) {
   send.disabled = !enabled;
   send.style.opacity = enabled ? '1' : '0.5';
   send.style.cursor = enabled ? 'pointer' : 'not-allowed';
+}
+
+// "停止"只在有轮次在飞时露出来：没有在跑的活时它没有意义，摆在那儿只会让人以为
+// 有东西卡住了。每次露出来都顺手把 disabled 复位——上一次点击会把它按下去。
+function setStopVisible(visible) {
+  var stop = document.getElementById(STOP_ID);
+  if (!stop) return;
+  stop.style.display = visible ? 'inline-block' : 'none';
+  stop.style.opacity = '1';
+  stop.disabled = false;
 }
 
 function setModelEnabled(enabled) {
@@ -322,6 +362,14 @@ function addAssistant(text, variant) {
   var row = makeRow('assistant');
   row.setAttribute('data-variant', variant || 'intermediate');
   row.textContent = text;
+  return appendNode(row);
+}
+
+// 被停下的一轮：不是失败，也不是回答。留一行说明，好让人知道这一轮为什么没结果。
+function addStopped(reason) {
+  var row = makeRow('stopped');
+  row.textContent = '已停止';
+  if (reason) row.title = '原因: ' + reason;
   return appendNode(row);
 }
 
@@ -569,6 +617,7 @@ function sendTurn() {
 
   STATE.busy = true;
   setSendEnabled(false);
+  setStopVisible(true);
   refreshModelEnabled(); // 一轮在飞时不换模型，免得把这一轮打断
   input.value = '';
   addUser(text);
@@ -584,6 +633,7 @@ function sendTurn() {
     STATE.cards = {};
     STATE.busy = false;
     setSendEnabled(true);
+    setStopVisible(false);
     refreshModelEnabled();
   };
 
@@ -595,8 +645,16 @@ function sendTurn() {
         setStatus('这一轮失败了', 'error');
         return;
       }
-      var answer = response.result && response.result.text;
-      addAssistant(typeof answer === 'string' ? answer : JSON.stringify(response.result), 'final');
+      var result = response.result || {};
+      if (result.cancelled === true) {
+        // 停下的一轮照样是一次**正常**响应（宿主这么约定的）：画一行"已停止"收尾，
+        // 别当失败报红，也别把空回答画成一个空气泡。
+        addStopped(result.reason);
+        setStatus('已停止（可以接着说下一句）');
+        return;
+      }
+      var answer = result.text;
+      addAssistant(typeof answer === 'string' ? answer : JSON.stringify(result), 'final');
       setStatus('就绪');
     },
     function (err) {
@@ -604,6 +662,48 @@ function sendTurn() {
       setStatus('这一轮失败了', 'error');
     }
   ).then(finish, finish);
+}
+
+// 叫停这一轮。真正的收尾（摘下"正在思考"、放开发送键）仍走上面那条 finish，
+// 因为停下之后 agent/chat 会正常回一个 cancelled 结果——这里只负责把请求发出去。
+function cancelTurn() {
+  if (!STATE.busy) return;
+  var stop = document.getElementById(STOP_ID);
+  if (stop) {
+    stop.disabled = true;
+    stop.style.opacity = '0.5';
+  }
+  setStatus('正在停下这一轮…');
+
+  var restore = function () {
+    if (stop) {
+      stop.disabled = false;
+      stop.style.opacity = '1';
+    }
+  };
+  Promise.resolve(bridge.request('agent/cancel', { session_id: STATE.session })).then(
+    function (response) {
+      if (!response || response.ok !== true) {
+        var error = (response && response.error) || {};
+        addError('取消失败: ' + (error.message || '未知错误'), error.code);
+        setStatus('没停下，这一轮还在跑', 'error');
+        restore();
+        return;
+      }
+      if (!response.result || response.result.cancelled !== true) {
+        // 幂等：没有在跑的轮次就回 cancelled:false。多半是这一轮刚好自己跑完了，
+        // 正常结果正在回来的路上，什么都不用改。
+        setStatus('这一轮已经结束了');
+        restore();
+      }
+      // cancelled:true：等 agent/chat 那条结果回来收尾（它会画"已停止"）。
+    },
+    function (err) {
+      addError('取消失败: ' + message(err));
+      setStatus('没停下，这一轮还在跑', 'error');
+      restore();
+    }
+  );
 }
 
 function refreshStatus() {
@@ -726,6 +826,130 @@ function start() {
   } catch (e) {}
   return injected;
 }
+
+// ---- 画布通道 ----------------------------------------------------------
+//
+// 桌面壳用 executeJavaScript 直接调 STATE.canvasCall(op, args)，宿主那侧的
+// canvas__snapshot / canvas__load_workflow 两个工具发的动作就落到这里（整条回家
+// 路线写在 lib/comfy_studio/canvas.py）。真正碰图的是页面里的 ComfyUI 前端，
+// 也就是 window.comfyAPI.app.app 那个 ComfyApp 实例；符号取自引擎 venv 里
+// comfyui_frontend_package 的打包产物。拿不到这个全局就明确报错——读不到画布和
+// 画布是空的不是一回事，不能糊过去。
+
+function canvasApp() {
+  var api = window.comfyAPI;
+  var app = api && api.app && api.app.app;
+  if (!app) {
+    throw new Error('这个前端没有 window.comfyAPI.app.app：读不到画布');
+  }
+  return app;
+}
+
+function canvasGraph(app) {
+  var root = app.rootGraph;
+  if (!root || typeof root.serialize !== 'function') {
+    throw new Error('这个前端没有 app.rootGraph.serialize()：读不到画布');
+  }
+  return root.serialize() || {};
+}
+
+// 一次快照最多带这么多节点：画布可以很大，而这份摘要整个要塞进模型的上下文。
+var CANVAS_MAX_NODES = 80;
+
+function canvasNodeSummary(node, includeWidgets) {
+  var item = { id: node.id, type: node.type };
+  if (node.title) item.title = String(node.title);
+  if (typeof node.mode === 'number' && node.mode !== 0) item.mode = node.mode;
+  if (includeWidgets && node.widgets_values != null) {
+    item.widgets = JSON.stringify(node.widgets_values).slice(0, 400);
+  }
+  return item;
+}
+
+function canvasLinks(data) {
+  var out = [];
+  var raw = data.links || [];
+  for (var i = 0; i < raw.length; i++) {
+    var link = raw[i];
+    if (!link) continue;
+    // 图数据里一条连线是 [id, from_node, from_slot, to_node, to_slot, type]；
+    // 有的版本给对象形状，两种都认。
+    if (Object.prototype.toString.call(link) === '[object Array]' && link.length >= 5) {
+      out.push({ from: link[1], from_slot: link[2], to: link[3], to_slot: link[4] });
+    } else if (typeof link === 'object') {
+      out.push({
+        from: link.origin_id,
+        from_slot: link.origin_slot,
+        to: link.target_id,
+        to_slot: link.target_slot,
+      });
+    }
+  }
+  return out;
+}
+
+function canvasSnapshot(args) {
+  var app = canvasApp();
+  var data = canvasGraph(app);
+  var includeWidgets = !!(args && args.include_widgets);
+  var all = data.nodes || [];
+  var nodes = [];
+  for (var i = 0; i < all.length && i < CANVAS_MAX_NODES; i++) {
+    nodes.push(canvasNodeSummary(all[i], includeWidgets));
+  }
+  var shot = {
+    node_count: all.length,
+    link_count: (data.links || []).length,
+    nodes: nodes,
+    links: canvasLinks(data),
+    truncated: all.length > nodes.length,
+  };
+  var ds = (data.extra && data.extra.ds) || {};
+  if (ds.filename) shot.workflow_name = String(ds.filename);
+  return shot;
+}
+
+function canvasLoadWorkflow(args) {
+  var app = canvasApp();
+  if (typeof app.loadGraphData !== 'function') {
+    throw new Error('这个前端没有 app.loadGraphData()：载不进工作流');
+  }
+  var graph = args && args.graph;
+  if (!graph || typeof graph !== 'object') {
+    throw new Error('graph 必须是工作流 JSON 对象');
+  }
+  var name = args.name;
+  // 后两个 true 是前端自己在“共享工作流”那条路上用的同款参数（clear / 重置视图），
+  // 没给名字就只传三个参数，免得塞一个 undefined 进去。
+  var call = name
+    ? app.loadGraphData(graph, true, true, name)
+    : app.loadGraphData(graph, true, true);
+  return Promise.resolve(call).then(function () {
+    var data = canvasGraph(app);
+    return { loaded: true, node_count: (data.nodes || []).length };
+  });
+}
+
+var CANVAS_OPS = { snapshot: canvasSnapshot, load_workflow: canvasLoadWorkflow };
+
+// 壳那边只认 {ok, result} / {ok:false, error}：抛出去会变成一次 executeJavaScript
+// 的 reject，措辞就丢了，所以这里自己把错误翻成结构化的回话。
+STATE.canvasCall = function (op, args) {
+  function failed(err) {
+    return { ok: false, error: String((err && err.message) || err) };
+  }
+  var run = CANVAS_OPS[op];
+  if (!run) {
+    return Promise.resolve(failed(new Error('不认识的画布动作: ' + op)));
+  }
+  try {
+    return Promise.resolve(run(args || {})).then(function (result) {
+      return { ok: true, result: result };
+    }, failed);
+  } catch (err) {
+    return Promise.resolve(failed(err));
+  }
+};
 
 start();
 `

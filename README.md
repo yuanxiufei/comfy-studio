@@ -80,6 +80,12 @@ agent / skill / mcp 三件能力**前后端各有一份**，按各自项目里�
 * `server.py` / `rpc.py` / `__main__.py` —— 桌面壳拉起的进程接口：行分隔 JSON-RPC 2.0 over
   stdio（`stdout` 只跑协议，诊断走 `stderr`），`agent/chat` 过程中会推 `agent/event` 通知，
   让面板能边跑边画工具调用。
+* `canvas.py` —— 画布通道（只有宿主侧有，因为画布在引擎前端页面里）：把 `canvas__snapshot`
+  与 `canvas__load_workflow` 两个工具混进同一张 MCP 工具表（形状与 stdio client 一致，对话循环
+  因此一行都不用改）。动作本身走一条回程：宿主推 `agent/event`（type `canvas_call`）→ 桌面壳在
+  那个安装的画布页面里执行 → `agent/canvas_result` 把结果送回宿主等着的 future。没人接这条通道
+  （例如直接拿 `run-mcp.mjs` 喂别的 MCP 客户端）时工具会明确回"等不到回音"，不假装读到一张空图；
+  桌面壳启动宿主时带 `--canvas`，这张工具表才会出现。
 
 对话要模型，配在环境变量里（不落盘、不进仓库）：`COMFY_STUDIO_LLM_MODEL`（必填）、
 `COMFY_STUDIO_LLM_BASE_URL`、`COMFY_STUDIO_LLM_API_KEY`。没配的话 `agent/config` 会明确
@@ -98,7 +104,13 @@ agent / skill / mcp 三件能力**前后端各有一份**，按各自项目里�
 （`Comfy-Desktop/src/main/lib/comfyStudioChatContentScript.ts`），
 它经 preload 桥 `window.__comfyDesktop2.ComfyStudio` 走 IPC 找主进程，
 主进程再按需 spawn 上面的宿主进程。抽屉顶部就是上面那个模型下拉，
-一轮在跑时它是禁用的。
+一轮在跑时它是禁用的；旁边那个「停止」按钮走 `agent/cancel`——宿主立刻不再等模型与引擎，
+这一轮回的是**正常结果**（`cancelled: true`）而不是错误，面板把它画成"已停止"，
+历史配对完整，接着聊下一句就行。
+
+画布那两个工具既是给模型用的也是给用户用的：问"我这张图里有什么"，它会先
+`canvas__snapshot` 看清再答；说"把这份工作流放到画布上"，就落到
+`canvas__load_workflow`（它会替换当前画布，工具描述里写明了，模型会先说清楚再动手）。
 
 ## 打通是怎么做到的
 

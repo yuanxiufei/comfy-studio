@@ -7,6 +7,7 @@ const LOG_ID = 'comfy-desktop-studio-chat-log'
 const STATUS_ID = 'comfy-desktop-studio-chat-status'
 const INPUT_ID = 'comfy-desktop-studio-chat-input'
 const SEND_ID = 'comfy-desktop-studio-chat-send'
+const STOP_ID = 'comfy-desktop-studio-chat-stop'
 const MODEL_ID = 'comfy-desktop-studio-chat-model'
 
 interface StudioBridge {
@@ -103,6 +104,7 @@ describe('getComfyStudioChatContentScript', () => {
     document.body.innerHTML = ''
     Reflect.deleteProperty(window, '__comfyDesktop2')
     Reflect.deleteProperty(window, '__comfyStudioChat')
+    Reflect.deleteProperty(window, 'comfyAPI')
     emit = () => {}
   })
 
@@ -385,6 +387,74 @@ describe('getComfyStudioChatContentScript', () => {
     expect(bridge.stop).toHaveBeenCalledOnce()
   })
 
+  it('stops a turn from the composer and paints 已停止 instead of an empty answer', async () => {
+    let settleChat: (value: unknown) => void = () => {}
+    const request = vi.fn((method: string) => {
+      if (method === 'agent/models') return catalog(['a:3b'], 'a:3b')
+      if (method === 'agent/cancel') {
+        return { ok: true, result: { session_id: 'default', cancelled: true } }
+      }
+      return new Promise((resolve) => {
+        settleChat = resolve
+      })
+    })
+    installBridge({ request })
+    setupDom()
+    new Function(script)()
+    await openPanel()
+
+    const stop = document.getElementById(STOP_ID) as HTMLButtonElement
+    expect(stop.style.display, 'nothing to stop before a turn starts').toBe('none')
+
+    const input = document.getElementById(INPUT_ID) as HTMLTextAreaElement
+    input.value = '跑个 skill'
+    document.getElementById(SEND_ID)?.click() // 不 await：这一轮在飞行中
+    expect(stop.style.display, 'the stop button shows up with the turn').not.toBe('none')
+
+    stop.click()
+    await flush()
+
+    expect(request).toHaveBeenCalledWith('agent/cancel', { session_id: 'default' })
+
+    // 停下之后宿主仍把 agent/chat 正常答完：结果带 cancelled:true
+    settleChat({ ok: true, result: { session_id: 'default', text: '', cancelled: true, reason: '用户取消' } })
+    await flush()
+
+    expect(rows('stopped').map((r) => r.textContent)).toEqual(['已停止'])
+    expect(rows('stopped')[0]?.getAttribute('title')).toContain('用户取消')
+    expect(rows('assistant'), 'a stopped turn has no answer to paint').toHaveLength(0)
+    expect(rows('error'), 'stopping is not a failure').toHaveLength(0)
+    expect(rows('pending'), 'the turn still settles').toHaveLength(0)
+    expect(stop.style.display, 'the turn is over, so no stop button').toBe('none')
+    expect((document.getElementById(SEND_ID) as HTMLButtonElement).disabled).toBe(false)
+    expect(document.getElementById(STATUS_ID)?.textContent).toContain('已停止')
+  })
+
+  it('says so when the host will not stop the turn, and keeps the button usable', async () => {
+    const request = vi.fn((method: string) => {
+      if (method === 'agent/models') return catalog(['a:3b'], 'a:3b')
+      if (method === 'agent/cancel') return { ok: false, error: { message: '宿主没在运行' } }
+      return new Promise(() => {}) // 这一轮一直挂着：取消失败就该看得出来
+    })
+    installBridge({ request })
+    setupDom()
+    new Function(script)()
+    await openPanel()
+
+    const input = document.getElementById(INPUT_ID) as HTMLTextAreaElement
+    input.value = '跑个 skill'
+    document.getElementById(SEND_ID)?.click() // 不 await：这一轮在飞行中
+
+    const stop = document.getElementById(STOP_ID) as HTMLButtonElement
+    stop.click()
+    await flush()
+
+    expect(rows('error').map((r) => r.textContent)).toEqual(['取消失败: 宿主没在运行'])
+    expect(document.getElementById(STATUS_ID)?.textContent).toContain('还在跑')
+    expect(stop.disabled, 'a failed cancel must not leave the button stuck').toBe(false)
+    expect(stop.style.display, 'the turn is still in flight').not.toBe('none')
+  })
+
   it('re-injects via the observer when the toolbar re-renders the button away', async () => {
     installBridge()
     setupDom()
@@ -521,6 +591,124 @@ describe('getComfyStudioChatContentScript', () => {
 
     await flush()
     expect(picker.disabled).toBe(false)
+  })
+
+  // ---- 画布通道：桌面壳用 executeJavaScript 调 STATE.canvasCall -------------
+
+  interface FakeApp {
+    rootGraph: { serialize: () => unknown }
+    loadGraphData: ReturnType<typeof vi.fn>
+  }
+
+  /** The ComfyUI frontend's own global, faked: `window.comfyAPI.app.app`. */
+  const installCanvasApp = (graph?: unknown): FakeApp => {
+    const app: FakeApp = {
+      rootGraph: { serialize: () => graph ?? { nodes: [], links: [] } },
+      loadGraphData: vi.fn(() => Promise.resolve())
+    }
+    Reflect.set(window, 'comfyAPI', { app: { app } })
+    return app
+  }
+
+  interface CanvasAnswer {
+    ok: boolean
+    result?: unknown
+    error?: string
+  }
+
+  type CanvasCall = (op: string, args: unknown) => Promise<CanvasAnswer>
+
+  const canvasCall = (): CanvasCall => {
+    const state = Reflect.get(window, '__comfyStudioChat') as
+      | { canvasCall?: CanvasCall }
+      | undefined
+    if (!state?.canvasCall) throw new Error('Expected the panel to expose canvasCall')
+    return state.canvasCall
+  }
+
+  const boot = (): void => {
+    installBridge()
+    setupDom()
+    new Function(script)()
+  }
+
+  it('summarises the live graph for the host', async () => {
+    installCanvasApp({
+      nodes: [
+        { id: 4, type: 'CheckpointLoaderSimple', widgets_values: ['sd_xl.safetensors'] },
+        { id: 7, type: 'KSampler', title: '采样' }
+      ],
+      links: [[1, 4, 0, 7, 0, 'MODEL']],
+      extra: { ds: { filename: 'demo' } }
+    })
+    boot()
+
+    const shot = (await canvasCall()('snapshot', {})).result as {
+      node_count: number
+      link_count: number
+      nodes: unknown[]
+      links: unknown[]
+      workflow_name?: string
+      truncated: boolean
+    }
+    expect(shot.node_count).toBe(2)
+    expect(shot.link_count).toBe(1)
+    expect(shot.workflow_name).toBe('demo')
+    expect(shot.truncated).toBe(false)
+    expect(shot.links).toEqual([{ from: 4, from_slot: 0, to: 7, to_slot: 0 }])
+    // Widget values cost tokens: not sent unless the host asks for them.
+    expect(shot.nodes[0]).toEqual({ id: 4, type: 'CheckpointLoaderSimple' })
+    expect(shot.nodes[1]).toEqual({ id: 7, type: 'KSampler', title: '采样' })
+  })
+
+  it('reads node parameters when the host asks for them', async () => {
+    installCanvasApp({ nodes: [{ id: 4, type: 'KSampler', widgets_values: [20, 'euler'] }] })
+    boot()
+
+    const shot = (await canvasCall()('snapshot', { include_widgets: true })).result as {
+      nodes: { widgets?: string }[]
+    }
+    expect(shot.nodes[0]?.widgets).toBe('[20,"euler"]')
+  })
+
+  it('says so when the frontend exposes no graph to read', async () => {
+    boot()
+
+    const answer = await canvasCall()('snapshot', {})
+    expect(answer.ok).toBe(false)
+    expect(answer.error).toContain('读不到画布')
+  })
+
+  it('loads a workflow into the canvas through the frontend API', async () => {
+    const app = installCanvasApp({ nodes: [{ id: 1, type: 'KSampler' }], links: [] })
+    boot()
+
+    const answer = await canvasCall()('load_workflow', {
+      graph: { nodes: [], links: [] },
+      name: '我的图'
+    })
+    expect(answer.ok).toBe(true)
+    expect(app.loadGraphData).toHaveBeenCalledWith({ nodes: [], links: [] }, true, true, '我的图')
+    expect(answer.result).toEqual({ loaded: true, node_count: 1 })
+  })
+
+  it('rejects a graph that is not a workflow object', async () => {
+    const app = installCanvasApp()
+    boot()
+
+    const answer = await canvasCall()('load_workflow', { graph: 'nope' })
+    expect(answer.ok).toBe(false)
+    expect(answer.error).toContain('graph')
+    expect(app.loadGraphData).not.toHaveBeenCalled()
+  })
+
+  it('refuses an unknown canvas op instead of doing nothing', async () => {
+    installCanvasApp()
+    boot()
+
+    const answer = await canvasCall()('teleport', {})
+    expect(answer.ok).toBe(false)
+    expect(answer.error).toContain('不认识的画布动作')
   })
 
 })

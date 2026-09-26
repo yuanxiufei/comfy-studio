@@ -36,12 +36,24 @@ TIMEOUT = 90.0
 SKILLS_TIMEOUT = 180.0
 
 
+def _last_user_text(messages: list[dict]) -> str:
+    """从请求体的对话里取最后一句用户话（判断是不是那次"慢慢来"的请求）。"""
+    for item in reversed(messages):
+        if item.get("role") == "user":
+            return str(item.get("content") or "")
+    return ""
+
+
 class _FakeCompletions(BaseHTTPRequestHandler):
     """假 chat completions 服务：先要工具、再给结论；顺带提供 ``GET /models``。"""
 
     #: 每次 chat completions 请求体里的 model（验证切换真的落到了请求上）。
     seen_models: list[str] = []
     lock = threading.Lock()
+
+    #: 用户话里带这个标记就让这次回答慢慢来：取消用例需要一个**真的在飞**的轮次。
+    SLOW_MARKER = "慢慢来"
+    SLOW_SECONDS = 6.0
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler 的接口
         if self.path.rstrip("/").endswith("/models"):
@@ -61,6 +73,17 @@ class _FakeCompletions(BaseHTTPRequestHandler):
             self.seen_models.append(str(body.get("model")))
 
         messages = body.get("messages") or []
+        if self.SLOW_MARKER in _last_user_text(messages):
+            # 慢回答期间不调工具：整轮就卡在这次模型请求上，取消才有东西可取消。
+            time.sleep(self.SLOW_SECONDS)
+            self._json(
+                {
+                    "choices": [
+                        {"index": 0, "message": {"role": "assistant", "content": "慢回答也说完啦"}}
+                    ]
+                }
+            )
+            return
         tool_messages = [m for m in messages if m.get("role") == "tool"]
         if tool_messages:
             count = len(json.loads(tool_messages[0]["content"]))
@@ -167,13 +190,16 @@ class StudioHostE2ETest(unittest.TestCase):
 
     # ---- 工具 -----------------------------------------------------------
 
-    def call(self, request_id: int, method: str, params: dict | None = None, timeout: float = TIMEOUT) -> dict:
+    def send(self, request_id: int, method: str, params: dict | None = None) -> None:
+        """只发不等：取消用例得在这一轮还没结束时插一脚。"""
         assert self.proc.stdin is not None
         self.proc.stdin.write(
             json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}})
             + "\n"
         )
         self.proc.stdin.flush()
+
+    def wait(self, request_id: int, timeout: float = TIMEOUT) -> dict:
         deadline = time.time() + timeout
         while time.time() < deadline:
             with self.lock:
@@ -181,7 +207,11 @@ class StudioHostE2ETest(unittest.TestCase):
                     if message.get("id") == request_id:
                         return message
             time.sleep(0.05)
-        self.fail(f"{method} 超时")
+        self.fail(f"id={request_id} 超时")
+
+    def call(self, request_id: int, method: str, params: dict | None = None, timeout: float = TIMEOUT) -> dict:
+        self.send(request_id, method, params)
+        return self.wait(request_id, timeout)
 
     def notifications(self, request_id: int) -> list[dict]:
         with self.lock:
@@ -292,6 +322,36 @@ class StudioHostE2ETest(unittest.TestCase):
             self.assertEqual(response.get("error", {}).get("code"), -32602, response)
         # 被拒的值不该改掉当前模型
         self.assertEqual(self.call(18, "agent/model").get("result", {}).get("model"), "other-model")
+
+    def test_14_a_running_turn_can_be_cancelled(self) -> None:
+        session = "cancel-e2e"
+        self.send(21, "agent/chat", {"text": "慢慢来，先别急着答", "session_id": session})
+        # 等它真走进模型请求：这时取消掉的才是"正在跑的一轮"。
+        time.sleep(1.5)
+        stopped = self.call(22, "agent/cancel", {"session_id": session}).get("result", {})
+        self.assertIs(stopped.get("cancelled"), True, stopped)
+
+        answer = self.wait(21).get("result", {})
+        # 取消不是失败：这一轮回的是正常结果，面板据此把气泡收成"已停止"。
+        self.assertNotIn("error", answer, answer)
+        self.assertIs(answer.get("cancelled"), True, answer)
+        self.assertEqual(answer.get("session_id"), session)
+
+    def test_15_the_session_still_works_after_a_cancel(self) -> None:
+        session = "cancel-e2e"
+        # 幂等：上一轮早停了，再叫一次只是白叫，不是错误。
+        again = self.call(23, "agent/cancel", {"session_id": session}).get("result", {})
+        self.assertEqual(again, {"session_id": session, "cancelled": False})
+
+        # 历史配对没被打断：取消完接着说下一句，照常走完工具再回答。
+        after = self.call(
+            24,
+            "agent/chat",
+            {"text": "取消之后还能说话吗？", "session_id": session},
+            timeout=SKILLS_TIMEOUT,
+        )
+        self.assertNotIn("error", after, after)
+        self.assertTrue(after.get("result", {}).get("text", "").startswith("本机有"), after)
 
 
 if __name__ == "__main__":
