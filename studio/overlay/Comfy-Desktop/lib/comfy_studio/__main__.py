@@ -61,6 +61,31 @@ def build_parser() -> argparse.ArgumentParser:
             "单独喂给别的 MCP 客户端时别开"
         ),
     )
+    parser.add_argument(
+        "--review",
+        action="store_true",
+        help=(
+            "挂上审核工具（review__ask_user）：agent 在关键节点问用户、等回答。"
+            "要靠桌面壳把 agent/event 里的 ask_user 画成问答卡，并回 agent/answer，"
+            "单独喂给别的 MCP 客户端时别开"
+        ),
+    )
+    parser.add_argument(
+        "--input-dir",
+        default=None,
+        help=(
+            "ComfyUI 的 input 目录（localfiles 工具往里接本地素材）；"
+            "默认取 <comfyui-dir>/input，引擎用 --input-directory 改过时才需要给"
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help=(
+            "ComfyUI 的 output 目录（localfiles 工具据此报产出路径）；"
+            "默认取 <comfyui-dir>/output，引擎用 --output-directory 改过时才需要给"
+        ),
+    )
     return parser
 
 
@@ -85,6 +110,9 @@ def main(argv: list[str] | None = None) -> int:
                 comfyui_dir=args.comfyui_dir or os.environ.get("COMFYUI_DIR"),
                 comfy_url=args.comfy_url,
                 canvas=args.canvas,
+                review=args.review,
+                input_dir=args.input_dir or os.environ.get("COMFY_INPUT_DIR"),
+                output_dir=args.output_dir or os.environ.get("COMFY_OUTPUT_DIR"),
             )
         )
     except KeyboardInterrupt:  # 桌面壳正常退出时是关掉 stdin，这条只为手动 Ctrl+C

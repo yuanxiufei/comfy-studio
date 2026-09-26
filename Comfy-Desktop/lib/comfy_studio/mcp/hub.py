@@ -52,17 +52,27 @@ class McpHub:
         return list(self._tools.values())
 
     def servers(self) -> list[dict[str, object]]:
-        return [
-            {
-                "name": client.config.name,
-                "command": client.config.command,
-                "args": list(client.config.args),
-                "cwd": client.config.cwd,
-                "alive": client.alive,
-                "stderr_tail": client.stderr_tail(),
-            }
-            for client in self._clients
-        ]
+        """每个 server 的名字、启动方式、存活与报错尾巴。
+
+        ``transport`` 必须报出来：表里既有 stdio 子进程，也有**跑在宿主进程里**的回程通道
+        （画布 / 审核，见 :mod:`comfy_studio.channel`）。后者没有 ``command``，不能拿
+        stdio 那套字段去套它——照报 None 会让调用方以为"命令没配好"。
+        """
+        servers: list[dict[str, object]] = []
+        for client in self._clients:
+            stdio = isinstance(client, McpStdioClient)
+            servers.append(
+                {
+                    "name": client.config.name,
+                    "transport": "stdio" if stdio else "in-process",
+                    "command": client.config.command if stdio else None,
+                    "args": list(client.config.args) if stdio else [],
+                    "cwd": client.config.cwd if stdio else None,
+                    "alive": client.alive,
+                    "stderr_tail": client.stderr_tail(),
+                }
+            )
+        return servers
 
     async def call_tool(
         self,

@@ -3,19 +3,27 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from typing import Any
 
 from ..engine import EngineError, MODEL_PROBES
 from ..mcp.tools import Tool, build_tools, error_result, schema_for, text_result
-from ..skills import load_skills, WORKFLOWS_DIR
+from ..skills import SkillRegistry, load_skills, WORKFLOWS_DIR
 from ..skills.types import SkillParam
-from .support import FakeEngine, make_skill
+from .support import FakeEngine, WORKFLOW, make_skill
+
+
+def registry_of(skills: tuple[Any, ...]) -> SkillRegistry:
+    """只有内存里这几份 skill 的视图（工具测试不碰磁盘）。"""
+    return SkillRegistry.in_memory(skills)
 
 GENERIC_TOOLS = [
     "comfy_list_models",
     "comfy_list_skills",
     "comfy_run_skill",
+    "comfy_save_skill",
     "comfy_submit_workflow",
     "comfy_get_history",
     "comfy_get_queue",
@@ -79,7 +87,7 @@ class SchemaTest(unittest.TestCase):
         self.assertNotIn("required", schema_for(make_skill()))
 
     def test_tool_describe_matches_the_mcp_shape(self) -> None:
-        tool = tool_by_name(build_tools(FakeEngine(), ()), "comfy_get_queue")
+        tool = tool_by_name(build_tools(FakeEngine(), registry_of(())), "comfy_get_queue")
         described = tool.describe()
         self.assertEqual(set(described), {"name", "description", "inputSchema"})
         self.assertEqual(described["inputSchema"]["type"], "object")
@@ -89,12 +97,12 @@ class ToolSurfaceTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.engine = FakeEngine()
         self.skills = load_skills(WORKFLOWS_DIR)
-        self.tools = build_tools(self.engine, self.skills)
+        self.tools = build_tools(self.engine, registry_of(self.skills))
 
     async def call(self, name: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
         return await tool_by_name(self.tools, name).handler(args or {})
 
-    def test_exposes_seven_generic_tools_plus_one_per_skill(self) -> None:
+    def test_exposes_generic_tools_plus_one_per_skill(self) -> None:
         names = [t.name for t in self.tools]
         self.assertEqual(names[: len(GENERIC_TOOLS)], GENERIC_TOOLS)
         self.assertEqual(names[len(GENERIC_TOOLS) :], [f"skill__{s.id}" for s in self.skills])
@@ -141,7 +149,7 @@ class ToolSurfaceTest(unittest.IsolatedAsyncioTestCase):
 class SkillToolTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.engine = FakeEngine()
-        self.tools = build_tools(self.engine, load_skills(WORKFLOWS_DIR))
+        self.tools = build_tools(self.engine, registry_of(load_skills(WORKFLOWS_DIR)))
 
     async def call(self, name: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
         return await tool_by_name(self.tools, name).handler(args or {})
@@ -192,7 +200,7 @@ class SkillToolTest(unittest.IsolatedAsyncioTestCase):
 class WorkflowToolTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.engine = FakeEngine()
-        self.tools = build_tools(self.engine, load_skills(WORKFLOWS_DIR))
+        self.tools = build_tools(self.engine, registry_of(load_skills(WORKFLOWS_DIR)))
 
     async def call(self, name: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
         return await tool_by_name(self.tools, name).handler(args or {})
@@ -223,6 +231,128 @@ class WorkflowToolTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual((await self.call("comfy_interrupt"))["content"][0]["text"], "interrupted")
         self.assertEqual(self.engine.interrupts, 1)
+
+
+class SaveSkillToolTest(unittest.IsolatedAsyncioTestCase):
+    """``comfy_save_skill``：把对话里打磨好的工作流沉淀成用户自己的 skill。
+
+    这里刻意用**真的两个目录**（内置目录 = 随包那份，用户目录 = 临时目录），因为这条
+    能力的要害就是"落盘之后立刻能用"，纯内存视图测不出这件事。
+    """
+
+    def setUp(self) -> None:
+        self.engine = FakeEngine()
+        self.tmp = tempfile.TemporaryDirectory(prefix="comfy-studio-store-")
+        self.addCleanup(self.tmp.cleanup)
+        self.user_dir = Path(self.tmp.name)
+        self.registry = SkillRegistry(builtin_dir=WORKFLOWS_DIR, user_dir=self.user_dir)
+        self.registry.reload()
+        self.tools = build_tools(self.engine, self.registry)
+
+    async def call(self, name: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
+        return await tool_by_name(self.tools, name).handler(args or {})
+
+    def document(self, **overrides: Any) -> dict[str, Any]:
+        workflow = {k: dict(v) for k, v in WORKFLOW.items()}
+        workflow["6"] = {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ["4", 1]}}
+        doc: dict[str, Any] = {
+            "id": "cat-portrait",
+            "title": "猫肖像",
+            "description": "固定好模型与采样参数，只调提示词反复出图",
+            "tags": ["人像"],
+            "workflow": workflow,
+            "params": [
+                {"name": "ckpt_name", "type": "string", "node": "4", "field": "ckpt_name", "required": True},
+                {"name": "positive", "type": "string", "node": "6", "field": "text", "default": "a cat"},
+            ],
+        }
+        doc.update(overrides)
+        return doc
+
+    async def test_a_saved_skill_is_listable_and_runnable_right_away(self) -> None:
+        saved = as_json(await self.call("comfy_save_skill", self.document()))
+        self.assertEqual(saved["id"], "cat-portrait")
+        self.assertEqual(Path(saved["file"]).parent, self.user_dir)
+        self.assertTrue((self.user_dir / "cat-portrait.json").is_file())
+
+        listed = {s["id"] for s in as_json(await self.call("comfy_list_skills"))}
+        self.assertEqual(listed, {"text-to-image", "cat-portrait"})
+
+        # 不用重启、也不用重建工具表，立刻就能跑它
+        result = await self.call(
+            "comfy_run_skill",
+            {"skill_id": "cat-portrait", "params": {"ckpt_name": "b.safetensors", "positive": "黑猫"}},
+        )
+        self.assertEqual(as_json(result)["prompt_id"], "prompt-1")
+        self.assertEqual(self.engine.submitted[0]["4"]["inputs"]["ckpt_name"], "b.safetensors")
+        self.assertEqual(self.engine.submitted[0]["6"]["inputs"]["text"], "黑猫")
+
+        with self.assertRaises(ValueError) as ctx:  # 必填项照样拦
+            await self.call("comfy_run_skill", {"skill_id": "cat-portrait", "params": {}})
+        self.assertIn("ckpt_name", str(ctx.exception))
+
+    async def test_it_does_not_clobber_an_existing_skill_on_its_own(self) -> None:
+        await self.call("comfy_save_skill", self.document())
+
+        with self.assertRaises(ValueError) as ctx:
+            await self.call("comfy_save_skill", self.document(title="改个名"))
+        self.assertIn("overwrite", str(ctx.exception))
+        self.assertEqual(self.registry.get("cat-portrait").title, "猫肖像")
+
+        saved = as_json(await self.call("comfy_save_skill", {**self.document(title="改个名"), "overwrite": True}))
+        self.assertEqual(saved["title"], "改个名")
+        self.assertEqual(self.registry.get("cat-portrait").title, "改个名")
+
+    async def test_builtin_skills_cannot_be_overwritten(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            await self.call("comfy_save_skill", self.document(id="text-to-image", overwrite=True))
+        self.assertIn("随包自带", str(ctx.exception))
+        self.assertFalse((self.user_dir / "text-to-image.json").exists())
+
+    async def test_the_document_is_checked_against_the_workflow(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            await self.call(
+                "comfy_save_skill",
+                self.document(params=[{"name": "steps", "type": "integer", "node": "99", "field": "steps"}]),
+            )
+        self.assertIn("不在 workflow 里", str(ctx.exception))
+
+        with self.assertRaises(ValueError) as ctx:
+            await self.call(
+                "comfy_save_skill",
+                self.document(params=[{"name": "steps", "type": "integer", "node": "4", "field": "steps"}]),
+            )
+        self.assertIn("不是节点 4 的输入", str(ctx.exception))
+
+        with self.assertRaises(ValueError):  # title/description 是给用户看的，不许空着
+            await self.call("comfy_save_skill", self.document(title=""))
+        self.assertEqual(list(self.user_dir.glob("*.json")), [])
+
+    async def test_unknown_fields_and_bad_ids_are_refused(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            await self.call("comfy_save_skill", {**self.document(), "nope": 1})
+        self.assertIn("不认识的字段: nope", str(ctx.exception))
+
+        with self.assertRaises(ValueError) as ctx:  # id 会成为文件名，必须安全
+            await self.call("comfy_save_skill", self.document(id="../跑出去"))
+        self.assertIn("不能当文件名", str(ctx.exception))
+
+        with self.assertRaises(ValueError):
+            await self.call("comfy_save_skill", {**self.document(), "overwrite": "yes"})
+        self.assertEqual(list(self.user_dir.glob("*.json")), [])
+
+    async def test_the_file_round_trips_through_a_fresh_load(self) -> None:
+        await self.call("comfy_save_skill", self.document())
+
+        # 换一个 registry 重新读盘 = 下次启动的视角
+        fresh = SkillRegistry(builtin_dir=WORKFLOWS_DIR, user_dir=self.user_dir)
+        fresh.reload()
+        skill = fresh.get("cat-portrait")
+        self.assertIsNotNone(skill)
+        self.assertEqual([p.name for p in skill.params], ["ckpt_name", "positive"])
+        self.assertTrue(skill.params[1].has_default)
+        self.assertEqual(skill.params[1].default, "a cat")
+        self.assertEqual(skill.tags, ("人像",))
 
 
 if __name__ == "__main__":

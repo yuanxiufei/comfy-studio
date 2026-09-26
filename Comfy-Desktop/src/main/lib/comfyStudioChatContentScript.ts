@@ -38,6 +38,12 @@ let cachedScript: string | null = null
  * `window.__comfyStudioChat.canvasCall(op, args)` here. Every op is a thin wrapper
  * over the ComfyUI frontend's own `window.comfyAPI.app.app`, and a missing global
  * is reported as an error rather than as an empty graph.
+ *
+ * Review: `review__ask_user` (see `lib/comfy_studio/review.py`) parks the host's
+ * turn until a human answers, and the only human in reach is the one looking at
+ * this drawer. The event paints a question card; submitting it posts
+ * `agent/answer`. An answer that arrives after the host stopped waiting comes
+ * back as `delivered: false` — late, not wrong — so the card just says so.
  */
 const STUDIO_CHAT_MAIN_JS = `
 var STATE = window.__comfyStudioChat;
@@ -97,7 +103,32 @@ var CHAT_CSS =
   '#' + DRAWER_ID + ' .cs-block{margin:0;font-family:var(--cs-mono);font-size:11px;white-space:pre-wrap;' +
   'word-break:break-word;max-height:220px;overflow:auto;}' +
   '#' + DRAWER_ID + ' .cs-block-more{border:1px solid ' + BORDER + ';border-radius:4px;background:transparent;' +
-  'color:' + MUTED + ';cursor:pointer;font:inherit;font-size:11px;padding:1px 6px;margin-top:4px;}';
+  'color:' + MUTED + ';cursor:pointer;font:inherit;font-size:11px;padding:1px 6px;margin-top:4px;}' +
+  // 审核节点：agent 停下来问用户。问句是主角，给一条琥珀色边，跟工具卡的灰边分开；
+  // 答完的状态（已答 / 没赶上 / 没送到）用 data-state 换边色，不再靠改内联样式。
+  '#' + DRAWER_ID + ' .cs-ask{align-self:stretch;display:flex;flex-direction:column;gap:6px;' +
+  'border:1px solid #e0b40055;background:#e0b4000f;}' +
+  '#' + DRAWER_ID + ' .cs-ask-q{font-weight:600;}' +
+  '#' + DRAWER_ID + ' .cs-ask-options{display:flex;flex-wrap:wrap;gap:6px;}' +
+  '#' + DRAWER_ID + ' .cs-ask-option{border:1px solid ' + BORDER + ';border-radius:4px;background:transparent;' +
+  'color:inherit;cursor:pointer;font:inherit;font-size:12px;padding:3px 8px;}' +
+  '#' + DRAWER_ID + ' .cs-ask-option:hover{background:' + INPUT_BG + ';}' +
+  '#' + DRAWER_ID + ' .cs-ask-form{display:flex;gap:6px;}' +
+  '#' + DRAWER_ID + ' .cs-ask-input{flex:1;min-width:0;box-sizing:border-box;border:1px solid ' + BORDER + ';' +
+  'border-radius:4px;background:' + INPUT_BG + ';color:inherit;font:inherit;font-size:12px;padding:4px 6px;}' +
+  '#' + DRAWER_ID + ' .cs-ask-send{border:1px solid ' + BORDER + ';border-radius:4px;background:transparent;' +
+  'color:inherit;cursor:pointer;font:inherit;font-size:12px;padding:3px 10px;}' +
+  '#' + DRAWER_ID + ' .cs-ask-note{color:' + MUTED + ';font-size:11px;}' +
+  '#' + DRAWER_ID + ' .cs-ask[data-state="answered"]{border-color:#3fa34d55;background:#3fa34d0f;}' +
+  '#' + DRAWER_ID + ' .cs-ask[data-state="failed"]{border-color:#d9534f55;background:#d9534f0f;}' +
+  '#' + DRAWER_ID + ' .cs-ask[data-state="stale"]{border-color:' + BORDER + ';background:transparent;}' +
+  // 已经在送、或已经有答案了，就把输入收起来：留着会让人以为还能再答一次
+  '#' + DRAWER_ID + ' .cs-ask[data-state="sending"] .cs-ask-form,' +
+  '#' + DRAWER_ID + ' .cs-ask[data-state="sending"] .cs-ask-options,' +
+  '#' + DRAWER_ID + ' .cs-ask[data-state="answered"] .cs-ask-form,' +
+  '#' + DRAWER_ID + ' .cs-ask[data-state="answered"] .cs-ask-options,' +
+  '#' + DRAWER_ID + ' .cs-ask[data-state="stale"] .cs-ask-form,' +
+  '#' + DRAWER_ID + ' .cs-ask[data-state="stale"] .cs-ask-options{display:none;}';
 
 function ensureStyle() {
   if (document.getElementById(STYLE_ID)) return;
@@ -605,6 +636,11 @@ function onEvent(payload) {
     addToolResult(params);
     return;
   }
+  if (type === 'ask_user') {
+    // 审核节点：宿主那张 review__ask_user 正挂着等这张卡片的回答。
+    addAskUser(params);
+    return;
+  }
   // final 不画：最终文本由请求结果给，画两遍就重复了。
 }
 
@@ -950,6 +986,110 @@ STATE.canvasCall = function (op, args) {
     return Promise.resolve(failed(err));
   }
 };
+
+// ---- 审核节点：agent 停下来问用户 ---------------------------------------
+
+// 宿主那张 review__ask_user 会一直挂着等回答（见 lib/comfy_studio/review.py），
+// 这张卡片就是它等的那个回答。答完用 agent/answer 送回去；送晚了（宿主那边已经超时、
+// 或者这一轮被停掉）不算错误——宿主回 delivered:false，这里把卡片标成"没被用上"。
+function addAskUser(params) {
+  var card = makeRow('ask');
+  card.setAttribute('data-state', 'waiting');
+  var callId = params && params.call_id != null ? String(params.call_id) : '';
+
+  var question = document.createElement('div');
+  question.className = 'cs-ask-q';
+  // 没有 question 是宿主/模型那头的问题，但卡片照样画出来让人看见，不静默吞掉。
+  question.textContent = String((params && params.question) || '（没问题内容）');
+  card.appendChild(question);
+
+  var note = document.createElement('div');
+  note.className = 'cs-ask-note';
+
+  function finish(text) {
+    // 一次只送一条：state 一离开 waiting 就锁住，省得双击把同一个回答送两遍。
+    if (card.getAttribute('data-state') !== 'waiting') return;
+    if (text === '') return;
+    if (callId === '') {
+      card.setAttribute('data-state', 'failed');
+      note.textContent = '这张卡片没带 call_id，回答送不回去';
+      return;
+    }
+    card.setAttribute('data-state', 'sending');
+    note.textContent = '正在送回宿主…';
+    Promise.resolve(bridge.request('agent/answer', { call_id: callId, answer: text })).then(
+      function (response) {
+        if (!response || response.ok !== true) {
+          var error = (response && response.error) || {};
+          card.setAttribute('data-state', 'failed');
+          note.textContent = '回答没送到: ' + (error.message || '未知错误');
+          return;
+        }
+        if (!response.result || response.result.delivered !== true) {
+          // 幂等：这一轮已经不等了（超时、被停、已经收过）。人答晚了不是错误。
+          card.setAttribute('data-state', 'stale');
+          note.textContent = '这一轮已经不等了（超时或已停），回答没被用上';
+          return;
+        }
+        card.setAttribute('data-state', 'answered');
+        note.textContent = '已回答：' + text;
+      },
+      function (err) {
+        card.setAttribute('data-state', 'failed');
+        note.textContent = '回答没送到: ' + message(err);
+      }
+    );
+  }
+
+  var options = (params && params.options) || [];
+  if (options.length) {
+    var row = document.createElement('div');
+    row.className = 'cs-ask-options';
+    for (var i = 0; i < options.length; i++) {
+      var option = document.createElement('button');
+      option.type = 'button';
+      option.className = 'cs-ask-option';
+      var label = String(options[i]);
+      option.textContent = label;
+      // 点选项 = 拿那一条当回答，跟手打进去走同一条路。
+      option.addEventListener(
+        'click',
+        (function (chosen) {
+          return function () {
+            finish(chosen);
+          };
+        })(label)
+      );
+      row.appendChild(option);
+    }
+    card.appendChild(row);
+  }
+
+  var form = document.createElement('form');
+  form.className = 'cs-ask-form';
+  var input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'cs-ask-input';
+  input.placeholder = options.length ? '或直接回答…' : '直接回答…';
+  input.setAttribute('aria-label', '回答 agent 的问题');
+  var send = document.createElement('button');
+  send.type = 'submit';
+  send.className = 'cs-ask-send';
+  send.textContent = '回答';
+  form.appendChild(input);
+  form.appendChild(send);
+  form.addEventListener('submit', function (event) {
+    event.preventDefault();
+    finish(input.value.trim());
+  });
+  card.appendChild(form);
+  card.appendChild(note);
+
+  appendNode(card);
+  // 抽屉开着就把光标送进输入框：问题是为它弹出来的，人正要回它。
+  if (STATE.open) input.focus();
+  return card;
+}
 
 start();
 `

@@ -711,4 +711,180 @@ describe('getComfyStudioChatContentScript', () => {
     expect(answer.error).toContain('不认识的画布动作')
   })
 
+  // ---- 审核节点：宿主问、人答、回答用 agent/answer 送回去 -------------------
+
+  const askCards = (): Element[] =>
+    Array.from(document.querySelectorAll(`#${LOG_ID} [data-kind="ask"]`))
+
+  const optionLabels = (card: Element): string[] =>
+    Array.from(card.querySelectorAll('.cs-ask-option')).map((o) => o.textContent ?? '')
+
+  const noteOf = (card: Element): string => card.querySelector('.cs-ask-note')?.textContent ?? ''
+
+  /** agent/answer 那次请求的参数，没发过就是 undefined。 */
+  const answerCall = (
+    request: ReturnType<typeof vi.fn>
+  ): [string, Record<string, unknown>] | undefined =>
+    request.mock.calls.find((call) => call[0] === 'agent/answer') as
+      | [string, Record<string, unknown>]
+      | undefined
+
+  /**
+   * 起一轮，并让 agent/chat 一直挂着——审核节点只在"一轮在飞"时才有落脚处。
+   */
+  const startTurn = async (request: ReturnType<typeof vi.fn>): Promise<void> => {
+    installBridge({ request })
+    setupDom()
+    new Function(script)()
+    await openPanel()
+    const input = document.getElementById(INPUT_ID) as HTMLTextAreaElement
+    input.value = '开始'
+    document.getElementById(SEND_ID)?.click() // 不 await：这一轮在飞行中
+    await flush()
+  }
+
+  const turnThen = (
+    onAnswer: (params: Record<string, unknown>) => unknown
+  ): ReturnType<typeof vi.fn> =>
+    vi.fn((method: string, params: unknown) => {
+      if (method === 'agent/chat') return new Promise(() => {}) // 这一轮不回来
+      if (method === 'agent/answer') return onAnswer((params ?? {}) as Record<string, unknown>)
+      return { ok: true, result: {} }
+    })
+
+  const askEvent = (overrides: Record<string, unknown> = {}): void => {
+    emit({
+      params: {
+        type: 'ask_user',
+        call_id: 'ask-1',
+        question: '用哪套工作流？',
+        options: ['SDXL', 'Flux'],
+        ...overrides
+      }
+    })
+  }
+
+  it('paints the question and its options when the host asks', async () => {
+    await startTurn(turnThen(() => ({ ok: true, result: { delivered: true } })))
+
+    askEvent()
+
+    const cards = askCards()
+    expect(cards).toHaveLength(1)
+    expect(cards[0]?.getAttribute('data-state')).toBe('waiting')
+    expect(cards[0]?.querySelector('.cs-ask-q')?.textContent).toBe('用哪套工作流？')
+    expect(optionLabels(cards[0]!)).toEqual(['SDXL', 'Flux'])
+  })
+
+  it('sends a clicked option back as the answer', async () => {
+    const request = turnThen(() => ({ ok: true, result: { delivered: true } }))
+    await startTurn(request)
+    askEvent()
+
+    const card = askCards()[0]!
+    ;(card.querySelector('.cs-ask-option') as HTMLButtonElement).click()
+    await flush()
+
+    expect(answerCall(request)?.[1]).toEqual({ call_id: 'ask-1', answer: 'SDXL' })
+    expect(card.getAttribute('data-state')).toBe('answered')
+    expect(noteOf(card)).toContain('已回答：SDXL')
+  })
+
+  it('sends a typed answer, trimmed', async () => {
+    const request = turnThen(() => ({ ok: true, result: { delivered: true } }))
+    await startTurn(request)
+    askEvent()
+
+    const card = askCards()[0]!
+    const input = card.querySelector('.cs-ask-input') as HTMLInputElement
+    input.value = '  用 Flux 那套  '
+    card.querySelector('form')!.dispatchEvent(new Event('submit', { cancelable: true }))
+    await flush()
+
+    expect(answerCall(request)?.[1]).toEqual({ call_id: 'ask-1', answer: '用 Flux 那套' })
+  })
+
+  it('allows a free answer when the host offered no options', async () => {
+    const request = turnThen(() => ({ ok: true, result: { delivered: true } }))
+    await startTurn(request)
+    askEvent({ options: [] })
+
+    const card = askCards()[0]!
+    expect(optionLabels(card)).toEqual([])
+    const input = card.querySelector('.cs-ask-input') as HTMLInputElement
+    input.value = '随你'
+    card.querySelector('form')!.dispatchEvent(new Event('submit', { cancelable: true }))
+    await flush()
+
+    expect(answerCall(request)?.[1]).toEqual({ call_id: 'ask-1', answer: '随你' })
+  })
+
+  it('says the answer was too late instead of pretending it landed', async () => {
+    // 宿主已经不等了（超时/被停/已收过）：delivered:false。人答晚了不是错误。
+    const request = turnThen(() => ({ ok: true, result: { call_id: 'ask-1', delivered: false } }))
+    await startTurn(request)
+    askEvent()
+
+    const card = askCards()[0]!
+    ;(card.querySelector('.cs-ask-option') as HTMLButtonElement).click()
+    await flush()
+
+    expect(card.getAttribute('data-state')).toBe('stale')
+    expect(noteOf(card)).toContain('不等了')
+  })
+
+  it('reports a send failure on the card', async () => {
+    const request = turnThen(() => ({ ok: false, error: { code: -32603, message: '宿主没在跑' } }))
+    await startTurn(request)
+    askEvent()
+
+    const card = askCards()[0]!
+    ;(card.querySelector('.cs-ask-option') as HTMLButtonElement).click()
+    await flush()
+
+    expect(card.getAttribute('data-state')).toBe('failed')
+    expect(noteOf(card)).toContain('回答没送到: 宿主没在跑')
+  })
+
+  it('does not send anything twice for the same question', async () => {
+    const request = turnThen(() => ({ ok: true, result: { delivered: true } }))
+    await startTurn(request)
+    askEvent()
+
+    const card = askCards()[0]!
+    const option = card.querySelector('.cs-ask-option') as HTMLButtonElement
+    option.click()
+    option.click() // 手抖点第二下：同一个回答不该送两遍
+    await flush()
+
+    const sent = request.mock.calls.filter((call) => call[0] === 'agent/answer')
+    expect(sent).toHaveLength(1)
+  })
+
+  it('flags a card that carries no call_id instead of posting a stray answer', async () => {
+    const request = turnThen(() => ({ ok: true, result: { delivered: true } }))
+    await startTurn(request)
+    askEvent({ call_id: undefined, options: [] })
+
+    const card = askCards()[0]!
+    const input = card.querySelector('.cs-ask-input') as HTMLInputElement
+    input.value = '随便'
+    card.querySelector('form')!.dispatchEvent(new Event('submit', { cancelable: true }))
+    await flush()
+
+    expect(answerCall(request)).toBeUndefined()
+    expect(card.getAttribute('data-state')).toBe('failed')
+    expect(noteOf(card)).toContain('call_id')
+  })
+
+  it('ignores an ask event that arrives with no turn in flight', () => {
+    installBridge()
+    setupDom()
+    new Function(script)()
+
+    askEvent()
+
+    expect(askCards()).toHaveLength(0)
+  })
+
 })

@@ -117,6 +117,37 @@ def validate_skill(raw: Any, source: str) -> Skill:
     )
 
 
+def skill_to_json(skill: Skill) -> dict[str, Any]:
+    """把 Skill 还原成 skill 文件的内容（:func:`validate_skill` 的逆）。
+
+    写盘与回显都走这里：这样"存进去的文件"和"读出来的内存对象"是同一套字段，
+    不会出现存进去能读、读出来再存字段却丢了的情况（``default: null`` 与"没声明
+    default"的区分也靠它保住）。
+    """
+    params: list[dict[str, Any]] = []
+    for p in skill.params:
+        item: dict[str, Any] = {
+            "name": p.name,
+            "type": p.type,
+            "node": p.node,
+            "field": p.field,
+            "required": p.required,
+        }
+        if p.description is not None:
+            item["description"] = p.description
+        if p.has_default:
+            item["default"] = p.default
+        params.append(item)
+    return {
+        "id": skill.id,
+        "title": skill.title,
+        "description": skill.description,
+        "tags": list(skill.tags),
+        "workflow": skill.workflow,
+        "params": params,
+    }
+
+
 def load_skill_file(path: str | Path) -> Skill:
     p = Path(path)
     try:
@@ -137,4 +168,4 @@ def load_skills(directory: str | Path) -> tuple[Skill, ...]:
     return tuple(load_skill_file(f) for f in files)
 
 
-__all__ = ["load_skill_file", "load_skills", "validate_skill"]
+__all__ = ["load_skill_file", "load_skills", "skill_to_json", "validate_skill"]

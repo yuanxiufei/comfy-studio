@@ -21,30 +21,53 @@ from aiohttp import web
 from .agent import AgentError, AgentEvent, LLMConfig, LLMError, OpenAIChatClient
 from .agent.loop import AgentSession
 from .engine import EngineError, get_engine
-from .mcp.server import load_default_skills, skills_dir
-from .mcp.tools import build_tools
+from .mcp.server import skills_dir
+from .mcp.tools import build_tools, skill_entry
+from .skills import Skill, SkillRegistry, user_skills_dir
 
 PREFIX = "/comfy-studio"
 
 #: 同时在内存里保留多少个对话会话（按最近使用淘汰，超出的关闭其模型连接）。
 MAX_SESSIONS = 8
 
-_skill_cache: tuple[float, tuple[Any, ...]] | None = None
+_registry: SkillRegistry | None = None
+_skill_stamp: tuple[tuple[str, float], ...] | None = None
 _sessions: dict[str, AgentSession] = {}
 
 
-def _skills() -> tuple[Any, ...]:
-    """加载 skill，目录内文件的时间戳没变就复用上次结果。"""
-    global _skill_cache
-    directory = Path(skills_dir())
-    stamp = 0.0
-    if directory.is_dir():
-        stamp = max((f.stat().st_mtime for f in directory.iterdir() if f.suffix == ".json"), default=0.0)
-    if _skill_cache is not None and _skill_cache[0] == stamp:
-        return _skill_cache[1]
-    loaded = load_default_skills()
-    _skill_cache = (stamp, loaded)
-    return loaded
+def _skills_stamp() -> tuple[tuple[str, float], ...]:
+    """两个 skill 目录（内置 + 用户）的指纹：增删改任何一个文件都会变。"""
+    entries: list[tuple[str, float]] = []
+    for directory in (skills_dir(), user_skills_dir()):
+        d = Path(directory)
+        if not d.is_dir():
+            continue
+        entries.extend(
+            (str(f), f.stat().st_mtime) for f in sorted(d.iterdir()) if f.is_file() and f.suffix == ".json"
+        )
+    return tuple(entries)
+
+
+def _skill_registry() -> SkillRegistry:
+    """skill 目录视图：内容没变就复用上次加载结果。
+
+    **只换内容、不换对象**（除非目录本身变了）：已经开着的会话把 registry 闭包进了工具集，
+    每次请求都新建一个对象的话，"对话里刚存下的 skill"在同一个会话里就看不见了。
+    """
+    global _registry, _skill_stamp
+    dirs = (Path(skills_dir()), Path(user_skills_dir()))
+    if _registry is None or (_registry.builtin_dir, _registry.user_dir) != dirs:
+        _registry = SkillRegistry(builtin_dir=dirs[0], user_dir=dirs[1])
+        _skill_stamp = None
+    stamp = _skills_stamp()
+    if _skill_stamp != stamp:
+        _registry.reload()
+        _skill_stamp = stamp
+    return _registry
+
+
+def _skills() -> tuple[Skill, ...]:
+    return _skill_registry().all()
 
 
 def _error(status: int, message: str) -> web.Response:
@@ -67,7 +90,7 @@ async def _read_json(request: web.Request) -> dict[str, Any]:
     return body
 
 
-def _session(session_id: str, engine: Any, skills: tuple[Any, ...]) -> AgentSession:
+def _session(session_id: str, engine: Any, registry: SkillRegistry) -> AgentSession:
     """取（或建）一个对话会话；超出上限就淘汰最久未用的那个。"""
     existing = _sessions.get(session_id)
     if existing is not None:
@@ -81,7 +104,7 @@ def _session(session_id: str, engine: Any, skills: tuple[Any, ...]) -> AgentSess
         # 连接交给事件循环回收；这里只保证不泄漏 session 对象。
         oldest.messages.clear()
 
-    created = AgentSession(engine, build_tools(engine, skills), OpenAIChatClient(LLMConfig.from_env()))
+    created = AgentSession(engine, build_tools(engine, registry), OpenAIChatClient(LLMConfig.from_env()))
     _sessions[session_id] = created
     return created
 
@@ -95,29 +118,16 @@ def register_routes() -> None:
 
     @router.get(f"{PREFIX}/skills")
     async def list_skills(_request: web.Request) -> web.Response:
-        loaded = _skills()
+        try:
+            loaded = _skills()
+        except (ValueError, OSError) as err:  # 目录里混了坏文件：如实报出来，别给个空列表
+            return _error(500, f"{type(err).__name__}: {err}")
         return web.json_response(
             {
                 "skills_dir": str(skills_dir()),
-                "skills": [
-                    {
-                        "id": s.id,
-                        "title": s.title,
-                        "description": s.description,
-                        "tags": list(s.tags),
-                        "params": [
-                            {
-                                "name": p.name,
-                                "type": p.type,
-                                "required": p.required,
-                                "default": p.default if p.has_default else None,
-                                "description": p.hint(),
-                            }
-                            for p in s.params
-                        ],
-                    }
-                    for s in loaded
-                ],
+                "user_skills_dir": str(user_skills_dir()),
+                # 形状与 MCP 工具返回的 skill_entry 一致，前端只认一套字段。
+                "skills": [skill_entry(s) for s in loaded],
             }
         )
 
@@ -141,7 +151,10 @@ def register_routes() -> None:
     @router.post(f"{PREFIX}/skills/{{skill_id}}/run")
     async def run_skill(request: web.Request) -> web.Response:
         skill_id = request.match_info["skill_id"]
-        skill = next((s for s in _skills() if s.id == skill_id), None)
+        try:
+            skill = _skill_registry().get(skill_id)
+        except (ValueError, OSError) as err:
+            return _error(500, f"{type(err).__name__}: {err}")
         if skill is None:
             return _error(404, f"没有 skill {skill_id}")
         try:
@@ -167,7 +180,7 @@ def register_routes() -> None:
                 "configured": True,
                 "model": config.model,
                 "base_url": config.base_url,
-                "tool_count": len(build_tools(engine, _skills())),
+                "tool_count": len(build_tools(engine, _skill_registry())),
             }
         )
 
@@ -183,7 +196,7 @@ def register_routes() -> None:
             return _bad_request(err)
 
         try:
-            session = _session(session_id, engine, _skills())
+            session = _session(session_id, engine, _skill_registry())
         except LLMError as err:
             return _error(503, str(err))
 

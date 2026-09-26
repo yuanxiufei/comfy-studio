@@ -8,12 +8,13 @@ from .server import (
     SERVER_NAME,
     SERVER_VERSION,
     create_server,
+    default_registry,
     load_default_skills,
     main,
     serve_stdio,
     skills_dir,
 )
-from .tools import Tool, build_tools, error_result, schema_for, text_result
+from .tools import Tool, build_tools, error_result, schema_for, skill_entry, text_result
 
 __all__ = [
     "PROTOCOL_VERSION",
@@ -24,11 +25,13 @@ __all__ = [
     "Tool",
     "build_tools",
     "create_server",
+    "default_registry",
     "error_result",
     "load_default_skills",
     "main",
     "schema_for",
     "serve_stdio",
+    "skill_entry",
     "skills_dir",
     "text_result",
 ]

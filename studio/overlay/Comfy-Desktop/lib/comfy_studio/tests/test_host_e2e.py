@@ -20,9 +20,11 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -55,6 +57,20 @@ class _FakeCompletions(BaseHTTPRequestHandler):
     SLOW_MARKER = "慢慢来"
     SLOW_SECONDS = 6.0
 
+    #: 用户话里带这个标记就让这一轮去调 ``review__ask_user``（审核节点用例）。
+    ASK_MARKER = "问我"
+    ASK_QUESTION = "用哪套工作流？"
+
+    #: 用户话里带这个标记就让这一轮把一套工作流沉淀成 skill（方法复用用例）。
+    SAVE_MARKER = "存下来"
+    SAVE_SKILL = {
+        "id": "e2e-saved",
+        "title": "对话里存下来的",
+        "description": "验证打磨好的工作流能沉淀成专属 skill",
+        "workflow": {"4": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "a.safetensors"}}},
+        "params": [{"name": "ckpt_name", "type": "string", "node": "4", "field": "ckpt_name", "required": True}],
+    }
+
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler 的接口
         if self.path.rstrip("/").endswith("/models"):
             self._json(
@@ -84,25 +100,74 @@ class _FakeCompletions(BaseHTTPRequestHandler):
                 }
             )
             return
-        tool_messages = [m for m in messages if m.get("role") == "tool"]
-        if tool_messages:
-            count = len(json.loads(tool_messages[0]["content"]))
-            message = {"role": "assistant", "content": f"本机有 {count} 个 skill"}
+        if self.SAVE_MARKER in _last_user_text(messages):
+            # 方法复用用例：第一轮把工作流交给 comfy_save_skill 存下来，
+            # 第二轮（存完了）复述存到了哪个 id。
+            tool_messages = [m for m in messages if m.get("role") == "tool"]
+            if tool_messages:
+                saved = json.loads(tool_messages[0]["content"])
+                message = {"role": "assistant", "content": f"存好了，skill id 是 {saved['id']}"}
+            else:
+                message = {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_save",
+                            "type": "function",
+                            "function": {
+                                "name": "comfy-studio__comfy_save_skill",
+                                "arguments": json.dumps(self.SAVE_SKILL, ensure_ascii=False),
+                            },
+                        }
+                    ],
+                }
+        elif self.ASK_MARKER in _last_user_text(messages):
+            # 审核节点用例：第一轮要 review__ask_user，把这一轮真停在"等人回答"上；
+            # 第二轮（已经拿到回答）把答案原样念出来，好断言它确实被用上了。
+            tool_messages = [m for m in messages if m.get("role") == "tool"]
+            if tool_messages:
+                # 工具回来的 content 就是那段文本（宿主把 MCP 的 content 块摊平过了），
+                # 审核工具吐的是 {question, answer}。
+                payload = json.loads(tool_messages[0]["content"])
+                message = {"role": "assistant", "content": f"用户回答说：{payload['answer']}"}
+            else:
+                message = {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_ask",
+                            "type": "function",
+                            "function": {
+                                "name": "review__ask_user",
+                                "arguments": json.dumps(
+                                    {"question": self.ASK_QUESTION, "options": ["SDXL", "Flux"]}
+                                ),
+                            },
+                        }
+                    ],
+                }
         else:
-            message = {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {
-                            "name": "comfy-studio__comfy_list_skills",
-                            "arguments": "{}",
-                        },
-                    }
-                ],
-            }
+            tool_messages = [m for m in messages if m.get("role") == "tool"]
+            if tool_messages:
+                count = len(json.loads(tool_messages[0]["content"]))
+                message = {"role": "assistant", "content": f"本机有 {count} 个 skill"}
+            else:
+                message = {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "comfy-studio__comfy_list_skills",
+                                "arguments": "{}",
+                            },
+                        }
+                    ],
+                }
         self._json({"choices": [{"index": 0, "message": message}]})
 
     def _json(self, payload: dict) -> None:
@@ -131,6 +196,10 @@ class StudioHostE2ETest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.lines = []
         cls.lock = threading.Lock()
+        # 用户 skill 目录钉在临时目录里：存 skill 的用例会真的落盘，
+        # 不能写到开发机上真实的 ~/.comfy-studio/skills 去。
+        cls._skills_tmp = tempfile.TemporaryDirectory(prefix="comfy-studio-user-skills-")
+        cls.user_skills_dir = cls._skills_tmp.name
         cls.llm = ThreadingHTTPServer(("127.0.0.1", 0), _FakeCompletions)
         threading.Thread(target=cls.llm.serve_forever, daemon=True).start()
         port = cls.llm.server_address[1]
@@ -145,6 +214,9 @@ class StudioHostE2ETest(unittest.TestCase):
                 "comfy_studio",
                 "--comfyui-dir",
                 str(COMFYUI_DIR),
+                # review__ask_user 得有桌面壳接住才成立，而这个测试就是那个壳：
+                # 它收下 ask_user 事件，再用 agent/answer 把答案送回去。
+                "--review",
             ],
             cwd=str(LIB_DIR),
             stdin=subprocess.PIPE,
@@ -157,6 +229,7 @@ class StudioHostE2ETest(unittest.TestCase):
                 **os.environ,
                 "COMFY_STUDIO_LLM_MODEL": "fake-model",
                 "COMFY_STUDIO_LLM_BASE_URL": f"http://127.0.0.1:{port}/v1",
+                "COMFY_USER_SKILLS_DIR": cls.user_skills_dir,
             },
         )
         threading.Thread(target=cls._pump_stdout, daemon=True).start()
@@ -171,6 +244,7 @@ class StudioHostE2ETest(unittest.TestCase):
         except subprocess.TimeoutExpired:
             cls.proc.kill()
         cls.llm.shutdown()
+        cls._skills_tmp.cleanup()
 
     @classmethod
     def _pump_stdout(cls) -> None:
@@ -221,6 +295,16 @@ class StudioHostE2ETest(unittest.TestCase):
                 if m.get("method") == "agent/event" and m.get("params", {}).get("requestId") == request_id
             ]
 
+    def wait_for_event(self, request_id: int, event_type: str, timeout: float = TIMEOUT) -> dict:
+        """等这一轮推出某类事件。回程工具（ask_user）少了它就永远走不到下一步。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            for event in self.notifications(request_id):
+                if event["params"]["type"] == event_type:
+                    return event
+            time.sleep(0.05)
+        self.fail(f"id={request_id} 没等到 {event_type} 事件")
+
     # ---- 用例 -----------------------------------------------------------
 
     def test_01_host_info_lists_methods(self) -> None:
@@ -228,12 +312,18 @@ class StudioHostE2ETest(unittest.TestCase):
         self.assertEqual(info.get("name"), "comfy-studio-desktop")
         self.assertIn("agent/chat", info.get("methods", []))
         self.assertIn("skills/run", info.get("methods", []))
+        # 状态里如实报出两条回程通道挂没挂：画布没开，审核开了（见启动参数）。
+        self.assertIs(info.get("canvas"), False)
+        self.assertIs(info.get("review"), True)
 
     def test_02_tools_are_namespaced_by_server(self) -> None:
         tools = self.call(2, "mcp/tools").get("result", {}).get("tools", [])
         names = [t["qualified_name"] for t in tools]
         self.assertIn("comfy-studio__comfy_list_skills", names)
-        self.assertTrue(all(t["server"] == "comfy-studio" for t in tools), names)
+        self.assertIn("review__ask_user", names)
+        # 每把工具都严格是 <server>__<tool>：回程那条通道（review）也不破例。
+        for tool in tools:
+            self.assertTrue(tool["qualified_name"].startswith(f"{tool['server']}__"), tool)
 
     def test_03_skills_catalog_comes_from_the_engine(self) -> None:
         skills = self.call(3, "skills/list", timeout=SKILLS_TIMEOUT).get("result", {}).get("skills")
@@ -246,7 +336,15 @@ class StudioHostE2ETest(unittest.TestCase):
     def test_04_servers_report_liveness(self) -> None:
         servers = self.call(4, "mcp/servers").get("result", {}).get("servers", [])
         self.assertTrue(servers)
-        self.assertIs(servers[0].get("alive"), True)
+        by_name = {s["name"]: s for s in servers}
+        self.assertIn("comfy-studio", by_name)  # 引擎是子进程
+        self.assertEqual(by_name["comfy-studio"]["transport"], "stdio")
+        # 审核/画布跑在宿主进程里：报状态时不能拿 stdio 那套字段去套（没有 command），
+        # 更不能因此把整个接口打挂。
+        self.assertEqual(by_name["review"]["transport"], "in-process")
+        self.assertIsNone(by_name["review"]["command"])
+        for server in servers:
+            self.assertIs(server.get("alive"), True, server)
 
     def test_05_agent_config_never_leaks_the_key(self) -> None:
         config = self.call(5, "agent/config").get("result", {})
@@ -352,6 +450,71 @@ class StudioHostE2ETest(unittest.TestCase):
         )
         self.assertNotIn("error", after, after)
         self.assertTrue(after.get("result", {}).get("text", "").startswith("本机有"), after)
+
+    def test_16_ask_user_waits_for_a_human_and_the_answer_comes_back(self) -> None:
+        """审核节点：这一轮会**真的停住**等人回答，答完接着跑完。"""
+        session = "review-e2e"
+        self.send(25, "agent/chat", {"text": "先问我一个方向再动手", "session_id": session})
+
+        # 宿主推到面板上的是 ask_user：问题、选项，外加一个能对上的 call_id。
+        ask = self.wait_for_event(25, "ask_user")
+        self.assertEqual(ask["params"]["question"], _FakeCompletions.ASK_QUESTION)
+        self.assertEqual(ask["params"]["options"], ["SDXL", "Flux"])
+        call_id = ask["params"]["call_id"]
+        self.assertTrue(str(call_id).startswith("ask-"), ask)
+
+        # 还没人回答：这一轮就该停在那儿，不能自己往下跑。
+        with self.lock:
+            ended_early = any(m.get("id") == 25 for m in self.lines)
+        self.assertFalse(ended_early, "还没人回答，这一轮不该已经结束")
+
+        delivered = self.call(26, "agent/answer", {"call_id": call_id, "answer": "SDXL"})
+        self.assertIs(delivered.get("result", {}).get("delivered"), True, delivered)
+
+        # 整条信封都要看：只看 result 会把错误回包看成"空回答"，白瞎一次定位。
+        reply = self.wait(25, SKILLS_TIMEOUT)
+        self.assertNotIn("error", reply, reply)
+        self.assertIn("用户回答说：SDXL", reply.get("result", {}).get("text", ""), reply)
+
+        # 幂等：同一张卡片再答一次只是白答——人答晚了不是错误。
+        late = self.call(27, "agent/answer", {"call_id": call_id, "answer": "Flux"})
+        self.assertIs(late.get("result", {}).get("delivered"), False, late)
+
+        # 空回答不算回答：挡住它，别让沉默被当成"随便你"。
+        empty = self.call(28, "agent/answer", {"call_id": call_id, "answer": "   "})
+        self.assertEqual(empty.get("error", {}).get("code"), -32602, empty)
+
+
+    def test_17_a_workflow_from_the_chat_can_be_saved_as_a_skill(self) -> None:
+        """方法复用：对话里打磨好的工作流当场沉淀成专属 skill，之后直接复用。"""
+        reply = self.call(
+            29,
+            "agent/chat",
+            {"text": "这套调好了，帮我存下来", "session_id": "save-e2e"},
+            timeout=SKILLS_TIMEOUT,
+        )
+        self.assertNotIn("error", reply, reply)
+        self.assertEqual(reply.get("result", {}).get("text", ""), "存好了，skill id 是 e2e-saved")
+
+        # 面板要能看见这次沉淀（事件流里就是一次普通的工具调用）
+        calls = [
+            e["params"]["name"]
+            for e in self.notifications(29)
+            if e["params"].get("type") == "tool_call"
+        ]
+        self.assertIn("comfy-studio__comfy_save_skill", calls, calls)
+
+        # 关键：**同一个引擎进程**里它立刻可复用 —— 不用重启、不用重建工具表。
+        listed = self.call(30, "skills/list", timeout=SKILLS_TIMEOUT).get("result", {}).get("skills", [])
+        saved = next((s for s in listed if s["id"] == "e2e-saved"), None)
+        self.assertIsNotNone(saved, [s["id"] for s in listed])
+        self.assertEqual(saved["title"], _FakeCompletions.SAVE_SKILL["title"])
+        self.assertEqual([p["name"] for p in saved["params"]], ["ckpt_name"])
+
+        # 落到用户目录里（下次启动还认得），而不是随包那份
+        path = Path(self.user_skills_dir, "e2e-saved.json")
+        self.assertTrue(path.is_file(), path)
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["id"], "e2e-saved")
 
 
 if __name__ == "__main__":

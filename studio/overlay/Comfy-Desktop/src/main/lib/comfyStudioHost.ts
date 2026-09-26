@@ -101,7 +101,11 @@ export function resolveStudioCommand(installation: InstallationRecord): ComfyStu
       // Canvas tools need somebody to answer `canvas_call` (see
       // `comfyStudioCanvasRelay`); this shell is that somebody, so the extra
       // tool table is asked for here and nowhere else.
-      '--canvas'
+      '--canvas',
+      // `review__ask_user` needs somebody to paint the question and carry the
+      // answer back — the injected panel does both. Same deal: this shell asks
+      // for that tool table, no other caller does.
+      '--review'
     ],
     cwd: getBundledLibDir(),
     comfyuiDir

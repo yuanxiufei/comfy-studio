@@ -9,8 +9,10 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 import types
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest import mock
@@ -36,11 +38,21 @@ class RouteContractTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.engine = FakeEngine()
         self.table = self._install_fake_server()
+        # 用户 skill 目录钉在临时目录里：否则会读到开发机上真实的 skill，
+        # 断言"列表里只有随包那一个"就成了看运气。
+        self._tmpdir = tempfile.TemporaryDirectory(prefix="comfy-studio-routes-")
+        self.addCleanup(self._tmpdir.cleanup)
+        self.user_skills = Path(self._tmpdir.name, "skills")
+        patcher = mock.patch.object(routes, "user_skills_dir", lambda: self.user_skills)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
         # 路由在注册时就把引擎闭包进 handler，所以 patch 只要覆盖注册那一刻
         with mock.patch.object(routes, "get_engine", lambda *a, **k: self.engine):
             routes.register_routes()
         routes._sessions.clear()
-        routes._skill_cache = None
+        routes._registry = None
+        routes._skill_stamp = None
 
         app = web.Application()
         app.add_routes(self.table)
@@ -79,7 +91,9 @@ class RouteContractTest(unittest.IsolatedAsyncioTestCase):
         status, body = await self.json_of("get", "/comfy-studio/skills")
         self.assertEqual(status, 200)
         self.assertTrue(body["skills_dir"])
+        self.assertEqual(body["user_skills_dir"], str(self.user_skills), "用户目录要如实报出来")
         self.assertEqual([s["id"] for s in body["skills"]], ["text-to-image"])
+        self.assertTrue(body["skills"][0]["file"].endswith("text-to-image.json"))
         params = {p["name"]: p for p in body["skills"][0]["params"]}
         self.assertIs(params["ckpt_name"]["required"], True)
         self.assertIsNone(params["positive"]["default"])
@@ -104,6 +118,37 @@ class RouteContractTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(await self.json_of("post", "/comfy-studio/interrupt"), (200, {"ok": True}))
         self.assertEqual(self.engine.interrupts, 1)
+
+    async def test_a_new_user_skill_shows_up_without_a_restart(self) -> None:
+        """用户在对话里存下一个 skill 后，同一个进程的接口立刻能看到（也就能跑）。"""
+        from ..skills import validate_skill
+        from ..skills.store import write_skill
+
+        document = {
+            "id": "from-chat",
+            "title": "对话里存的",
+            "description": "存完立刻能被列出来、被调用",
+            "workflow": {"4": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "a.safetensors"}}},
+            "params": [{"name": "ckpt_name", "type": "string", "node": "4", "field": "ckpt_name"}],
+        }
+        write_skill(validate_skill(document, "mem"), self.user_skills)
+
+        status, body = await self.json_of("get", "/comfy-studio/skills")
+        self.assertEqual(status, 200)
+        self.assertEqual([s["id"] for s in body["skills"]], ["text-to-image", "from-chat"])
+
+        status, body = await self.json_of(
+            "post", "/comfy-studio/skills/from-chat/run", json={"params": {"ckpt_name": "b.safetensors"}}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(self.engine.submitted[0]["4"]["inputs"]["ckpt_name"], "b.safetensors")
+
+    async def test_a_broken_skill_file_says_so_instead_of_listing_nothing(self) -> None:
+        self.user_skills.mkdir(parents=True, exist_ok=True)
+        (self.user_skills / "broken.json").write_text("{ 不是 JSON", encoding="utf-8")
+        status, body = await self.json_of("get", "/comfy-studio/skills")
+        self.assertEqual(status, 500)
+        self.assertIn("不是合法 JSON", body["error"])
 
     async def test_run_skill_returns_images(self) -> None:
         status, body = await self.json_of("post", "/comfy-studio/skills/text-to-image/run", json=WORKFLOW_BODY)
@@ -154,7 +199,7 @@ class RouteContractTest(unittest.IsolatedAsyncioTestCase):
             status, body = await self.json_of("get", "/comfy-studio/agent/config")
         self.assertEqual(status, 200)
         self.assertEqual(body["model"], "qwen")
-        self.assertEqual(body["tool_count"], 8, "7 个通用工具 + 每 skill 一个")
+        self.assertEqual(body["tool_count"], 9, "8 个通用工具 + 每 skill 一个")
 
     async def test_agent_chat_validates_input_and_llm_config(self) -> None:
         for body in ({}, {"message": "   "}, {"message": 3}):

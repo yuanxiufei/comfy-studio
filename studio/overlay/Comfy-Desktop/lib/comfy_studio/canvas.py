@@ -13,18 +13,19 @@
 ``setup/run-mcp.mjs`` 喂给别的 MCP 客户端），动作会等到超时然后明确报错，绝不静默
 返回一个空图。桌面壳要显式启动它（``__main__.py`` 的 ``--canvas``）。
 
-工具汇进 hub 后叫 ``canvas__snapshot`` / ``canvas__load_workflow``（``<server>__<tool>``）。
+这条回程的骨架与审核节点（:mod:`comfy_studio.review`）共用，都在
+:mod:`comfy_studio.channel`。工具汇进 hub 后叫 ``canvas__snapshot`` /
+``canvas__load_workflow``（``<server>__<tool>``）。
 """
 
 from __future__ import annotations
 
-import asyncio
-import contextvars
 import json
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any
 
-from .cancel import CancelToken, race
+from .cancel import CancelToken
+from .channel import Channel, ChannelError, Emit, bind_emit, unbind_emit
 from .mcp import McpError, McpTool
 
 #: 汇进工具表时用的 server 名。
@@ -35,7 +36,7 @@ CANVAS_SERVER = "canvas"
 DEFAULT_CALL_TIMEOUT = 30.0
 
 
-class CanvasError(RuntimeError):
+class CanvasError(ChannelError):
     """画布通道层面的错误：没人接、动作失败、超时。"""
 
 
@@ -46,39 +47,21 @@ class CanvasServerConfig:
     name: str = CANVAS_SERVER
 
 
-#: 往本轮 RPC 现场推一条通知的形状。
-Emit = Callable[[str, dict[str, Any]], Awaitable[None]]
+class CanvasChannel(Channel):
+    """画布动作的往返：发一条事件出去，等 ``agent/canvas_result`` 回来。
 
-#: 当前这一轮的 emit（由 :meth:`~comfy_studio.server.StudioHost.agent_chat` 起跑前绑定）。
-#: 用 contextvars 而不是成员变量：一个宿主进程里可以同时跑好几个会话的一轮，工具执行
-#: 又都在 ``asyncio.create_task`` 里，正好顺着 context 传下去。
-_CURRENT_EMIT: contextvars.ContextVar[Emit | None] = contextvars.ContextVar(
-    "comfy_studio_canvas_emit", default=None
-)
-
-
-def bind_emit(emit: Emit) -> contextvars.Token[Emit | None]:
-    """把这一轮的 emit 绑到当前 context；返回的 token 用来 :func:`unbind_emit`。"""
-    return _CURRENT_EMIT.set(emit)
-
-
-def unbind_emit(token: contextvars.Token[Emit | None]) -> None:
-    _CURRENT_EMIT.reset(token)
-
-
-class CanvasChannel:
-    """画布动作的往返：发一条事件出去，等 ``agent/canvas_result`` 回来。"""
+    骨架（发事件、等 future、超时、收结果）在 :class:`~comfy_studio.channel.Channel`；
+    这里只管画布这一侧的事件类型、call_id 前缀与报错措辞。
+    """
 
     def __init__(self, timeout: float = DEFAULT_CALL_TIMEOUT) -> None:
-        self.timeout = timeout
-        #: call_id → 等结果的 future；页面回话或超时后都必须摘掉，别攒着。
-        self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
-        self._next_id = 0
-
-    @property
-    def pending(self) -> int:
-        """还等着的动作数（面板/诊断用）。"""
-        return len(self._pending)
+        super().__init__(
+            event_type="canvas_call",
+            timeout=timeout,
+            id_prefix="canvas",
+            peer="画布页面没在跑",
+            error_type=CanvasError,
+        )
 
     async def call(
         self,
@@ -88,56 +71,13 @@ class CanvasChannel:
         cancel: CancelToken | None = None,
         timeout: float | None = None,
     ) -> Any:
-        """派一个动作出去并等结果；失败/超时/取消一律往上抛，不返回半成品。"""
-        emit = _CURRENT_EMIT.get()
-        if emit is None:
-            raise CanvasError("这一轮没有绑定桌面壳通道：画布工具只能在 agent/chat 里用")
-        if cancel is not None:
-            cancel.raise_if_cancelled(f"画布动作 {op}")
-
-        self._next_id += 1
-        call_id = f"canvas-{self._next_id}"
-        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
-        self._pending[call_id] = future
-        limit = self.timeout if timeout is None else timeout
-        try:
-            await emit(
-                "agent/event",
-                {"type": "canvas_call", "call_id": call_id, "op": op, "args": args},
-            )
-            try:
-                payload = await race(
-                    lambda: asyncio.wait_for(future, limit), cancel, what=f"画布动作 {op}"
-                )
-            except asyncio.TimeoutError as err:
-                raise CanvasError(
-                    f"画布动作 {op} 等了 {limit:g} 秒没有回音：桌面壳没接这条通道，"
-                    "或者画布页面没在跑"
-                ) from err
-        finally:
-            self._pending.pop(call_id, None)
-
-        if payload.get("ok") is not True:
-            raise CanvasError(str(payload.get("error") or f"画布动作 {op} 失败"))
-        return payload.get("result")
-
-    def resolve(
-        self, call_id: str, *, ok: bool, result: Any = None, error: str | None = None
-    ) -> bool:
-        """收下页面回的结果；返回是否真的有人收（false = 这一轮已经不等了）。"""
-        future = self._pending.get(call_id)
-        if future is None or future.done():
-            return False
-        future.set_result({"ok": ok, "result": result, "error": error})
-        return True
-
-    def fail_all(self, reason: str) -> int:
-        """宿主关停时把还等着的动作都放掉，别让它们拖到超时。"""
-        waiting = [f for f in self._pending.values() if not f.done()]
-        for future in waiting:
-            future.set_exception(CanvasError(reason))
-        self._pending.clear()
-        return len(waiting)
+        """派一个画布动作出去并等结果；失败/超时/取消一律往上抛，不返回半成品。"""
+        return await self._round_trip(
+            {"op": op, "args": args},
+            what=f"画布动作 {op}",
+            cancel=cancel,
+            timeout=timeout,
+        )
 
 
 @dataclass(frozen=True)
@@ -268,6 +208,7 @@ __all__ = [
     "CanvasClient",
     "CanvasError",
     "CanvasServerConfig",
+    "Emit",
     "bind_emit",
     "unbind_emit",
 ]

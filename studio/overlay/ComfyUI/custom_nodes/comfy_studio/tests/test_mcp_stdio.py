@@ -1,8 +1,10 @@
 """MCP stdio server 的进程级测试：真起 ``python -m comfy_studio.mcp`` 喂 JSON-RPC。
 
 用引擎自己的 venv 解释器（缺了整组跳过），但**不需要引擎在跑**：
-用到的都是不依赖运行中引擎的方法（initialize / tools/list / 参数校验失败 / 协议错误）。
-skill 目录用 ``COMFY_SKILLS_DIR`` 指向一个临时目录，顺带验证这个覆盖点生效。
+用到的都是不依赖运行中引擎的方法（initialize / tools/list / 参数校验失败 / 协议错误 / 存 skill）。
+skill 目录用 ``COMFY_SKILLS_DIR`` 指向一个临时目录，顺带验证这个覆盖点生效；
+用户 skill 目录用 ``COMFY_USER_SKILLS_DIR`` 指向另一个临时目录 —— 否则这条用例会去读写
+开发机上真实的 ``~/.comfy-studio/skills``。
 
 这里同时守住一条协议纪律：stdout 上只能出现 JSON-RPC 报文，一切诊断都走 stderr。
 """
@@ -36,6 +38,7 @@ class McpStdioTest(unittest.TestCase):
     stderr_lines: list[str]
     lock: threading.Lock
     skills_dir: str
+    user_skills_dir: str
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -45,12 +48,16 @@ class McpStdioTest(unittest.TestCase):
 
         # 临时 skill 目录：把随包那份拷过去改个 id，用来验证 COMFY_SKILLS_DIR 覆盖
         cls._tmp = tempfile.TemporaryDirectory(prefix="comfy-studio-skills-")
-        cls.skills_dir = cls._tmp.name
+        cls.skills_dir = str(Path(cls._tmp.name, "builtin"))
+        Path(cls.skills_dir).mkdir()
         source = PACKAGE_DIR / "skills" / "workflows" / "text-to-image.json"
         doc = json.loads(source.read_text(encoding="utf-8"))
         doc["id"] = "demo-e2e"
         doc["title"] = "端到端示例"
         Path(cls.skills_dir, "demo-e2e.json").write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+
+        # 用户目录也钉在临时目录里（存 skill 的用例要落盘）
+        cls.user_skills_dir = str(Path(cls._tmp.name, "user"))
 
         # cwd 必须是包的父目录，`-m comfy_studio.mcp` 才找得到包
         cls.proc = subprocess.Popen(
@@ -62,7 +69,11 @@ class McpStdioTest(unittest.TestCase):
             text=True,
             encoding="utf-8",
             bufsize=1,
-            env={**os.environ, "COMFY_SKILLS_DIR": cls.skills_dir},
+            env={
+                **os.environ,
+                "COMFY_SKILLS_DIR": cls.skills_dir,
+                "COMFY_USER_SKILLS_DIR": cls.user_skills_dir,
+            },
         )
         threading.Thread(target=cls._pump_stdout, daemon=True).start()
         threading.Thread(target=cls._pump_stderr, daemon=True).start()
@@ -136,6 +147,7 @@ class McpStdioTest(unittest.TestCase):
         names = [t["name"] for t in tools]
         self.assertIn("comfy_list_skills", names)
         self.assertIn("comfy_run_skill", names)
+        self.assertIn("comfy_save_skill", names)
         self.assertIn("skill__demo-e2e", names, "COMFY_SKILLS_DIR 里的 skill 没被加载")
         plain = next(t for t in tools if t["name"] == "skill__demo-e2e")
         self.assertEqual(plain["inputSchema"]["type"], "object")
@@ -188,7 +200,34 @@ class McpStdioTest(unittest.TestCase):
         self.assertEqual(added, [], f"notification 不该有回包，却收到 {added}")
         self.assertIn("result", self.call(10, "ping"), "收到 notification 后 server 应继续工作")
 
-    def test_09_stdout_stays_protocol_only(self) -> None:
+    def test_09_saving_a_skill_lands_on_disk_and_shows_up_at_once(self) -> None:
+        """真起进程存一个 skill：文件落在用户目录里，同一进程的列表/取名接口立刻认得它。"""
+        document = {
+            "id": "saved-here",
+            "title": "现场存的",
+            "description": "验证存完立刻可用",
+            "workflow": {"4": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "a.safetensors"}}},
+            "params": [{"name": "ckpt_name", "type": "string", "node": "4", "field": "ckpt_name"}],
+        }
+        result = self.call(11, "tools/call", {"name": "comfy_save_skill", "arguments": document}).get("result", {})
+        self.assertNotIn("isError", result)
+        saved = json.loads(result["content"][0]["text"])
+        self.assertEqual(saved["id"], "saved-here")
+        self.assertTrue(Path(self.user_skills_dir, "saved-here.json").is_file())
+
+        listed = self.call(12, "tools/call", {"name": "comfy_list_skills", "arguments": {}}).get("result", {})
+        ids = [s["id"] for s in json.loads(listed["content"][0]["text"])]
+        self.assertIn("saved-here", ids)
+
+        # 已经存过的 id 不会被下一次调用悄悄覆盖
+        again = self.call(13, "tools/call", {"name": "comfy_save_skill", "arguments": document}).get("result", {})
+        self.assertIs(again.get("isError"), True)
+        self.assertIn("overwrite", again["content"][0]["text"])
+
+        # 就绪横幅里要能看到用户目录 —— 用户得知道自己的东西存在哪
+        self.assertIn(self.user_skills_dir, self.stderr_text())
+
+    def test_10_stdout_stays_protocol_only(self) -> None:
         with self.lock:
             lines = list(self.lines)
         self.assertTrue(lines, "没收到任何报文")
