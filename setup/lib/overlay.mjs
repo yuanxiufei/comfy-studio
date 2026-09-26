@@ -2,11 +2,17 @@
  * 覆盖层装配：把 studio/overlay/<检出名>/ 下的自己人代码装进两份上游检出的
  * 标准扩展位，并把 studio/patches/<检出名>/*.patch 打到上游既有文件上。
  *
- * 为什么要有覆盖层：
- *   引擎侧代码落在 ComfyUI/custom_nodes/，而上游 ComfyUI 自己的 .gitignore 第 8 行
- *   就忽略 /custom_nodes/；桌面侧新增文件在检出里是未跟踪；父仓库又把两个检出整目录
- *   按 gitlink 忽略、且没有 .gitmodules。三处 git 都不认识这些代码，它们只活在本机
- *   文件系统里。收进 studio/ 后由父仓库跟踪，换机器 clone 下来跑一次 attach 就能复原。
+ * 两份检出的形态（事实，不是约定）：
+ *   上游工作树已经整份收进父仓库（ComfyUI/ 与 Comfy-Desktop/ 里的每个文件都由父仓库跟踪），
+ *   所以它们自己没有 .git —— git 只可能把带 .git 的目录记成 gitlink，要把内容入库就必须把
+ *   .git 挪走（本机那份在 .cache/upstream-git/<检出名>.git，要恢复成独立检出就搬回去）。
+ *   于是自己人代码有两重身份：检出里的那份是"跑起来的样子"，studio/ 里的是它的源。
+ *
+ * 覆盖层脚本在这种形态下的分工：
+ *   attach           把 studio/overlay 的改动同步进检出（幂等）；检出里的就地改动会显式报出来，
+ *                    不静默覆盖（--force 顶掉前先备份到 .cache/）。
+ *   doctor / --check 只读：自己人代码就位了没、补丁打上了没。
+ *   detach           已入库形态直接拒绝：父仓里那份就是工作形态，撤出会把它删成一片删改。
  *
  * 为什么上游那几行改动用补丁、而不是整份文件覆盖：
  *   整份文件覆盖会在上游更新同一文件时静默把上游的改动顶掉；补丁在 git apply --check
@@ -42,7 +48,7 @@ export function saveManifest(repoRoot, manifest) {
 
 /** 提示里给人看的路径：统一成正斜杠，PowerShell 与 bash 里都好复制。 */
 function relFrom(repoRoot, target) {
-  return relFrom(repoRoot, target).split(path.sep).join('/')
+  return path.relative(repoRoot, target).split(path.sep).join('/')
 }
 
 function walk(dir, base = dir, out = []) {
@@ -62,7 +68,7 @@ function sha256(file) {
   return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')
 }
 
-function gitTry(args, cwd) {
+export function gitTry(args, cwd) {
   try {
     const out = execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
     return { ok: true, out: out.trim() }
@@ -74,7 +80,7 @@ function gitTry(args, cwd) {
 
 export function requireGit() {
   const probe = gitTry(['--version'], process.cwd())
-  if (!probe.ok) throw new Error(`需要 git（打补丁走 git apply）：${probe.out}`)
+  if (!probe.ok) throw new Error(`需要 git（核对检出、打补丁都要走它）：${probe.out}`)
 }
 
 function headOf(checkoutDir) {
@@ -83,16 +89,86 @@ function headOf(checkoutDir) {
   return r.out
 }
 
+/** 归一化后比较路径：git 在 Windows 上回的是正斜杠，大小写也不敏感。 */
+function normPath(p) {
+  const abs = path.resolve(p).split(/[\\/]/).join(path.sep)
+  return process.platform === 'win32' ? abs.toLowerCase() : abs
+}
+
+/**
+ * 这个目录自己就是一个 git 检出吗？
+ * 用来区分"真的上游检出"与"父仓里的 gitlink 空占位目录 / 别的仓库的子目录"——
+ * 后者会让 git 一路往上找到别的 HEAD，覆盖层的基线核对与 --rebaseline 都会被带错。
+ */
+export function isStandaloneCheckout(dir) {
+  if (!fs.existsSync(path.join(dir, '.git'))) return false
+  const top = gitTry(['rev-parse', '--show-toplevel'], dir)
+  return top.ok && normPath(top.out) === normPath(dir)
+}
+
+/**
+ * 检出形态：
+ *   'git'      目录自己就是一个独立的上游检出（有 .git，能读 HEAD、能 --rebaseline）
+ *   'embedded' 没有自己的 .git，但落在父仓工作树里、且父仓确实跟踪着它 —— 即"检出已入库"
+ *   'alien'    两者都不是：克隆老提交留下的 gitlink 空目录、或别的仓库的子目录
+ */
+export function checkoutMode(repoRoot, side) {
+  const dir = path.join(repoRoot, side.checkout)
+  if (!fs.existsSync(dir)) return 'absent'
+  if (isStandaloneCheckout(dir)) return 'git'
+  const top = gitTry(['rev-parse', '--show-toplevel'], dir)
+  if (!top.ok || normPath(top.out) !== normPath(repoRoot)) return 'alien'
+  const tracked = gitTry(['ls-files', '--', side.checkout], repoRoot)
+  return tracked.ok && tracked.out.length > 0 ? 'embedded' : 'alien'
+}
+
+/**
+ * 检出目录必须能当上游检出用：要么自己就是独立检出，要么已被父仓整份跟踪。
+ *
+ * 为什么非要拦 'alien'：克隆父仓（老提交）之后 ComfyUI/ 与 Comfy-Desktop/ 是 gitlink
+ * 留下的空目录，它们位于父仓工作树内。此时 git rev-parse HEAD 会一路往上落到父仓，
+ * 返回父仓的 HEAD，后果有三：① 基线核对拿父仓 commit 去比上游基线，报出牛头不对马嘴的
+ * "漂移"；② attach --rebaseline 会把父仓 commit 写进 studio/upstream.json；
+ * ③ 那一侧若没有补丁，attach 还会把自方代码灌进空目录，做出一个"看起来装好了、
+ * 其实上游根本不在"的假检出。所以这里宁可停下报错，也不许猜。
+ */
+function assertCheckoutUsable(repoRoot, side, mode) {
+  const dir = path.join(repoRoot, side.checkout)
+  const takeover =
+    `要一份上游检出（放临时目录就行，本仓不再需要它当检出）：\n` +
+    `  git clone ${side.upstream ?? '<上游仓库地址>'} <临时目录>\n` +
+    (side.baselineCommit ? `  git -C <临时目录> checkout --detach ${side.baselineCommit}\n` : '')
+  if (mode === 'absent') {
+    throw new Error(`${side.checkout} 缺失（${dir}），没动盘。\n${takeover}`)
+  }
+  if (mode === 'alien') {
+    throw new Error(
+      `${side.checkout} 既不是独立检出、也没被父仓跟踪（${dir}），没动盘：\n` +
+        `  这是克隆老提交留下的 gitlink 空目录、或者别的仓库的子目录 —— 两种情况都会让 git 一路\n` +
+        `  往上找到别的 HEAD，把基线核对与 --rebaseline 带错，所以这里宁可停下报错，也不许猜。\n${takeover}`
+    )
+  }
+}
+
+/** 一侧的形态 + 基线，说成人话（attach / doctor / --check 共用，别各自拼字符串）。 */
+export function modeLabel(plan) {
+  const side = plan.side
+  const recorded =
+    `${side.baselineCommit ? side.baselineCommit.slice(0, 7) : '未记'}` +
+    (side.upstreamVersion ? ` / 上游 ${side.upstreamVersion}` : '')
+  if (plan.mode === 'git') return `独立检出 ${plan.head.slice(0, 7)}（记录基线 ${recorded}）`
+  return `已入库、无独立 .git（内容由父仓跟踪；记录基线 ${recorded}）`
+}
+
 /**
  * 只读计划：这一侧要装哪些文件、每个目标文件现在是什么状态、补丁打没打上。
  * state：missing（还没装）/ same（已就位且与覆盖层一致）/ differs（存在但被就地改过）。
  * 补丁 state：applied（已打上）/ absent（干净未打）/ conflict（既打不上也退不掉）。
  */
 export function planSide(repoRoot, side) {
+  const mode = checkoutMode(repoRoot, side)
+  assertCheckoutUsable(repoRoot, side, mode)
   const checkoutDir = path.join(repoRoot, side.checkout)
-  if (!fs.existsSync(checkoutDir)) {
-    throw new Error(`上游检出缺失：${checkoutDir}（先把它 clone/放到这个位置）`)
-  }
   const overlayRoot = path.join(repoRoot, side.overlay ?? '')
   if (!side.overlay || !fs.existsSync(overlayRoot)) {
     throw new Error(`覆盖层源缺失：${overlayRoot}（清单里写的是 ${side.overlay ?? '（空）'}）`)
@@ -125,7 +201,9 @@ export function planSide(repoRoot, side) {
             return { name, abs, state: applied ? 'applied' : clean ? 'absent' : 'conflict' }
           })
       : []
-  return { side, checkoutDir, overlayRoot, files, patches, head: headOf(checkoutDir) }
+  // head 只对独立检出有意义。已入库形态没有自己的 HEAD：在检出目录里跑 rev-parse HEAD
+  // 会落到父仓头上，所以这里宁可给 null，也不拿父仓 commit 冒充上游检出。
+  return { side, mode, head: mode === 'git' ? headOf(checkoutDir) : null, checkoutDir, overlayRoot, files, patches }
 }
 
 /** 顶掉别人的改动之前先备份，并把备份目录报出来。 */
@@ -153,9 +231,14 @@ function removeEmptyDirs(dirs, stopAt) {
 }
 
 function rewriteBaseline(repoRoot, manifest, plan, log) {
+  if (plan.mode !== 'git') {
+    throw new Error(`${plan.side.checkout} 不是独立检出（${plan.mode}），读不到上游 commit，不能自动重写基线`)
+  }
   const side = plan.side
   side.baselineCommit = plan.head
   side.baselineSubject = gitTry(['log', '-1', '--pretty=%s'], plan.checkoutDir).out
+  const branch = gitTry(['rev-parse', '--abbrev-ref', 'HEAD'], plan.checkoutDir).out
+  if (branch && branch !== 'HEAD') side.baselineBranch = branch
   saveManifest(repoRoot, manifest)
   log(
     `     基线已重新对齐到 ${plan.head.slice(0, 7)}（${side.baselineSubject}）` +
@@ -164,6 +247,20 @@ function rewriteBaseline(repoRoot, manifest, plan, log) {
 }
 
 function assertBaseline(repoRoot, manifest, plan, { rebaseline, log }) {
+  if (plan.mode === 'embedded') {
+    // 检出已入库时没有独立 HEAD 可读：基线不再靠检出 commit 核对，而是靠父仓 diff
+    // （父仓里那份 = 入库时的内容），上游换版本只能手改 studio/upstream.json。
+    if (rebaseline) {
+      throw new Error(
+        `${plan.side.checkout} 已入库（没有独立 .git），读不到上游 commit，不会替你写基线：\n` +
+          `  上游换成别的 commit 之后，手改 studio/upstream.json 里这一侧的\n` +
+          `  baselineCommit / baselineBranch / upstreamVersion / baselineSubject，\n` +
+          `  再跑 npm run doctor 核对补丁还合不合得上。`
+      )
+    }
+    log(`[i]    ${plan.side.checkout} ${modeLabel(plan)}`)
+    return
+  }
   if (plan.head === plan.side.baselineCommit) return
   if (rebaseline) {
     log(`[!]    ${plan.side.checkout} 检出已不在记录的基线上：`)
@@ -238,18 +335,41 @@ export function attach(repoRoot, { force = false, rebaseline = false, log = cons
       patched++
     }
     log(
-      `[attach] ${plan.side.checkout} 基线 ${plan.head.slice(0, 7)} 就位：` +
+      `[attach] ${plan.side.checkout} ${modeLabel(plan)} 就位：` +
         `文件 新增/更新 ${written}，已就绪 ${kept}` +
         (plan.patches.length > 0 ? `，补丁 新打 ${patched}/${plan.patches.length}` : '，无补丁')
     )
+    if (plan.mode === 'embedded' && (written > 0 || patched > 0)) {
+      log(
+        `[!]    ${plan.side.checkout} 的内容由父仓跟踪：这次落盘会显示成父仓的改动` +
+          `（在仓库根跑 git status -- ${plan.side.checkout} 能看到），确认无误就连同 studio/ 一起提交`
+      )
+    }
   }
 }
 
-/** 把覆盖层与补丁撤出检出，让两份上游回到基线原样。 */
+/** 把覆盖层与补丁撤出检出，让独立检出回到基线原样。已入库的那些一侧直接拒绝（见下）。 */
 export function detach(repoRoot, { force = false, log = console.log } = {}) {
   requireGit()
   const manifest = loadManifest(repoRoot)
   const plans = manifest.sides.map((side) => planSide(repoRoot, side))
+
+  // 已入库形态不能 detach：父仓里那份本来就是"装了覆盖层"的工作形态，撤出等于把它
+  // 删成一片删改（那些文件父仓跟踪着），既不是"回到上游原样"，还容易连带提交。
+  const embedded = plans.filter((plan) => plan.mode === 'embedded')
+  if (embedded.length > 0) {
+    throw new Error(
+      embedded
+        .map(
+          (plan) =>
+            `${plan.side.checkout} 已入库（没有独立 .git），没动盘：撤出会把它删成一片删改。\n` +
+            `  要纯净上游做对比：git clone ${plan.side.upstream ?? '<上游仓库地址>'} <临时目录>` +
+            (plan.side.baselineCommit ? `，再 git -C <临时目录> checkout --detach ${plan.side.baselineCommit}` : '') +
+            `\n  要把检出恢复成入库时的样子：git -C ${plan.side.checkout} restore .`
+        )
+        .join('\n')
+    )
+  }
 
   for (const plan of plans) {
     const clashed = plan.patches.filter((p) => p.state === 'conflict')
@@ -314,8 +434,12 @@ export function inspect(repoRoot) {
     const plan = planSide(repoRoot, side)
     return {
       checkout: side.checkout,
+      mode: plan.mode,
+      upstream: side.upstream ?? null,
+      upstreamVersion: side.upstreamVersion ?? null,
       baselineCommit: side.baselineCommit,
-      baselineOk: plan.head === side.baselineCommit,
+      // 已入库形态没有自己的 HEAD：基线核对比不了，给 null（调用方据此改口径，别当失败也别当通过）。
+      baselineOk: plan.mode === 'git' ? plan.head === side.baselineCommit : null,
       head: plan.head,
       filesTotal: plan.files.length,
       installed: plan.files.filter((f) => f.state === 'same').length,

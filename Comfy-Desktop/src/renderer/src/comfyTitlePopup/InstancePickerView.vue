@@ -1,0 +1,934 @@
+<script setup lang="ts">
+import { computed, ref, toRef, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
+import { LayoutDashboard, Plus, Search, X } from 'lucide-vue-next'
+import BaseInput from '../components/ui/BaseInput.vue'
+import { FILTER_CHIPS, useInstallList } from '../composables/useInstallList'
+import { useDialogs } from '../composables/useDialogs'
+import { useInstanceActions } from '../composables/useInstanceActions'
+import type { NavDecision } from '../../../shared/navigation/navDecision'
+import type { Category, ViewKind } from '../../../shared/viewKind'
+import { useSessionStore } from '../stores/sessionStore'
+import ComfyUISettingsContent from '../components/settings/ComfyUISettingsContent.vue'
+import InfoTooltip from '../components/InfoTooltip.vue'
+import Tooltip from '../components/ui/Tooltip.vue'
+import InstanceRow from './instancePicker/InstanceRow.vue'
+import { resolvePickerTab, type PickerTab } from '../lib/pickerTabs'
+import { resolveProgressRouting } from '../lib/pickerProgressRouting'
+import type {
+  DetailSection,
+  Installation,
+  RunningInstance,
+  ShowProgressOpts,
+  SnapshotListData
+} from '../types/ipc'
+
+interface PickerInstall {
+  id: string
+  name: string
+  sourceLabel: string
+  sourceCategory: string
+  version?: string
+  lastLaunchedAt?: number
+  installPath?: string
+  status?: string
+  statusTag?: { style: string; label: string; detail?: string }
+}
+
+interface PickerStorageDir {
+  path: string
+  isPrimary: boolean
+}
+
+/** Must stay in sync with `PickerStorageSlice` in `src/main/popups/titlePopup.ts`. */
+interface PickerStorageSlice {
+  sharedDirectoriesFields: Record<string, unknown>[]
+  modelsDirs: PickerStorageDir[]
+  modelsSystemDefault: string
+}
+
+interface PickerOperationStatus {
+  percent: number
+  status: string
+  speedBytesPerSec?: number | null
+  done: boolean
+  ok: boolean | null
+  error: string | null
+  cancellable: boolean
+  title: string
+  actionId: string
+  actionData?: Record<string, unknown>
+}
+
+interface PickerSnapshot {
+  installs: PickerInstall[]
+  activeInstallationId: string | null
+  /** Host view-kind + active-install category for the navigation matrix.
+   *  Mirrors `InstancePickerSnapshot` in main; optional for older bundles. */
+  currentView?: ViewKind
+  currentCategory?: Category | null
+  runningInstallationIds: string[]
+  /** Installs launching but not yet started. Hydrated into
+   *  sessionStore because the popup preload has no onInstanceLaunching. */
+  launchingInstallationIds: string[]
+  selectedInstallationId: string | null
+  /** Bumped only when main intentionally retargets the selection. The view
+   *  applies selectedInstallationId over a local pick only when this advances,
+   *  so a stale rebroadcast can't snap the user back to a prior row. */
+  pickerSelectionEpoch?: number
+  selectedSettings: DetailSection[] | null
+  selectedSnapshots: SnapshotListData | null
+  initialTab?: string | null
+  autoAction?: string | null
+  autoActionNonce?: number
+  storage: PickerStorageSlice
+  operatingInstallationIds?: string[]
+  installOperationStatus?: Record<string, PickerOperationStatus>
+}
+
+const props = defineProps<{
+  snapshot: PickerSnapshot
+}>()
+
+const sessionStore = useSessionStore()
+function hydrateSessionStoreFromSnapshot(): void {
+  const next = new Set(props.snapshot.runningInstallationIds)
+  for (const id of Array.from(sessionStore.runningInstances.keys())) {
+    if (!next.has(id)) sessionStore.runningInstances.delete(id)
+  }
+  for (const id of next) {
+    if (!sessionStore.runningInstances.has(id)) {
+      const placeholder: RunningInstance = {
+        installationId: id,
+        installationName: '',
+        mode: ''
+      }
+      sessionStore.runningInstances.set(id, placeholder)
+    }
+  }
+  // The snapshot is the only path that brings launching state in (the
+  // popup preload has no onInstanceLaunching).
+  const nextLaunching = new Set(props.snapshot.launchingInstallationIds ?? [])
+  for (const id of Array.from(sessionStore.launchingInstances.keys())) {
+    if (!nextLaunching.has(id)) sessionStore.launchingInstances.delete(id)
+  }
+  for (const id of nextLaunching) {
+    if (!sessionStore.launchingInstances.has(id)) {
+      sessionStore.launchingInstances.set(id, { installationName: '' })
+    }
+  }
+}
+
+interface PickerBridge {
+  platform?: string
+  activate?: (id: string) => void
+  close?: () => void
+  pickInstall: (installationId: string) => void
+  openInstallNewWindow: (installationId: string, opts?: { allowDuplicate?: boolean }) => void
+  openNewInstall: () => void
+  restartInstall: (installationId: string, opts?: { confirmed?: boolean }) => void
+  setPickerSelectedInstall: (installationId: string | null) => void
+  pickerUpdateField: (
+    installationId: string,
+    fieldId: string,
+    value: unknown
+  ) => Promise<{ ok: boolean; message?: string }>
+  pickerRunAction: (
+    installationId: string,
+    actionId: 'snapshot-save' | 'snapshot-restore' | 'snapshot-delete',
+    actionData?: Record<string, unknown>
+  ) => Promise<{ ok: boolean; message?: string }>
+  openInstallAction: (installationId: string, actionId: string) => void
+  pickerForwardShowProgress: (payload: {
+    installationId: string
+    actionId: string
+    actionData?: Record<string, unknown>
+    title: string
+    cancellable?: boolean
+    triggersInstanceStart?: boolean
+    opKind?: 'launch' | 'install' | 'update' | 'destructive' | 'snapshot' | 'generic'
+    isRestart?: boolean
+    routing?: 'same-host' | 'target-host' | 'inline-picker'
+    successChoice?: boolean
+  }) => void
+  pickerStartBackgroundOp: (payload: {
+    installationId: string
+    actionId: string
+    actionData?: Record<string, unknown>
+    title: string
+    cancellable?: boolean
+    opKind?: string
+  }) => void
+  pickerCancelBackgroundOp: (installationId: string) => void
+  pickerDismissBackgroundOp: (installationId: string) => void
+}
+const bridge = (window as unknown as { __comfyTitlePopup?: PickerBridge }).__comfyTitlePopup
+
+const installations = computed<Installation[]>(
+  () => props.snapshot.installs as unknown as Installation[]
+)
+const installationsRef = toRef(() => installations.value)
+const { searchQuery, activeFilter, visibleInstalls, showEmptyHint, lastLaunchedShortLabel } =
+  useInstallList({ installations: installationsRef })
+
+const visibleChips = computed(() => {
+  return FILTER_CHIPS.filter((chip) => {
+    if (chip.key === 'all') return true
+    const count = installations.value.filter((i) => {
+      if (chip.key === 'local') {
+        return i.sourceCategory === 'local'
+      }
+      return i.sourceCategory === chip.key
+    }).length
+    return count > 0
+  })
+})
+
+/** Default selection when the popup opens with no active/selected install. */
+function mostRecentInstallId(installs: PickerInstall[]): string | null {
+  let best: PickerInstall | undefined
+  for (const inst of installs) {
+    if (!best || (inst.lastLaunchedAt ?? 0) > (best.lastLaunchedAt ?? 0)) {
+      best = inst
+    }
+  }
+  return best?.id ?? null
+}
+
+function resolveInitialSelection(snapshot: PickerSnapshot): string | null {
+  const explicit = snapshot.selectedInstallationId ?? snapshot.activeInstallationId
+  if (explicit) return explicit
+  return mostRecentInstallId(snapshot.installs)
+}
+const selectedId = ref<string | null>(resolveInitialSelection(props.snapshot))
+// Largest pickerSelectionEpoch applied so far; only a strictly-greater
+// snapshot epoch counts as a main-authoritative retarget.
+const appliedSelectionEpoch = ref<number>(props.snapshot.pickerSelectionEpoch ?? 0)
+
+watch(
+  () => props.snapshot.pickerSelectionEpoch ?? 0,
+  (nextEpoch) => {
+    if (nextEpoch <= appliedSelectionEpoch.value) return
+    // Main intentionally retargeted; a fresh open overrides any local pick.
+    appliedSelectionEpoch.value = nextEpoch
+    selectedId.value = resolveInitialSelection(props.snapshot)
+  }
+)
+
+// Cold-start fallback: seed selectedId once installs land if the snapshot
+// first arrived empty. Once a selection exists, live install-list updates
+// must not touch it (would reintroduce the snap-back).
+watch(
+  () => props.snapshot.installs,
+  (installs) => {
+    if (selectedId.value) return
+    const id = mostRecentInstallId(installs)
+    if (id) {
+      selectedId.value = id
+    }
+  }
+)
+
+const selectedInstall = computed<Installation | null>(() => {
+  const id = selectedId.value
+  if (id) {
+    const found = installations.value.find((i) => i.id === id)
+    if (found) return found
+  }
+  return null
+})
+
+const runningSet = computed(() => new Set(props.snapshot.runningInstallationIds))
+// Optimistic local state set on click so the progress view appears before
+// the IPC round-trip + snapshot lands; cleared once the snapshot confirms.
+const localOperationStatus = ref<Map<string, PickerOperationStatus>>(new Map())
+
+watch(
+  () => props.snapshot.installOperationStatus,
+  (snapshotOps) => {
+    for (const id of localOperationStatus.value.keys()) {
+      if (snapshotOps?.[id]) {
+        localOperationStatus.value.delete(id)
+      }
+    }
+  },
+  { deep: true }
+)
+
+const activeOperation = computed<PickerOperationStatus | null>(() => {
+  const id = selectedId.value
+  if (!id) return null
+  return props.snapshot.installOperationStatus?.[id] ?? localOperationStatus.value.get(id) ?? null
+})
+
+const effectiveOperatingSet = computed(() => {
+  const s = new Set(props.snapshot.operatingInstallationIds ?? [])
+  for (const id of localOperationStatus.value.keys()) s.add(id)
+  return s
+})
+
+function isRowRunning(inst: Installation): boolean {
+  return runningSet.value.has(inst.id)
+}
+
+function isRowCurrent(inst: Installation): boolean {
+  return !!props.snapshot.activeInstallationId && inst.id === props.snapshot.activeInstallationId
+}
+
+/** Must mirror the `showUpdateBadge` check in `ComfyUISettingsContent.vue`. */
+function isRowUpdateAvailable(inst: Installation): boolean {
+  const tagged = inst as Installation & { statusTag?: { style?: string }; status?: string }
+  return tagged.statusTag?.style === 'update' || tagged.status === 'update-available'
+}
+
+function handleSelect(inst: Installation): void {
+  selectedId.value = inst.id
+}
+
+// FLIP: pin a leaving row's box so it fades out of flow while the survivors
+// slide up into the gap (mirrors ChooserView's `lockLeavingTileSize`).
+function lockLeavingRowSize(el: Element): void {
+  const node = el as HTMLElement
+  const list = node.parentElement
+  if (!list) return
+  const rect = node.getBoundingClientRect()
+  const listRect = list.getBoundingClientRect()
+  node.style.width = `${rect.width}px`
+  node.style.height = `${rect.height}px`
+  node.style.left = `${rect.left - listRect.left + list.scrollLeft}px`
+  node.style.top = `${rect.top - listRect.top + list.scrollTop}px`
+}
+
+function handleNewInstall(): void {
+  bridge?.openNewInstall()
+}
+
+function handleClose(): void {
+  bridge?.close?.()
+}
+
+const isInstallHost = computed(() => !!props.snapshot.activeInstallationId)
+
+/** Routes through `new-window` rather than `return-to-dashboard`: the latter
+ *  detaches the install, which stops the running instance. */
+function handleOpenDashboard(): void {
+  bridge?.activate?.('new-window')
+}
+
+watch(
+  () => selectedInstall.value?.id ?? null,
+  (next) => {
+    bridge?.setPickerSelectedInstall(next)
+  }
+)
+
+// On an install-less host the initial fallback selection never reaches main
+// via the change-only watcher above, so persist it once on mount.
+if (
+  selectedId.value &&
+  !props.snapshot.selectedInstallationId &&
+  !props.snapshot.activeInstallationId
+) {
+  bridge?.setPickerSelectedInstall(selectedId.value)
+}
+
+const initialExpandedTab = computed<PickerTab>(() =>
+  resolvePickerTab(props.snapshot.initialTab, 'update')
+)
+
+// Both lifecycle id arrays must be watched: the snapshot is the sole source
+// of truth for sessionStore, and watching only runningInstallationIds would
+// miss launching-only transitions. NUL-joined to avoid comma collisions.
+watch(
+  [
+    () => props.snapshot.runningInstallationIds.join('\0'),
+    () => (props.snapshot.launchingInstallationIds ?? []).join('\0')
+  ],
+  () => hydrateSessionStoreFromSnapshot(),
+  { immediate: true }
+)
+
+function handleSettingsShowProgress(opts: ShowProgressOpts): void {
+  if (!opts.actionId) return
+  const existingOperation =
+    props.snapshot.installOperationStatus?.[opts.installationId] ??
+    localOperationStatus.value.get(opts.installationId)
+  if (existingOperation && !existingOperation.done) return
+
+  // opts.actionData may be a Vue reactive proxy, which can't cross the
+  // contextBridge structured-clone boundary; deep-clone to a plain object.
+  const rawActionData = opts.actionData
+    ? (JSON.parse(JSON.stringify(opts.actionData)) as Record<string, unknown>)
+    : undefined
+  const { routing, successChoice } = resolveProgressRouting(
+    opts,
+    props.snapshot.activeInstallationId
+  )
+  if (routing === 'inline-picker') {
+    // Seed optimistic local state so the progress view appears before the
+    // IPC round-trip lands. Seed main's first-tick status for snapshot
+    // restore so the line doesn't flash the "Working…" fallback.
+    localOperationStatus.value.set(opts.installationId, {
+      percent: -1,
+      status: opts.actionId === 'snapshot-restore' ? 'Loading snapshot…' : '',
+      done: false,
+      ok: null,
+      error: null,
+      cancellable: opts.cancellable ?? false,
+      title: opts.title,
+      actionId: opts.actionId,
+      actionData: rawActionData
+    })
+    selectedId.value = opts.installationId
+    bridge?.pickerStartBackgroundOp({
+      installationId: opts.installationId,
+      actionId: opts.actionId,
+      actionData: rawActionData,
+      title: opts.title,
+      cancellable: opts.cancellable,
+      opKind: opts.opKind
+    })
+    return
+  }
+  bridge?.pickerForwardShowProgress({
+    installationId: opts.installationId,
+    actionId: opts.actionId,
+    actionData: rawActionData,
+    title: opts.title,
+    cancellable: opts.cancellable,
+    triggersInstanceStart: opts.triggersInstanceStart,
+    opKind: opts.opKind,
+    isRestart: opts.actionId === 'restart',
+    routing,
+    successChoice
+  })
+}
+
+function handleInlineProgressCancel(): void {
+  const id = selectedId.value
+  if (!id) return
+  bridge?.pickerCancelBackgroundOp(id)
+}
+
+function handleInlineProgressRetry(): void {
+  const id = selectedId.value
+  if (!id || !activeOperation.value) return
+  const op = activeOperation.value
+  bridge?.pickerStartBackgroundOp({
+    installationId: id,
+    actionId: op.actionId,
+    actionData: op.actionData,
+    title: op.title,
+    cancellable: op.cancellable
+  })
+}
+
+function handleInlineProgressDismiss(): void {
+  const id = selectedId.value
+  if (!id) return
+  bridge?.pickerDismissBackgroundOp(id)
+}
+
+function handleSettingsNavigateList(): void {
+  selectedId.value = null
+}
+
+const dialogs = useDialogs()
+const { t } = useI18n()
+
+// Single funnel for navigation decisions (primary CTA + caret). The decision is
+// computed in `ComfyUISettingsContent` via `decideNavigation`; this routes its
+// verb onto the bridge, applying the renderer-side gates.
+const instanceActions = useInstanceActions({
+  bridge,
+  // Local restarts/switches confirm in-drawer (cloud/remote have no local
+  // process to kill); keeps the drawer open instead of a system-modal over the
+  // host. Non-local installs short-circuit to confirmed.
+  confirmLocalKill: async (inst) => {
+    if (inst.sourceCategory !== 'local') return true
+    const result = await dialogs.confirm({
+      title: t('instancePicker.restartConfirmHeading'),
+      message: t('instancePicker.restartConfirmTitle'),
+      confirmLabel: t('instancePicker.restartConfirmAction'),
+      cancelLabel: t('common.cancel'),
+      messageDetails: [
+        {
+          label: t('instancePicker.confirmHeadsUp'),
+          items: [t('instancePicker.restartConfirmItem1'), t('instancePicker.restartConfirmItem2')]
+        }
+      ]
+    })
+    return result === 'primary'
+  },
+  // In-drawer 3-way prompt (popup stays open) when the CURRENT host is a local
+  // install — swapping would stop its process. Cloud/remote hosts have no local
+  // process to stop → switch straight away.
+  confirmSwitch: async (inst) => {
+    const hostIsLocalInstall =
+      props.snapshot.currentView === 'instance' && props.snapshot.currentCategory === 'local'
+    if (!hostIsLocalInstall) return 'switch'
+    const result = await dialogs.confirm({
+      title: t('instancePicker.switchConfirmTitle'),
+      message: t('instancePicker.switchConfirmMessage', { name: inst.name }),
+      confirmLabel: t('instancePicker.switchConfirmAction'),
+      secondaryLabel: t('instancePicker.switchConfirmSecondary'),
+      cancelLabel: t('common.cancel'),
+      showCancel: true,
+      messageDetails: [
+        {
+          label: t('instancePicker.confirmHeadsUp'),
+          items: [t('instancePicker.switchConfirmItem1'), t('instancePicker.switchConfirmItem2')]
+        }
+      ]
+    })
+    return result === 'primary' ? 'switch' : result === 'secondary' ? 'new-window' : 'cancel'
+  }
+})
+
+async function handleExpandedNav(decision: NavDecision): Promise<void> {
+  const inst = selectedInstall.value
+  if (!inst) return
+  await instanceActions.dispatch(decision, inst)
+}
+</script>
+
+<template>
+  <div class="picker">
+    <div class="picker-search">
+      <BaseInput
+        v-model="searchQuery"
+        class="picker-search-input"
+        :placeholder="$t('chooser.searchPlaceholder')"
+        :aria-label="$t('chooser.searchPlaceholder')"
+      >
+        <template #leading><Search :size="20" class="picker-search-icon" /></template>
+      </BaseInput>
+      <button
+        type="button"
+        class="picker-close"
+        :aria-label="$t('common.close')"
+        :title="$t('common.close')"
+        @click="handleClose"
+      >
+        <X :size="18" />
+      </button>
+    </div>
+
+    <div class="picker-chips-row">
+      <template v-if="isInstallHost">
+        <Tooltip :text="$t('instancePicker.openDashboardHint')" side="bottom">
+          <button
+            type="button"
+            class="picker-home"
+            :aria-label="$t('instancePicker.openDashboard')"
+            @click="handleOpenDashboard"
+          >
+            <LayoutDashboard :size="14" />
+            <span class="picker-home-label">{{ $t('instancePicker.openDashboard') }}</span>
+          </button>
+        </Tooltip>
+        <span class="picker-chips-divider" aria-hidden="true"></span>
+      </template>
+      <div
+        class="picker-chips"
+        role="tablist"
+        :aria-label="$t('chooser.filterLabel', 'Source filter')"
+      >
+        <button
+          v-for="chip in visibleChips"
+          :key="chip.key"
+          type="button"
+          role="tab"
+          class="picker-chip"
+          :class="{ 'is-active': activeFilter === chip.key }"
+          :aria-selected="activeFilter === chip.key"
+          @click="activeFilter = chip.key"
+        >
+          {{ $t(chip.labelKey) }}
+        </button>
+      </div>
+    </div>
+
+    <div class="picker-body">
+      <div class="picker-left">
+        <div class="picker-list-section">
+          <div class="picker-list-section-title">
+            {{ $t('instancePicker.instances')
+            }}<InfoTooltip :text="$t('tooltips.instances')" side="bottom" />
+          </div>
+
+          <TransitionGroup
+            tag="div"
+            name="picker-row"
+            class="picker-list"
+            role="listbox"
+            @before-leave="lockLeavingRowSize"
+          >
+            <InstanceRow
+              v-for="inst in visibleInstalls"
+              :key="inst.id"
+              :installation="inst"
+              :active="selectedId === inst.id"
+              :running="isRowRunning(inst)"
+              :is-current="isRowCurrent(inst)"
+              :update-available="isRowUpdateAvailable(inst)"
+              :operating="effectiveOperatingSet.has(inst.id)"
+              :last-launched-short-label="lastLaunchedShortLabel(inst)"
+              @select="handleSelect"
+            />
+
+            <div v-if="showEmptyHint" key="__empty" class="picker-list-empty">
+              {{ $t('chooser.noMatches') }}
+            </div>
+          </TransitionGroup>
+        </div>
+
+        <footer class="picker-left-footer">
+          <button type="button" class="picker-new-install" @click="handleNewInstall">
+            <Plus :size="16" />
+            <span>{{ $t('instancePicker.newInstance') }}</span>
+          </button>
+        </footer>
+      </div>
+
+      <div class="picker-detail-wrap is-expanded">
+        <div class="picker-detail">
+          <template v-if="selectedInstall">
+            <ComfyUISettingsContent
+              :installation="selectedInstall"
+              :initial-tab="initialExpandedTab"
+              :auto-action="snapshot.autoAction ?? null"
+              :auto-action-nonce="snapshot.autoActionNonce ?? 0"
+              :global-settings-snapshot="snapshot.storage"
+              :active-operation="activeOperation"
+              :active-installation-id="snapshot.activeInstallationId"
+              :current-view="snapshot.currentView ?? 'dashboard'"
+              :current-category="snapshot.currentCategory ?? null"
+              class="picker-expanded-body"
+              @show-progress="handleSettingsShowProgress"
+              @navigate-list="handleSettingsNavigateList"
+              @request-close="handleSettingsNavigateList"
+              @request-dismiss="handleClose"
+              @primary-action="handleExpandedNav"
+              @open-new-window="handleExpandedNav"
+              @op-cancel="handleInlineProgressCancel"
+              @op-retry="handleInlineProgressRetry"
+              @op-dismiss="handleInlineProgressDismiss"
+            />
+          </template>
+          <div v-else class="picker-detail-empty">
+            {{ $t('instancePicker.empty') }}
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.picker {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--modal-surface-bg);
+}
+
+.picker-search {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  border-bottom: 1px solid var(--brand-surface-border-hover, var(--chooser-surface-border));
+  padding: 6px 8px 8px 12px;
+}
+.picker-search-input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.picker-search :deep(.ui-input) {
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 0;
+  gap: 8px;
+}
+.picker-close {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition:
+    background-color 100ms ease,
+    color 100ms ease,
+    border-color 100ms ease;
+}
+.picker-close:hover,
+.picker-close:focus-visible {
+  background: var(--brand-surface-bg-hover);
+  color: var(--neutral-100);
+  outline: none;
+}
+.picker-search :deep(.ui-input):focus-within {
+  border-color: transparent;
+}
+.picker-search :deep(.ui-input-leading) {
+  color: var(--text);
+}
+.picker-search :deep(.ui-input-control) {
+  padding: 2px 0 0 0;
+  font-size: 14px;
+  line-height: 20px;
+  color: var(--text);
+}
+.picker-search :deep(.ui-input-control::placeholder) {
+  color: var(--text);
+  opacity: 0.6;
+}
+
+.picker-search-icon {
+  color: var(--accent-label);
+  margin-top: 2px;
+}
+.picker-chips-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px 10px 16px;
+  border-bottom: 1px solid var(--brand-surface-border-hover, var(--chooser-surface-border));
+}
+.picker-chips {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.picker-home {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 22px;
+  padding: 0 6px 0 2px;
+  border: none;
+  background: transparent;
+  color: var(--neutral-100);
+  cursor: pointer;
+  transition: color 100ms ease;
+}
+.picker-home-label {
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 16px;
+  white-space: nowrap;
+}
+.picker-home:hover,
+.picker-home:focus-visible {
+  color: var(--text);
+  outline: none;
+}
+.picker-chips-divider {
+  flex: 0 0 auto;
+  display: inline-block;
+  width: 1px;
+  height: 16px;
+  background: var(--brand-surface-border-hover, var(--chooser-surface-border));
+}
+.picker-chip {
+  height: 22px;
+  padding: 2px 10px;
+  border-radius: 9999px;
+  border: 1px solid var(--brand-surface-border-hover, var(--chooser-surface-border));
+  background: transparent;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 16px;
+  color: var(--neutral-100);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  transition:
+    background-color 100ms ease,
+    border-color 100ms ease,
+    color 100ms ease;
+}
+.picker-chip:hover,
+.picker-chip:focus-visible {
+  outline: none;
+  color: var(--text);
+}
+.picker-chip.is-active {
+  background: var(--chooser-surface-border);
+  border-color: var(--brand-surface-border-hover);
+  color: var(--text);
+}
+
+.picker-body {
+  flex: 1 1 0;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr);
+}
+
+.picker-left {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--chooser-surface-border);
+  background: var(--modal-surface-bg);
+}
+.picker-left-footer {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  padding: 12px 16px;
+  border-top: 1px solid var(--chooser-surface-border);
+  background: var(--modal-surface-bg);
+}
+.picker-list-section {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.picker-list-section-title {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 20px;
+  color: var(--neutral-100);
+  opacity: 0.7;
+  padding: 12px 18px 0 16px;
+  margin-bottom: 14px;
+}
+.picker-list {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* Row FLIP: enter rises in, leave fades out of flow so survivors slide into the
+ * gap, move uses the app's iOS-derived curve. Transform/opacity only. Mirrors
+ * ChooserView's `tile` transition so list and dashboard motion stay consistent. */
+.picker-row-enter-active {
+  transition:
+    opacity 200ms ease,
+    transform 200ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.picker-row-enter-from {
+  opacity: 0;
+  transform: translateY(8px) scale(0.98);
+}
+.picker-row-leave-active {
+  transition:
+    opacity 140ms ease,
+    transform 140ms cubic-bezier(0.32, 0.72, 0, 1);
+  position: absolute;
+}
+.picker-row-leave-to {
+  opacity: 0;
+  transform: scale(0.98);
+}
+.picker-row-move {
+  transition: transform 220ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+@media (prefers-reduced-motion: reduce) {
+  .picker-row-enter-active,
+  .picker-row-leave-active,
+  .picker-row-move {
+    /* Non-zero so Vue's transitionend cleanup still fires and leaving nodes get removed. */
+    transition-duration: 1ms;
+  }
+  .picker-row-enter-from,
+  .picker-row-leave-to {
+    transform: none;
+  }
+}
+.picker-list-empty {
+  padding: 8px 18px;
+  font-size: 14px;
+  color: var(--neutral-100);
+}
+
+.picker-new-install {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  height: 32px;
+  padding: 8px 14px;
+  border-radius: 8px;
+  width: fit-content;
+  border: none;
+  background: var(--chooser-surface-border-hover);
+  color: var(--neutral-100);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 16px;
+  cursor: pointer;
+  transition:
+    background-color 120ms ease,
+    color 120ms ease;
+}
+.picker-new-install:hover,
+.picker-new-install:focus-visible {
+  background: var(--brand-surface-border-hover);
+  color: var(--text);
+  outline: none;
+}
+
+.picker-detail-wrap {
+  min-width: 0;
+  min-height: 0;
+  padding: 0 8px;
+  display: flex;
+  overflow: hidden;
+}
+.picker-detail {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+.picker-detail-empty {
+  margin: auto;
+  font-size: 14px;
+  color: var(--neutral-100);
+  opacity: 0.7;
+}
+
+.picker-detail-wrap.is-expanded {
+  padding: 0;
+}
+.picker-detail-wrap.is-expanded .picker-detail {
+  gap: 0;
+}
+
+.picker-expanded-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  --text-muted: var(--neutral-100);
+}
+</style>

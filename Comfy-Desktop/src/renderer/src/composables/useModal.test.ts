@@ -1,0 +1,237 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+import type { ModalSelectItem, ModalOption } from './useModal'
+
+vi.mock('../main', () => ({
+  i18n: {
+    global: {
+      t: (key: string) => key
+    }
+  }
+}))
+
+import { useModal } from './useModal'
+
+describe('useModal', () => {
+  const modal = useModal()
+
+  beforeEach(() => {
+    modal.close(null)
+  })
+
+  describe('alert', () => {
+    it('resolves on close', async () => {
+      const promise = modal.alert({ title: 'T', message: 'M' })
+      modal.close(undefined)
+
+      await expect(promise).resolves.toBeUndefined()
+    })
+
+    it('uses the translated default buttonLabel', () => {
+      modal.alert({ title: 'T', message: 'M' })
+      expect(modal.state.buttonLabel).toBe('OK')
+    })
+
+    it('uses custom buttonLabel when provided', () => {
+      modal.alert({ title: 'T', message: 'M', buttonLabel: 'Got it' })
+      expect(modal.state.buttonLabel).toBe('Got it')
+    })
+  })
+
+  describe('confirm', () => {
+    it('resolves true when closed with true', async () => {
+      const promise = modal.confirm({ title: 'T', message: 'M' })
+      modal.close(true)
+
+      await expect(promise).resolves.toBe(true)
+    })
+
+    it('resolves false when closed with false', async () => {
+      const promise = modal.confirm({ title: 'T', message: 'M' })
+      modal.close(false)
+
+      await expect(promise).resolves.toBe(false)
+    })
+
+    it('sets messageDetails on state when provided', () => {
+      const details = [
+        { label: 'Group A', items: ['item 1', 'item 2'] },
+        { label: 'Group B', items: ['item 3'] }
+      ]
+      modal.confirm({ title: 'T', message: 'M', messageDetails: details })
+
+      expect(modal.state.messageDetails).toHaveLength(2)
+      expect(modal.state.messageDetails[0]).toEqual({
+        label: 'Group A',
+        items: ['item 1', 'item 2']
+      })
+      expect(modal.state.messageDetails[1]).toEqual({ label: 'Group B', items: ['item 3'] })
+    })
+
+    it('defaults messageDetails to empty array when not provided', () => {
+      modal.confirm({ title: 'T', message: 'M' })
+
+      expect(modal.state.messageDetails).toEqual([])
+    })
+  })
+
+  describe('prompt', () => {
+    it('resolves with string value on close', async () => {
+      const promise = modal.prompt({ title: 'T', message: 'M' })
+      modal.close('user input')
+
+      await expect(promise).resolves.toBe('user input')
+    })
+
+    it('resolves with null when cancelled', async () => {
+      const promise = modal.prompt({ title: 'T', message: 'M' })
+      modal.close(null)
+
+      await expect(promise).resolves.toBeNull()
+    })
+  })
+
+  describe('select', () => {
+    const items: ModalSelectItem[] = [
+      { value: 'a', label: 'Option A' },
+      { value: 'b', label: 'Option B' }
+    ]
+
+    it('resolves with selected value on close', async () => {
+      const promise = modal.select({ title: 'T', items })
+      modal.close('b')
+
+      await expect(promise).resolves.toBe('b')
+    })
+
+    it('resolves with null when cancelled', async () => {
+      const promise = modal.select({ title: 'T', items })
+      modal.close(null)
+
+      await expect(promise).resolves.toBeNull()
+    })
+  })
+
+  describe('confirmWithOptions', () => {
+    const options: ModalOption[] = [
+      { id: 'opt1', label: 'Option 1', checked: true },
+      { id: 'opt2', label: 'Option 2', checked: false }
+    ]
+
+    it('copies options rather than using the same reference', () => {
+      modal.confirmWithOptions({ title: 'T', message: 'M', options })
+
+      expect(modal.state.options).not.toBe(options)
+      expect(modal.state.options[0]).not.toBe(options[0])
+    })
+
+    it('resolves with record on close', async () => {
+      const promise = modal.confirmWithOptions({ title: 'T', message: 'M', options })
+      const result = { opt1: true, opt2: false }
+      modal.close(result)
+
+      await expect(promise).resolves.toEqual(result)
+    })
+  })
+
+  describe('updateConfirm variant state', () => {
+    const variantA = { value: 'nvidia', label: 'NVIDIA' }
+    const variantB = { value: 'amd', label: 'AMD' }
+
+    it('sets variantCards and selectedVariant', () => {
+      modal.confirm({ title: 'T', message: 'M' })
+      modal.updateConfirm({ variantCards: [variantA, variantB], selectedVariant: variantA })
+
+      expect(modal.state.variantCards).toEqual([variantA, variantB])
+      expect(modal.state.selectedVariant).toEqual(variantA)
+    })
+
+    it('sets variantLoading', () => {
+      modal.confirm({ title: 'T', message: 'M' })
+      modal.updateConfirm({ variantLoading: true })
+
+      expect(modal.state.variantLoading).toBe(true)
+    })
+
+    it('clears variant state on reset', () => {
+      modal.confirm({ title: 'T', message: 'M' })
+      modal.updateConfirm({
+        variantCards: [variantA],
+        selectedVariant: variantA,
+        variantLoading: true
+      })
+      modal.close(false)
+
+      expect(modal.state.variantCards).toEqual([])
+      expect(modal.state.selectedVariant).toBeNull()
+      expect(modal.state.variantLoading).toBe(false)
+    })
+
+    it('does not update when modal is not visible', () => {
+      modal.updateConfirm({ variantCards: [variantA], selectedVariant: variantA })
+
+      expect(modal.state.variantCards).toEqual([])
+      expect(modal.state.selectedVariant).toBeNull()
+    })
+  })
+
+  describe('close', () => {
+    it('resets state after resolving', () => {
+      modal.confirm({ title: 'Test', message: 'Msg', confirmStyle: 'primary' })
+      expect(modal.state.visible).toBe(true)
+
+      modal.close(false)
+
+      expect(modal.state.visible).toBe(false)
+      expect(modal.state.resolve).toBeNull()
+    })
+
+    it('is safe to call when no modal is open', () => {
+      expect(() => modal.close(null)).not.toThrow()
+    })
+  })
+
+  describe('dismiss', () => {
+    it('resolves confirm as false', async () => {
+      const promise = modal.confirm({ title: 'T', message: 'M' })
+      modal.dismiss()
+      await expect(promise).resolves.toBe(false)
+      expect(modal.state.visible).toBe(false)
+    })
+
+    it('resolves prompt as null', async () => {
+      const promise = modal.prompt({ title: 'T', message: 'M' })
+      modal.dismiss()
+      await expect(promise).resolves.toBeNull()
+    })
+
+    it('resolves select as null', async () => {
+      const promise = modal.select({
+        title: 'T',
+        items: [{ value: 'a', label: 'A' }]
+      })
+      modal.dismiss()
+      await expect(promise).resolves.toBeNull()
+    })
+
+    it('resolves alert as undefined', async () => {
+      const promise = modal.alert({ title: 'T', message: 'M' })
+      modal.dismiss()
+      await expect(promise).resolves.toBeUndefined()
+    })
+
+    it('resolves confirmWithOptions as null', async () => {
+      const promise = modal.confirmWithOptions({
+        title: 'T',
+        message: 'M',
+        options: [{ id: 'opt1', label: 'Option 1' }]
+      })
+      modal.dismiss()
+      await expect(promise).resolves.toBeNull()
+    })
+
+    it('is a no-op when no modal is open', () => {
+      expect(() => modal.dismiss()).not.toThrow()
+      expect(modal.state.visible).toBe(false)
+    })
+  })
+})

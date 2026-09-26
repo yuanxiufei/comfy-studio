@@ -1,0 +1,1723 @@
+import os from 'os'
+import path from 'path'
+import fs from 'fs'
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
+
+import type * as pathsModule from './paths'
+import type * as pipModule from './pip'
+import type * as gitModule from './git'
+
+vi.mock('electron', () => ({
+  app: { getPath: (name: string) => (name === 'home' ? os.tmpdir() : os.tmpdir()) }
+}))
+
+vi.mock('./paths', async (importOriginal) => {
+  const actual = await importOriginal<typeof pathsModule>()
+  return {
+    ...actual,
+    defaultInstallDir: () => path.join(os.tmpdir(), 'desktopAdopt-installs')
+  }
+})
+
+vi.mock('../settings', () => {
+  const store: Record<string, unknown> = {}
+  return {
+    defaults: { modelsDirs: ['/shared/models'] },
+    get: vi.fn((key: string) => store[key]),
+    set: vi.fn((key: string, value: unknown) => {
+      if (value === undefined) delete store[key]
+      else store[key] = value
+    }),
+    // Mirrors the real "explicitly persisted" semantics: defaults aren't user choices.
+    has: vi.fn((key: string) => store[key] !== undefined && store[key] !== null),
+    getAll: vi.fn(() => ({ ...store })),
+    getMirrorConfig: vi.fn(() => ({ pypiMirror: undefined, useChineseMirrors: false })),
+    getTrackedSettingsTelemetryProperties: vi.fn(() => ({})),
+    __store: store
+  }
+})
+
+// Stub the latest-stable-tag lookup + git checkout so adoption tests
+// don't need network access or a real ComfyUI git tree.
+const {
+  getLatestStableTagMock,
+  gitCheckoutCommitMock,
+  readGitHeadMock,
+  fetchTagsMock,
+  isGitAvailableMock,
+  isPygit2ConfiguredMock,
+  tryConfigurePygit2FallbackMock,
+  resolveLocalVersionMock
+} = vi.hoisted(() => ({
+  getLatestStableTagMock: vi.fn<() => Promise<string | null>>(),
+  gitCheckoutCommitMock:
+    vi.fn<(...args: unknown[]) => Promise<{ exitCode: number; stdout: string; stderr: string }>>(),
+  readGitHeadMock: vi.fn<(repoPath: string) => string | null>(),
+  fetchTagsMock: vi.fn<(repoPath: string) => Promise<boolean>>(),
+  isGitAvailableMock: vi.fn<() => Promise<boolean>>(),
+  isPygit2ConfiguredMock: vi.fn<() => boolean>(),
+  tryConfigurePygit2FallbackMock: vi.fn<(installPath: string) => Promise<boolean>>(),
+  resolveLocalVersionMock:
+    vi.fn<
+      (
+        comfyuiDir: string,
+        commit: string,
+        fallbackTag?: string
+      ) => Promise<{ commit: string; baseTag?: string; commitsAhead?: number } | undefined>
+    >()
+}))
+
+vi.mock('./comfyui-releases', () => ({
+  getLatestStableTag: getLatestStableTagMock
+}))
+
+vi.mock('./git', async () => {
+  const actual = await vi.importActual<typeof gitModule>('./git')
+  return {
+    ...actual,
+    gitCheckoutCommit: gitCheckoutCommitMock,
+    readGitHead: readGitHeadMock,
+    fetchTags: fetchTagsMock,
+    isGitAvailable: isGitAvailableMock,
+    isPygit2Configured: isPygit2ConfiguredMock,
+    tryConfigurePygit2Fallback: tryConfigurePygit2FallbackMock
+  }
+})
+
+vi.mock('./version-resolve', () => ({
+  resolveLocalVersion: resolveLocalVersionMock
+}))
+
+// Stub the pip helpers so adoption tests don't need a real uv binary on disk.
+const { installFilteredRequirementsMock, runUvPipMock } = vi.hoisted(() => ({
+  installFilteredRequirementsMock: vi.fn<(...args: unknown[]) => Promise<number>>(),
+  runUvPipMock: vi.fn<(...args: unknown[]) => Promise<number>>()
+}))
+
+vi.mock('./pip', async (importOriginal) => {
+  const actual = await importOriginal<typeof pipModule>()
+  return {
+    ...actual,
+    installFilteredRequirements: installFilteredRequirementsMock,
+    runUvPip: runUvPipMock
+  }
+})
+
+vi.mock('../installations', () => {
+  const records: Record<string, unknown>[] = []
+  let nextSeq = 0
+  return {
+    add: vi.fn(async (data: Record<string, unknown>) => {
+      const entry = { id: `inst-test-${++nextSeq}`, createdAt: new Date().toISOString(), ...data }
+      records.unshift(entry)
+      return entry
+    }),
+    list: vi.fn(async () => records.slice()),
+    get: vi.fn(async (id: string) => records.find((r) => r.id === id) ?? null),
+    update: vi.fn(async (id: string, data: Record<string, unknown>) => {
+      const entry = records.find((r) => r.id === id)
+      if (!entry) return null
+      Object.assign(entry, data)
+      return entry
+    }),
+    remove: vi.fn(async (id: string) => {
+      const idx = records.findIndex((r) => r.id === id)
+      if (idx >= 0) records.splice(idx, 1)
+    }),
+    __records: records,
+    __reset: () => {
+      records.length = 0
+      nextSeq = 0
+    }
+  }
+})
+
+vi.mock('./telemetry', () => ({
+  capture: vi.fn(),
+  captureInstallCompleted: vi.fn(),
+  registerPersonProperties: vi.fn(),
+  bucketError: vi.fn(() => 'other'),
+  trackedStep: vi.fn(async (_step: string, _ctx: unknown, fn: () => Promise<unknown>) => fn())
+}))
+
+vi.mock('./github-mirror', () => ({
+  getComfyUIRemoteUrl: vi.fn(() => 'https://github.com/Comfy-Org/ComfyUI.git')
+}))
+
+import {
+  adoptDesktopInstall,
+  parseExtraModelsYaml,
+  parseExtraModelsSections,
+  deriveLaunchArgs,
+  computeModelsDirsToCarry,
+  getLegacyVenvUvPath,
+  reconcileAdoptedSettings,
+  type AdoptTools,
+  type AdoptDeps,
+  type UserChoice
+} from './desktopAdopt'
+
+import type { DesktopInstallInfo } from './desktopDetect'
+import * as settings from '../settings'
+import * as installations from '../installations'
+import * as telemetry from './telemetry'
+
+// Test-only helpers exposed by the mock factories above.
+interface SettingsMock {
+  __store: Record<string, unknown>
+  set: ReturnType<typeof vi.fn>
+  get: ReturnType<typeof vi.fn>
+  getAll: ReturnType<typeof vi.fn>
+}
+interface InstallationsMock {
+  __records: Record<string, unknown>[]
+  __reset: () => void
+  add: ReturnType<typeof vi.fn>
+  list: ReturnType<typeof vi.fn>
+  update: ReturnType<typeof vi.fn>
+}
+const settingsMock = settings as unknown as SettingsMock
+const installationsMock = installations as unknown as InstallationsMock
+
+function mkdtemp(prefix: string): string {
+  return fs.mkdtempSync(path.join(os.tmpdir(), prefix))
+}
+
+function buildSilentTools(promptUser?: AdoptTools['promptUser']): AdoptTools {
+  return {
+    sendProgress: vi.fn(),
+    sendOutput: vi.fn(),
+    signal: new AbortController().signal,
+    promptUser:
+      promptUser ??
+      vi.fn(async () => {
+        throw new Error('promptUser unexpectedly called')
+      })
+  }
+}
+
+function writeFakeStagedSource(stagingDir: string, version: string): void {
+  fs.mkdirSync(stagingDir, { recursive: true })
+  fs.writeFileSync(path.join(stagingDir, 'main.py'), '# placeholder')
+  fs.writeFileSync(path.join(stagingDir, 'comfyui_version.py'), `__version__ = "${version}"\n`)
+}
+
+interface FakeLegacy {
+  basePath: string
+  configDir: string
+  info: DesktopInstallInfo
+  cleanup: () => void
+}
+
+function buildFakeLegacy(
+  opts: {
+    configFiles?: Record<string, string>
+    baseFiles?: Record<string, string>
+    hasVenv?: boolean
+  } = {}
+): FakeLegacy {
+  const root = mkdtemp('adopt-test-')
+  const basePath = path.join(root, 'data')
+  const configDir = path.join(root, 'userData')
+  fs.mkdirSync(basePath, { recursive: true })
+  fs.mkdirSync(configDir, { recursive: true })
+  fs.mkdirSync(path.join(basePath, 'models'), { recursive: true })
+  fs.mkdirSync(path.join(basePath, 'user'), { recursive: true })
+  if (opts.hasVenv !== false) {
+    const venvBin =
+      process.platform === 'win32'
+        ? path.join(basePath, '.venv', 'Scripts')
+        : path.join(basePath, '.venv', 'bin')
+    fs.mkdirSync(venvBin, { recursive: true })
+    const pyName = process.platform === 'win32' ? 'python.exe' : 'python3'
+    fs.writeFileSync(path.join(venvBin, pyName), '')
+  }
+  for (const [name, content] of Object.entries(opts.configFiles ?? {})) {
+    const target =
+      name === 'comfy.settings.json'
+        ? path.join(basePath, 'user', 'default', name)
+        : path.join(configDir, name)
+    fs.mkdirSync(path.dirname(target), { recursive: true })
+    fs.writeFileSync(target, content)
+  }
+  for (const [name, content] of Object.entries(opts.baseFiles ?? {})) {
+    const target = path.join(basePath, name)
+    fs.mkdirSync(path.dirname(target), { recursive: true })
+    fs.writeFileSync(target, content)
+  }
+  const info: DesktopInstallInfo = {
+    configDir,
+    basePath,
+    executablePath: null,
+    hasVenv: opts.hasVenv !== false
+  }
+  return {
+    basePath,
+    configDir,
+    info,
+    cleanup: () => {
+      try {
+        fs.rmSync(root, { recursive: true, force: true })
+      } catch {}
+    }
+  }
+}
+
+function buildDeps(overrides: Partial<AdoptDeps>, info: DesktopInstallInfo): Partial<AdoptDeps> {
+  return {
+    detectDesktopInstall: () => info,
+    validateLegacyVenv: async () => ({ ok: true }),
+    copyStagedSource: async (src, dest) => {
+      fs.mkdirSync(path.dirname(dest), { recursive: true })
+      fs.cpSync(src, dest, { recursive: true })
+    },
+    cloneSourceFromGit: async (_url, dest) => {
+      fs.mkdirSync(dest, { recursive: true })
+      fs.writeFileSync(path.join(dest, 'main.py'), '# cloned placeholder')
+      return { ok: true }
+    },
+    captureDesktopSnapshot: vi.fn(async () => ({
+      version: 1 as const,
+      createdAt: new Date().toISOString(),
+      trigger: 'manual' as const,
+      label: 'Legacy Desktop adopt',
+      comfyui: { ref: 'Legacy Desktop', commit: null, releaseTag: '', variant: '' },
+      customNodes: [],
+      pipPackages: {},
+      skipPipSync: true
+    })),
+    now: () => new Date('2026-05-19T12:00:00.000Z'),
+    ...overrides
+  }
+}
+
+beforeEach(() => {
+  installationsMock.__reset()
+  for (const key of Object.keys(settingsMock.__store)) delete settingsMock.__store[key]
+  vi.clearAllMocks()
+  installFilteredRequirementsMock.mockResolvedValue(0)
+  runUvPipMock.mockResolvedValue(0)
+  // Default "no tag available" makes the one-shot update a no-op for unrelated tests.
+  getLatestStableTagMock.mockResolvedValue(null)
+  gitCheckoutCommitMock.mockResolvedValue({ exitCode: 0, stdout: '', stderr: '' })
+  // Default git helpers to "git is available, no HEAD, no resolved
+  // version" so the comfyVersion-resolution branch is a no-op for
+  // tests that don't opt in. Specific tests override these as needed.
+  readGitHeadMock.mockReturnValue(null)
+  fetchTagsMock.mockResolvedValue(true)
+  isGitAvailableMock.mockResolvedValue(true)
+  isPygit2ConfiguredMock.mockReturnValue(true)
+  tryConfigurePygit2FallbackMock.mockResolvedValue(true)
+  resolveLocalVersionMock.mockResolvedValue(undefined)
+})
+
+afterEach(() => {
+  vi.restoreAllMocks()
+})
+
+describe('parseExtraModelsYaml', () => {
+  it('extracts base_path values across multiple sections', () => {
+    const yaml =
+      `# header\n` +
+      `comfyui_desktop:\n` +
+      `  base_path: /data/ComfyUI\n` +
+      `  is_default: true\n` +
+      `a1111:\n` +
+      `  base_path: "/extra/A1111"\n` +
+      `  other_key: value\n`
+    expect(parseExtraModelsYaml(yaml)).toEqual(['/data/ComfyUI', '/extra/A1111'])
+  })
+
+  it('strips inline comments and surrounding quotes', () => {
+    const yaml = `s1:\n  base_path: '/with spaces/dir' # comment\n`
+    expect(parseExtraModelsYaml(yaml)).toEqual(['/with spaces/dir'])
+  })
+
+  it('ignores per-folder overrides (only matches base_path)', () => {
+    const yaml = `s1:\n  base_path: /a\n  checkpoints: /override/cp\n`
+    expect(parseExtraModelsYaml(yaml)).toEqual(['/a'])
+  })
+
+  it('returns [] for empty or malformed input', () => {
+    expect(parseExtraModelsYaml('')).toEqual([])
+    expect(parseExtraModelsYaml('garbage::::')).toEqual([])
+  })
+})
+
+describe('parseExtraModelsSections', () => {
+  it('returns base_path plus per-type overrides for each section', () => {
+    const yaml =
+      `comfyui_desktop:\n` +
+      `  is_default: 'true'\n` +
+      `  base_path: /Users/me/ComfyUI\n` +
+      `my_external:\n` +
+      `  base_path: /mnt/nas/ai\n` +
+      `  checkpoints: /mnt/big-ssd/checkpoints\n` +
+      `  loras: models/loras\n`
+    const sections = parseExtraModelsSections(yaml)
+    expect(sections).toEqual([
+      { name: 'comfyui_desktop', basePath: '/Users/me/ComfyUI', overrides: [] },
+      {
+        name: 'my_external',
+        basePath: '/mnt/nas/ai',
+        overrides: [
+          { type: 'checkpoints', path: '/mnt/big-ssd/checkpoints' },
+          { type: 'loras', path: 'models/loras' }
+        ]
+      }
+    ])
+  })
+
+  it('ignores non-model section keys (is_default, custom_nodes, download_model_base)', () => {
+    const yaml =
+      `s:\n` +
+      `  base_path: /a\n` +
+      `  is_default: 'true'\n` +
+      `  custom_nodes: /a/custom_nodes\n` +
+      `  download_model_base: /a/models\n` +
+      `  vae: /a/models/vae\n`
+    const [section] = parseExtraModelsSections(yaml)
+    expect(section!.overrides).toEqual([{ type: 'vae', path: '/a/models/vae' }])
+  })
+
+  it('splits pipe-block multi-path values into one override per path', () => {
+    const yaml = `s:\n  base_path: /a\n  loras: |\n    models/Lora\n    models/LyCORIS\n`
+    const [section] = parseExtraModelsSections(yaml)
+    expect(section!.overrides).toEqual([
+      { type: 'loras', path: 'models/Lora' },
+      { type: 'loras', path: 'models/LyCORIS' }
+    ])
+  })
+
+  it('returns [] on malformed YAML rather than throwing', () => {
+    expect(parseExtraModelsSections('  : : :\n\tbad')).toEqual([])
+    expect(parseExtraModelsSections('')).toEqual([])
+  })
+})
+
+describe('deriveLaunchArgs', () => {
+  it('synthesizes --port 8000 + --enable-manager when LaunchArgs is empty', () => {
+    const { launchArgs, pathOverrides } = deriveLaunchArgs({})
+    expect(launchArgs).toBe('--port 8000 --enable-manager')
+    expect(pathOverrides).toEqual({})
+  })
+
+  it('reads Comfy.Server.LaunchArgs (not server_config.*)', () => {
+    const { launchArgs } = deriveLaunchArgs({
+      'Comfy.Server.LaunchArgs': { listen: '0.0.0.0', port: '7860', lowvram: '' },
+      // server_config.* are never read by adoption; included to confirm the parser ignores them.
+      'server_config.listen': '1.2.3.4',
+      'server_config.port': 1234
+    })
+    expect(launchArgs).toContain('--listen 0.0.0.0')
+    expect(launchArgs).toContain('--port 7860')
+    expect(launchArgs).toContain('--lowvram')
+    expect(launchArgs).not.toContain('1.2.3.4')
+    expect(launchArgs).not.toContain('1234')
+  })
+
+  it('honors Comfy.Server.ServerConfigValues (authoritative legacy store)', () => {
+    // ServerConfigValues keeps native types: number port, boolean flags.
+    const { launchArgs } = deriveLaunchArgs({
+      'Comfy.Server.ServerConfigValues': { port: 8192, 'enable-manager-legacy-ui': true }
+    })
+    expect(launchArgs).toContain('--port 8192')
+    expect(launchArgs).toContain('--enable-manager-legacy-ui')
+  })
+
+  it('keeps a custom port from ServerConfigValues (no --port 8000 override)', () => {
+    const { launchArgs } = deriveLaunchArgs({
+      'Comfy.Server.ServerConfigValues': { port: 8192 }
+    })
+    expect(launchArgs).toContain('--port 8192')
+    expect(launchArgs).not.toContain('--port 8000')
+  })
+
+  it('carries enable-manager-legacy-ui and does NOT add --enable-manager', () => {
+    const { launchArgs } = deriveLaunchArgs({
+      'Comfy.Server.ServerConfigValues': { 'enable-manager-legacy-ui': true }
+    })
+    expect(launchArgs).toContain('--enable-manager-legacy-ui')
+    expect(launchArgs).not.toContain('--enable-manager ')
+    expect(launchArgs.endsWith('--enable-manager')).toBe(false)
+    expect(launchArgs.split(' ')).not.toContain('--enable-manager')
+  })
+
+  it('lets LaunchArgs override ServerConfigValues on a conflicting key', () => {
+    const { launchArgs } = deriveLaunchArgs({
+      'Comfy.Server.ServerConfigValues': { port: 8192 },
+      'Comfy.Server.LaunchArgs': { port: '7860' }
+    })
+    expect(launchArgs).toContain('--port 7860')
+    expect(launchArgs).not.toContain('8192')
+  })
+
+  it('synthesizes --port 8000 when neither store sets a port', () => {
+    const { launchArgs } = deriveLaunchArgs({
+      'Comfy.Server.ServerConfigValues': { 'cpu-vae': true },
+      'Comfy.Server.LaunchArgs': { lowvram: '' }
+    })
+    expect(launchArgs).toContain('--port 8000')
+  })
+
+  it('drops ServerConfigValues entries explicitly set to false', () => {
+    const { launchArgs } = deriveLaunchArgs({
+      'Comfy.Server.ServerConfigValues': { 'enable-manager-legacy-ui': false }
+    })
+    expect(launchArgs).not.toContain('--enable-manager-legacy-ui')
+    // legacy disabled -> new Manager is force-added as usual
+    expect(launchArgs).toContain('--enable-manager')
+  })
+
+  it('leaves LaunchArgs-only --enable-manager behavior unchanged', () => {
+    const { launchArgs } = deriveLaunchArgs({
+      'Comfy.Server.LaunchArgs': { 'enable-manager': '', lowvram: '' }
+    })
+    expect((launchArgs.match(/--enable-manager\b/g) ?? []).length).toBe(1)
+    expect(launchArgs).toContain('--lowvram')
+  })
+
+  it('is idempotent: re-deriving from its own output keys yields stable args', () => {
+    const first = deriveLaunchArgs({
+      'Comfy.Server.ServerConfigValues': { port: 8192, 'enable-manager-legacy-ui': true }
+    })
+    // Feed the derived flags back through both stores; result must not grow.
+    const second = deriveLaunchArgs({
+      'Comfy.Server.ServerConfigValues': { port: 8192, 'enable-manager-legacy-ui': true },
+      'Comfy.Server.LaunchArgs': { port: '8192', 'enable-manager-legacy-ui': '' }
+    })
+    expect(second.launchArgs).toBe(first.launchArgs)
+    expect((second.launchArgs.match(/--enable-manager-legacy-ui/g) ?? []).length).toBe(1)
+    expect((second.launchArgs.match(/--port/g) ?? []).length).toBe(1)
+  })
+
+  it('does NOT synthesize --listen (legacy implicit matches ComfyUI native)', () => {
+    const { launchArgs } = deriveLaunchArgs({ 'Comfy.Server.LaunchArgs': {} })
+    expect(launchArgs).not.toContain('--listen')
+  })
+
+  it('preserves user-set --listen verbatim', () => {
+    const { launchArgs } = deriveLaunchArgs({
+      'Comfy.Server.LaunchArgs': { listen: '0.0.0.0' }
+    })
+    expect(launchArgs).toContain('--listen 0.0.0.0')
+  })
+
+  it('keeps --enable-manager always (idempotent if already present)', () => {
+    const { launchArgs } = deriveLaunchArgs({
+      'Comfy.Server.LaunchArgs': { 'enable-manager': '' }
+    })
+    expect((launchArgs.match(/--enable-manager/g) ?? []).length).toBe(1)
+  })
+
+  it('promotes input-directory / output-directory into pathOverrides', () => {
+    const { launchArgs, pathOverrides } = deriveLaunchArgs({
+      'Comfy.Server.LaunchArgs': {
+        'input-directory': 'D:\\my-input',
+        'output-directory': 'D:\\my-output'
+      }
+    })
+    expect(pathOverrides).toEqual({ inputDir: 'D:\\my-input', outputDir: 'D:\\my-output' })
+    expect(launchArgs).not.toContain('--input-directory')
+    expect(launchArgs).not.toContain('--output-directory')
+  })
+
+  it('keeps user-set --base-directory and --user-directory in the string', () => {
+    const { launchArgs } = deriveLaunchArgs({
+      'Comfy.Server.LaunchArgs': {
+        'base-directory': 'D:\\my-comfy',
+        'user-directory': 'D:\\my-comfy\\user'
+      }
+    })
+    expect(launchArgs).toContain('--base-directory D:\\my-comfy')
+    expect(launchArgs).toContain('--user-directory D:\\my-comfy\\user')
+  })
+
+  it('drops v2 plumbing keys (extra-model-paths-config, front-end-root, log-stdout, database-url)', () => {
+    const { launchArgs } = deriveLaunchArgs({
+      'Comfy.Server.LaunchArgs': {
+        'extra-model-paths-config': 'C:\\legacy.yaml',
+        'front-end-root': 'C:\\legacy-fe',
+        'log-stdout': '',
+        'database-url': 'sqlite:///legacy.db',
+        // preserved control: real CLI flag stays
+        cpu: ''
+      }
+    })
+    expect(launchArgs).not.toContain('--extra-model-paths-config')
+    expect(launchArgs).not.toContain('--front-end-root')
+    expect(launchArgs).not.toContain('--log-stdout')
+    expect(launchArgs).not.toContain('--database-url')
+    expect(launchArgs).toContain('--cpu')
+  })
+
+  it('user-set --port wins over the synthesized 8000', () => {
+    const { launchArgs } = deriveLaunchArgs({
+      'Comfy.Server.LaunchArgs': { port: '9999' }
+    })
+    expect(launchArgs).toContain('--port 9999')
+    expect(launchArgs).not.toContain('--port 8000')
+  })
+
+  it('preserves CPU mode from selectedDevice when the settings entry is missing', () => {
+    const { launchArgs } = deriveLaunchArgs({}, 'cpu')
+    expect(launchArgs.split(' ')).toContain('--cpu')
+  })
+
+  it('does not override an explicit disabled CPU setting', () => {
+    const { launchArgs } = deriveLaunchArgs({ 'Comfy.Server.LaunchArgs': { cpu: false } }, 'cpu')
+    expect(launchArgs.split(' ')).not.toContain('--cpu')
+  })
+})
+
+describe('computeModelsDirsToCarry', () => {
+  let tmpRoot: string
+  beforeEach(() => {
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'carryModelsDirs-'))
+  })
+  afterEach(() => {
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  })
+
+  it('always carries basePath/models even when the folder is absent (legacy install root is trusted)', () => {
+    const basePath = path.join(tmpRoot, 'ComfyUI-legacy')
+    const result = computeModelsDirsToCarry(basePath, null, [])
+    expect(result).toEqual([path.resolve(path.join(basePath, 'models'))])
+  })
+
+  it('carries <yamlBase>/models when present, else the bare base_path dir', () => {
+    const basePath = path.join(tmpRoot, 'primary')
+    const siblingComfy = path.join(tmpRoot, 'sibling-comfy')
+    const a1111 = path.join(tmpRoot, 'a1111')
+    fs.mkdirSync(path.join(siblingComfy, 'models'), { recursive: true })
+    fs.mkdirSync(path.join(a1111, 'models', 'Stable-diffusion'), { recursive: true })
+    // A base_path that exists but has no `/models` sibling: carried as the bare dir.
+    const bareRoot = path.join(tmpRoot, 'bare-root')
+    fs.mkdirSync(bareRoot)
+    const yaml =
+      `comfyui_sibling:\n  base_path: ${siblingComfy}\n` +
+      `a1111:\n  base_path: ${a1111}\n` +
+      `weird:\n  base_path: ${bareRoot}\n`
+    const result = computeModelsDirsToCarry(basePath, yaml, [])
+    expect(result).toContain(path.resolve(path.join(basePath, 'models')))
+    expect(result).toContain(path.resolve(path.join(siblingComfy, 'models')))
+    expect(result).toContain(path.resolve(path.join(a1111, 'models')))
+    // No `/models` sibling → bare dir carried.
+    expect(result).toContain(path.resolve(bareRoot))
+    expect(result).not.toContain(path.resolve(path.join(bareRoot, 'models')))
+    // Siblings that DO have `/models` are carried via `/models`, not bare.
+    expect(result).not.toContain(path.resolve(siblingComfy))
+    expect(result).not.toContain(path.resolve(a1111))
+  })
+
+  it('carries a per-type override pointing OUTSIDE base_path via its parent dir', () => {
+    const basePath = path.join(tmpRoot, 'primary')
+    const sectionBase = path.join(tmpRoot, 'install')
+    fs.mkdirSync(path.join(sectionBase, 'models'), { recursive: true })
+    // External drive: an absolute checkpoints override outside base_path.
+    const externalDrive = path.join(tmpRoot, 'external-drive', 'ai')
+    fs.mkdirSync(path.join(externalDrive, 'checkpoints'), { recursive: true })
+    const yaml = `s:\n  base_path: ${sectionBase}\n  checkpoints: ${path.join(externalDrive, 'checkpoints')}\n`
+    const result = computeModelsDirsToCarry(basePath, yaml, [])
+    // type-named leaf → carry its parent so buildYaml discovers `checkpoints/`.
+    expect(result).toContain(path.resolve(externalDrive))
+    expect(result).toContain(path.resolve(path.join(sectionBase, 'models')))
+  })
+
+  it('resolves a relative override against the section base_path', () => {
+    const basePath = path.join(tmpRoot, 'primary')
+    const sectionBase = path.join(tmpRoot, 'webui')
+    // base_path has no `/models`, so its bare dir is the carried root.
+    fs.mkdirSync(path.join(sectionBase, 'Stable-diffusion'), { recursive: true })
+    fs.mkdirSync(path.join(sectionBase, 'extra-loras'), { recursive: true })
+    const yaml =
+      `a1111:\n  base_path: ${sectionBase}\n` +
+      `  checkpoints: Stable-diffusion\n` +
+      `  loras: extra-loras\n`
+    const result = computeModelsDirsToCarry(basePath, yaml, [])
+    // base_path carried as bare dir; both relative overrides resolve under it
+    // and are therefore subsumed (not separately registered).
+    expect(result).toContain(path.resolve(sectionBase))
+    expect(result).not.toContain(path.resolve(path.join(sectionBase, 'Stable-diffusion')))
+    expect(result).not.toContain(path.resolve(path.join(sectionBase, 'extra-loras')))
+  })
+
+  it('skips the home directory and filesystem root as models roots (safety guard)', () => {
+    const basePath = path.join(tmpRoot, 'primary')
+    const fsRoot = path.parse(tmpRoot).root
+    const home = path.resolve(os.homedir())
+    const yaml =
+      `bad_root:\n  base_path: ${fsRoot}\n  checkpoints: ${fsRoot}\n` +
+      `bad_home:\n  base_path: ${home}\n`
+    const result = computeModelsDirsToCarry(basePath, yaml, [])
+    expect(result).not.toContain(path.resolve(fsRoot))
+    expect(result).not.toContain(home)
+    // Primary install root is still carried.
+    expect(result).toContain(path.resolve(path.join(basePath, 'models')))
+  })
+
+  it('skips non-existent override and base_path targets', () => {
+    const basePath = path.join(tmpRoot, 'primary')
+    const sectionBase = path.join(tmpRoot, 'install')
+    fs.mkdirSync(path.join(sectionBase, 'models'), { recursive: true })
+    const yaml =
+      `s:\n  base_path: ${sectionBase}\n` +
+      `  checkpoints: ${path.join(tmpRoot, 'does-not-exist', 'checkpoints')}\n` +
+      `gone:\n  base_path: ${path.join(tmpRoot, 'also-missing')}\n`
+    const result = computeModelsDirsToCarry(basePath, yaml, [])
+    expect(result).toContain(path.resolve(path.join(sectionBase, 'models')))
+    expect(result).not.toContain(path.resolve(path.join(tmpRoot, 'does-not-exist')))
+    expect(result).not.toContain(path.resolve(path.join(tmpRoot, 'also-missing')))
+  })
+
+  it('dedupes against the caller existing list', () => {
+    const basePath = path.join(tmpRoot, 'primary')
+    const sibling = path.join(tmpRoot, 'sibling')
+    fs.mkdirSync(path.join(sibling, 'models'), { recursive: true })
+    const existing = [path.resolve(path.join(basePath, 'models'))]
+    const yaml = `s:\n  base_path: ${sibling}\n`
+    const result = computeModelsDirsToCarry(basePath, yaml, existing)
+    expect(result).toEqual([path.resolve(path.join(sibling, 'models'))])
+  })
+
+  it('dedupes a base_path equal to the primary install (no duplicate <basePath>/models)', () => {
+    const basePath = path.join(tmpRoot, 'primary')
+    fs.mkdirSync(path.join(basePath, 'models'), { recursive: true })
+    const yaml = `self:\n  base_path: ${basePath}\n`
+    const result = computeModelsDirsToCarry(basePath, yaml, [])
+    expect(result).toEqual([path.resolve(path.join(basePath, 'models'))])
+  })
+
+  it('carries a base_path that exists as a dir even when its `models` child is a file', () => {
+    const basePath = path.join(tmpRoot, 'primary')
+    const yamlBase = path.join(tmpRoot, 'has-models-file')
+    fs.mkdirSync(yamlBase, { recursive: true })
+    // `models` here is a file, not a directory → fall back to the bare dir.
+    fs.writeFileSync(path.join(yamlBase, 'models'), 'not a dir')
+    const yaml = `s:\n  base_path: ${yamlBase}\n`
+    const result = computeModelsDirsToCarry(basePath, yaml, [])
+    expect(result).not.toContain(path.resolve(path.join(yamlBase, 'models')))
+    expect(result).toContain(path.resolve(yamlBase))
+  })
+})
+
+describe('adoptDesktopInstall', () => {
+  it('throws no-legacy-install when detection returns null', async () => {
+    const tools = buildSilentTools()
+    await expect(
+      adoptDesktopInstall({
+        tools,
+        deps: { detectDesktopInstall: () => null }
+      })
+    ).rejects.toThrow('no-legacy-install')
+    expect(telemetry.trackedStep).toHaveBeenCalledWith(
+      'comfy.desktop.adopt.detect',
+      {},
+      expect.any(Function)
+    )
+  })
+
+  it('prefers pre-swap-copy when staged source is valid', async () => {
+    const legacy = buildFakeLegacy({
+      configFiles: {
+        'comfy.settings.json': JSON.stringify({
+          'Comfy.Server.LaunchArgs': { listen: '0.0.0.0', port: '8188' }
+        })
+      }
+    })
+    try {
+      writeFakeStagedSource(path.join(legacy.configDir, 'legacy-staging', 'comfyui'), '0.3.45')
+      const copyFn = vi.fn(async (src: string, dest: string) => {
+        fs.mkdirSync(path.dirname(dest), { recursive: true })
+        fs.cpSync(src, dest, { recursive: true })
+      })
+      const cloneFn = vi.fn(async () => ({ ok: true as const }))
+      const tools = buildSilentTools()
+      const record = await adoptDesktopInstall({
+        tools,
+        deps: buildDeps({ copyStagedSource: copyFn, cloneSourceFromGit: cloneFn }, legacy.info)
+      })
+      expect(copyFn).toHaveBeenCalledOnce()
+      expect(cloneFn).not.toHaveBeenCalled()
+      expect(record.adoptedSourceMode).toBe('pre-swap-copy')
+      expect(record.launchArgs).toContain('--listen 0.0.0.0')
+      expect(record.launchArgs).toContain('--port 8188')
+      expect(record.launchArgs).toContain('--enable-manager')
+      // Marker written
+      const marker = fs.readFileSync(path.join(legacy.basePath, '.comfyui-desktop-2'), 'utf-8')
+      expect(marker).toBe(record.id)
+    } finally {
+      legacy.cleanup()
+    }
+  })
+
+  it('reads and backs up settings from the legacy workspace', async () => {
+    const canonicalSettings = JSON.stringify({
+      'Comfy.Server.LaunchArgs': { cpu: '', port: '8123' }
+    })
+    const legacy = buildFakeLegacy({
+      configFiles: {
+        'config.json': JSON.stringify({ selectedDevice: 'cpu' }),
+        'comfy.settings.json': canonicalSettings
+      }
+    })
+    try {
+      fs.writeFileSync(
+        path.join(legacy.configDir, 'comfy.settings.json'),
+        JSON.stringify({ 'Comfy.Server.LaunchArgs': { 'gpu-only': '', port: '9999' } })
+      )
+
+      const record = await adoptDesktopInstall({
+        tools: buildSilentTools(),
+        deps: buildDeps({}, legacy.info)
+      })
+
+      expect(record.launchArgs).toContain('--cpu')
+      expect(record.launchArgs).toContain('--port 8123')
+      expect(record.launchArgs).not.toContain('--gpu-only')
+      expect(record.launchArgs).not.toContain('--port 9999')
+
+      const [backupDir] = fs.readdirSync(path.join(legacy.configDir, 'legacy-backup'))
+      const backup = fs.readFileSync(
+        path.join(legacy.configDir, 'legacy-backup', backupDir!, 'comfy.settings.json'),
+        'utf-8'
+      )
+      expect(backup).toBe(canonicalSettings)
+    } finally {
+      legacy.cleanup()
+    }
+  })
+
+  it('preserves CPU mode from config.json when comfy.settings.json is missing', async () => {
+    const legacy = buildFakeLegacy({
+      configFiles: { 'config.json': JSON.stringify({ selectedDevice: 'cpu' }) }
+    })
+    try {
+      const record = await adoptDesktopInstall({
+        tools: buildSilentTools(),
+        deps: buildDeps({}, legacy.info)
+      })
+      expect((record.launchArgs as string).split(' ')).toContain('--cpu')
+      expect(record.adoptedSettingsVersion).toBe(1)
+    } finally {
+      legacy.cleanup()
+    }
+  })
+
+  it('repairs adopted records that still contain generated defaults', async () => {
+    const legacy = buildFakeLegacy({
+      configFiles: {
+        'comfy.settings.json': JSON.stringify({
+          'Comfy.Server.LaunchArgs': {
+            cpu: '',
+            port: '8123',
+            'input-directory': 'D:\\legacy-input',
+            'output-directory': 'D:\\legacy-output'
+          },
+          'Comfy-Desktop.UV.PypiInstallMirror': 'https://example.com/simple/'
+        })
+      }
+    })
+    try {
+      installationsMock.__records.push({
+        id: 'affected-adoption',
+        name: 'ComfyUI',
+        createdAt: new Date().toISOString(),
+        sourceId: 'standalone',
+        installPath: path.join(legacy.basePath, 'managed-source'),
+        adopted: true,
+        adoptedBaseDir: legacy.basePath,
+        adoptedSelectedDevice: 'cpu',
+        launchArgs: '--port 8000 --enable-manager',
+        inputDir: path.join(legacy.basePath, 'input'),
+        outputDir: 'D:\\v2-output'
+      })
+
+      expect(await reconcileAdoptedSettings()).toBe(1)
+      const [record] = installationsMock.__records
+      expect(record!.launchArgs).toContain('--cpu')
+      expect(record!.launchArgs).toContain('--port 8123')
+      expect(record!.inputDir).toBe('D:\\legacy-input')
+      expect(record!.outputDir).toBe('D:\\v2-output')
+      expect(record!.adoptedSettingsVersion).toBe(1)
+      expect(settingsMock.__store['pypiMirror']).toBe('https://example.com/simple/')
+
+      installationsMock.update.mockClear()
+      expect(await reconcileAdoptedSettings()).toBe(0)
+      expect(installationsMock.update).not.toHaveBeenCalled()
+    } finally {
+      legacy.cleanup()
+    }
+  })
+
+  it('does not replace launch args edited after adoption', async () => {
+    const legacy = buildFakeLegacy({
+      configFiles: {
+        'comfy.settings.json': JSON.stringify({
+          'Comfy.Server.LaunchArgs': {
+            cpu: '',
+            'input-directory': 'D:\\legacy-input',
+            'output-directory': 'D:\\legacy-output'
+          }
+        })
+      }
+    })
+    try {
+      installationsMock.__records.push({
+        id: 'edited-adoption',
+        name: 'ComfyUI',
+        createdAt: new Date().toISOString(),
+        sourceId: 'standalone',
+        installPath: path.join(legacy.basePath, 'managed-source'),
+        adopted: true,
+        adoptedBaseDir: legacy.basePath,
+        adoptedSelectedDevice: 'cpu',
+        launchArgs: '--port 9000 --enable-manager',
+        inputDir: path.join(legacy.basePath, 'input'),
+        outputDir: path.join(legacy.basePath, 'output')
+      })
+
+      expect(await reconcileAdoptedSettings()).toBe(1)
+      const [record] = installationsMock.__records
+      expect(record!.launchArgs).toBe('--port 9000 --enable-manager')
+      expect(record!.inputDir).toBe('D:\\legacy-input')
+      expect(record!.outputDir).toBe('D:\\legacy-output')
+      expect(record!.adoptedSettingsVersion).toBe(1)
+    } finally {
+      legacy.cleanup()
+    }
+  })
+
+  it('retries adopted settings repair after a malformed settings file', async () => {
+    const legacy = buildFakeLegacy({
+      configFiles: { 'comfy.settings.json': '{' }
+    })
+    try {
+      installationsMock.__records.push({
+        id: 'unreadable-settings-adoption',
+        name: 'ComfyUI',
+        createdAt: new Date().toISOString(),
+        sourceId: 'standalone',
+        installPath: path.join(legacy.basePath, 'managed-source'),
+        adopted: true,
+        adoptedBaseDir: legacy.basePath,
+        adoptedSelectedDevice: 'cpu',
+        launchArgs: '--port 8000 --enable-manager'
+      })
+
+      expect(await reconcileAdoptedSettings()).toBe(0)
+      expect(installationsMock.update).not.toHaveBeenCalled()
+      expect(installationsMock.__records[0]).not.toHaveProperty('adoptedSettingsVersion')
+    } finally {
+      legacy.cleanup()
+    }
+  })
+
+  it('repairs a missing settings file from the persisted CPU device', async () => {
+    const legacy = buildFakeLegacy()
+    try {
+      installationsMock.__records.push({
+        id: 'missing-settings-adoption',
+        name: 'ComfyUI',
+        createdAt: new Date().toISOString(),
+        sourceId: 'standalone',
+        installPath: path.join(legacy.basePath, 'managed-source'),
+        adopted: true,
+        adoptedBaseDir: legacy.basePath,
+        adoptedSelectedDevice: 'cpu',
+        launchArgs: '--port 8000 --enable-manager'
+      })
+
+      expect(await reconcileAdoptedSettings()).toBe(1)
+      expect(installationsMock.__records[0]!.launchArgs).toContain('--cpu')
+      expect(installationsMock.__records[0]!.adoptedSettingsVersion).toBe(1)
+    } finally {
+      legacy.cleanup()
+    }
+  })
+
+  it('falls back to git clone when staged source is missing', async () => {
+    const legacy = buildFakeLegacy({
+      configFiles: { 'comfy.settings.json': '{}' }
+    })
+    try {
+      const cloneFn = vi.fn(async (_url: string, dest: string) => {
+        fs.mkdirSync(dest, { recursive: true })
+        fs.writeFileSync(path.join(dest, 'main.py'), '# clone')
+        fs.writeFileSync(path.join(dest, 'comfyui_version.py'), '__version__ = "0.9.9"\n')
+        return { ok: true as const }
+      })
+      const tools = buildSilentTools()
+      const record = await adoptDesktopInstall({
+        tools,
+        deps: buildDeps({ cloneSourceFromGit: cloneFn }, legacy.info)
+      })
+      expect(cloneFn).toHaveBeenCalledOnce()
+      expect(record.adoptedSourceMode).toBe('git-clone-fallback')
+      expect(record.version).toBe('0.9.9')
+    } finally {
+      legacy.cleanup()
+    }
+  })
+
+  it('merges modelsDirs: basePath/models + <yamlBase>/models when present + bare base_path + external override', async () => {
+    // Sibling install has `/models`; "bare" install has no `/models`;
+    // an external per-type override lives outside any base_path.
+    const tmpYamlRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'adopt-yaml-roots-'))
+    const sibling = path.join(tmpYamlRoot, 'sibling-comfy')
+    const bareRoot = path.join(tmpYamlRoot, 'no-models')
+    const externalDrive = path.join(tmpYamlRoot, 'external')
+    fs.mkdirSync(path.join(sibling, 'models'), { recursive: true })
+    fs.mkdirSync(bareRoot, { recursive: true })
+    fs.mkdirSync(path.join(externalDrive, 'loras'), { recursive: true })
+    const yaml =
+      `comfyui_sibling:\n  base_path: ${sibling}\n  is_default: true\n` +
+      `weird:\n  base_path: ${bareRoot}\n` +
+      `ext:\n  base_path: ${sibling}\n  loras: ${path.join(externalDrive, 'loras')}\n`
+    const legacy = buildFakeLegacy({
+      configFiles: {
+        'comfy.settings.json': '{}',
+        'extra_models_config.yaml': yaml
+      }
+    })
+    try {
+      const tools = buildSilentTools()
+      await adoptDesktopInstall({
+        tools,
+        deps: buildDeps({}, legacy.info)
+      })
+      const finalDirs = settingsMock.__store['modelsDirs'] as string[] | undefined
+      expect(finalDirs).toBeDefined()
+      expect(finalDirs).toEqual(
+        expect.arrayContaining([
+          path.resolve(path.join(legacy.basePath, 'models')),
+          path.resolve(path.join(sibling, 'models')),
+          // base_path with no `/models` sibling → bare dir carried.
+          path.resolve(bareRoot),
+          // external `loras` override → carried via its parent.
+          path.resolve(externalDrive)
+        ])
+      )
+      // Sibling with `/models` is carried via `/models`, not the bare dir.
+      expect(finalDirs).not.toContain(path.resolve(sibling))
+    } finally {
+      legacy.cleanup()
+      fs.rmSync(tmpYamlRoot, { recursive: true, force: true })
+    }
+  })
+
+  it('continues adoption when validateLegacyVenv fails and user picks use-anyway', async () => {
+    const legacy = buildFakeLegacy({ configFiles: { 'comfy.settings.json': '{}' } })
+    try {
+      const prompt = vi.fn(
+        async (_kind, _ctx): Promise<UserChoice> => ({ kind: 'venv-broken', choice: 'use-anyway' })
+      )
+      const tools = buildSilentTools(prompt)
+      const validate = vi.fn(async () => ({ ok: false as const, message: 'no torch' }))
+      const record = await adoptDesktopInstall({
+        tools,
+        deps: buildDeps({ validateLegacyVenv: validate }, legacy.info)
+      })
+      expect(validate).toHaveBeenCalledOnce()
+      expect(prompt).toHaveBeenCalledWith(
+        'venv-broken',
+        expect.objectContaining({ message: 'no torch' })
+      )
+      expect(record.id).toMatch(/^inst-test-/)
+    } finally {
+      legacy.cleanup()
+    }
+  })
+
+  it('aborts adoption when validateLegacyVenv fails and user cancels', async () => {
+    const legacy = buildFakeLegacy({ configFiles: { 'comfy.settings.json': '{}' } })
+    try {
+      const prompt = vi.fn(
+        async (): Promise<UserChoice> => ({ kind: 'venv-broken', choice: 'cancel' })
+      )
+      const tools = buildSilentTools(prompt)
+      const validate = vi.fn(async () => ({ ok: false as const, message: 'no torch' }))
+      await expect(
+        adoptDesktopInstall({
+          tools,
+          deps: buildDeps({ validateLegacyVenv: validate }, legacy.info)
+        })
+      ).rejects.toThrow(/venv-broken-cancelled/)
+      // No installation created
+      expect(installationsMock.__records).toHaveLength(0)
+    } finally {
+      legacy.cleanup()
+    }
+  })
+
+  it('writes the marker and registers an installation with the expected shape', async () => {
+    const legacy = buildFakeLegacy({
+      configFiles: {
+        'comfy.settings.json': JSON.stringify({
+          'Comfy.Server.LaunchArgs': {
+            port: '8188',
+            'use-pytorch-cross-attention': ''
+          },
+          'Comfy-Desktop.SendStatistics': false
+        })
+      }
+    })
+    try {
+      const tools = buildSilentTools()
+      const record = await adoptDesktopInstall({
+        tools,
+        deps: buildDeps({}, legacy.info)
+      })
+      expect(record).toMatchObject({
+        sourceId: 'standalone',
+        adopted: true,
+        adoptedBaseDir: legacy.basePath,
+        adoptedSourceMode: 'git-clone-fallback',
+        releaseTag: 'legacy-adopted',
+        variant: 'legacy-uv-py312',
+        pythonVersion: '3.12',
+        launchMode: 'window',
+        browserPartition: 'unique',
+        portConflict: 'auto',
+        autoUpdateComfyUI: false,
+        // New shared-paths schema — `useSharedPaths` is gone.
+        useSharedModels: true,
+        useSharedInput: false,
+        useSharedOutput: false,
+        inputDir: path.join(legacy.basePath, 'input'),
+        outputDir: path.join(legacy.basePath, 'output'),
+        copiedFrom: 'legacy-desktop',
+        copyReason: 'in-place-adoption',
+        status: 'installed'
+      })
+      expect(record).not.toHaveProperty('useSharedPaths')
+      expect(record.launchArgs as string).toContain('--port 8188')
+      expect(record.launchArgs as string).toContain('--use-pytorch-cross-attention')
+      // Marker stamped with the freshly minted install id
+      const marker = fs.readFileSync(path.join(legacy.basePath, '.comfyui-desktop-2'), 'utf-8')
+      expect(marker).toBe(record.id)
+      // Telemetry succeeded
+      expect(telemetry.capture).toHaveBeenCalledWith(
+        'comfy.desktop.adopt.succeeded',
+        expect.objectContaining({
+          adopted_source_mode: 'git-clone-fallback',
+          carried_keys: expect.arrayContaining(['telemetryEnabled', 'firstUseCompleted'])
+        })
+      )
+      // Once-per-install funnel event fired exactly once with method 'adopt'.
+      expect(telemetry.captureInstallCompleted).toHaveBeenCalledTimes(1)
+      expect(telemetry.captureInstallCompleted).toHaveBeenCalledWith({
+        installationId: record.id,
+        method: 'adopt',
+        express: false
+      })
+      // Telemetry consent carried from legacy SendStatistics
+      expect(settingsMock.__store['telemetryEnabled']).toBe(false)
+      // First-use takeover skipped for adopted users.
+      expect(settingsMock.__store['firstUseCompleted']).toBe(true)
+      // Global shared dirs seeded to legacy workspace (v2 had nothing set).
+      expect(settingsMock.__store['inputDir']).toBe(path.join(legacy.basePath, 'input'))
+      expect(settingsMock.__store['outputDir']).toBe(path.join(legacy.basePath, 'output'))
+    } finally {
+      legacy.cleanup()
+    }
+  })
+
+  it('removes the auto-tracked legacy desktop card after successful adoption', async () => {
+    const legacy = buildFakeLegacy()
+    try {
+      // Pre-seed the auto-tracked legacy card; adoption must drop it (one card per workspace).
+      await installations.add({
+        name: 'ComfyUI Legacy Desktop',
+        sourceId: 'desktop',
+        installPath: legacy.info.basePath,
+        launchMode: 'external',
+        status: 'installed'
+      })
+      // Unrelated desktop-source records at other paths must NOT be touched.
+      const unrelated = await installations.add({
+        name: 'Other Legacy',
+        sourceId: 'desktop',
+        installPath: path.join(legacy.info.basePath, '..', 'elsewhere'),
+        launchMode: 'external',
+        status: 'installed'
+      })
+
+      const tools = buildSilentTools()
+      const record = await adoptDesktopInstall({
+        tools,
+        deps: buildDeps({}, legacy.info)
+      })
+
+      const after = await installations.list()
+      // Adopted standalone present, legacy card at this basePath gone,
+      // unrelated desktop record preserved.
+      expect(after.find((r) => r.id === record.id)).toBeTruthy()
+      expect(
+        after.some((r) => r.sourceId === 'desktop' && r.installPath === legacy.info.basePath)
+      ).toBe(false)
+      expect(after.find((r) => r.id === unrelated.id)).toBeTruthy()
+    } finally {
+      legacy.cleanup()
+    }
+  })
+
+  it('promotes legacy input-directory / output-directory into per-install fields', async () => {
+    const legacy = buildFakeLegacy({
+      configFiles: {
+        'comfy.settings.json': JSON.stringify({
+          'Comfy.Server.LaunchArgs': {
+            'input-directory': 'D:\\custom-input',
+            'output-directory': 'D:\\custom-output'
+          }
+        })
+      }
+    })
+    try {
+      const tools = buildSilentTools()
+      const record = await adoptDesktopInstall({ tools, deps: buildDeps({}, legacy.info) })
+      expect(record.inputDir).toBe('D:\\custom-input')
+      expect(record.outputDir).toBe('D:\\custom-output')
+      // Promoted out of the editable string.
+      expect(record.launchArgs as string).not.toContain('--input-directory')
+      expect(record.launchArgs as string).not.toContain('--output-directory')
+      // Telemetry notes which dirs were overridden.
+      expect(telemetry.capture).toHaveBeenCalledWith(
+        'comfy.desktop.adopt.succeeded',
+        expect.objectContaining({
+          adopted_path_override_input: true,
+          adopted_path_override_output: true
+        })
+      )
+    } finally {
+      legacy.cleanup()
+    }
+  })
+
+  it('force-enables autoInstallUpdates regardless of legacy value, carries pypiMirror and infers Chinese mirror flags', async () => {
+    const legacy = buildFakeLegacy({
+      configFiles: {
+        'comfy.settings.json': JSON.stringify({
+          'Comfy.ColorPalette': 'dark',
+          // Legacy Desktop auto-update OFF must NOT carry, else they'd miss future updates.
+          'Comfy-Desktop.AutoUpdate': false,
+          'Comfy-Desktop.UV.PypiInstallMirror': 'https://mirrors.aliyun.com/pypi/simple/',
+          'Comfy-Desktop.UV.TorchInstallMirror': 'https://download.pytorch.org/whl/cu121'
+        })
+      }
+    })
+    try {
+      const tools = buildSilentTools()
+      const record = await adoptDesktopInstall({ tools, deps: buildDeps({}, legacy.info) })
+      // ColorPalette is a frontend setting, not v2's launcher `theme` — never carried.
+      expect(settingsMock.__store).not.toHaveProperty('theme')
+      // Force-on at adoption regardless of legacy value.
+      expect(settingsMock.__store['autoInstallUpdates']).toBe(true)
+      expect(settingsMock.__store['pypiMirror']).toBe('https://mirrors.aliyun.com/pypi/simple/')
+      expect(settingsMock.__store['useChineseMirrors']).toBe(true)
+      expect(settingsMock.__store['chineseMirrorsPrompted']).toBe(true)
+      // TorchInstallMirror has no v2 consumer, never stashed on the record.
+      expect(record).not.toHaveProperty('adoptedTorchMirror')
+    } finally {
+      legacy.cleanup()
+    }
+  })
+
+  it('refreshes durable person properties for the settings it carries', async () => {
+    const legacy = buildFakeLegacy()
+    try {
+      // carryLegacySettings writes settings.json directly (bypassing
+      // applySettingSet), so it must refresh person properties itself.
+      const carried = { auto_install_updates: true, auto_install_updates_explicit: true }
+      vi.mocked(settings.getTrackedSettingsTelemetryProperties).mockReturnValueOnce(carried)
+      await adoptDesktopInstall({ tools: buildSilentTools(), deps: buildDeps({}, legacy.info) })
+      expect(telemetry.registerPersonProperties).toHaveBeenCalledWith(carried)
+    } finally {
+      legacy.cleanup()
+    }
+  })
+
+  it('respects a pre-existing v2 autoInstallUpdates choice on reconcile', async () => {
+    // A reconcile pass must not silently flip a user's explicit v2 choice back on.
+    settingsMock.__store['autoInstallUpdates'] = false
+    const legacy = buildFakeLegacy({
+      configFiles: {
+        'comfy.settings.json': JSON.stringify({
+          'Comfy-Desktop.AutoUpdate': true
+        })
+      }
+    })
+    try {
+      const tools = buildSilentTools()
+      await adoptDesktopInstall({ tools, deps: buildDeps({}, legacy.info) })
+      expect(settingsMock.__store['autoInstallUpdates']).toBe(false)
+    } finally {
+      legacy.cleanup()
+    }
+  })
+
+  it('respects pre-existing v2 settings under the "v2 user choice wins" rule', async () => {
+    // Adoption must NOT overwrite a pre-configured v2 choice.
+    settingsMock.__store['pypiMirror'] = 'https://pypi.org/simple/'
+    settingsMock.__store['inputDir'] = '/v2/chosen/input'
+    const legacy = buildFakeLegacy({
+      configFiles: {
+        'comfy.settings.json': JSON.stringify({
+          'Comfy-Desktop.UV.PypiInstallMirror': 'https://mirrors.aliyun.com/pypi/simple/'
+        })
+      }
+    })
+    try {
+      const tools = buildSilentTools()
+      await adoptDesktopInstall({ tools, deps: buildDeps({}, legacy.info) })
+      expect(settingsMock.__store['pypiMirror']).toBe('https://pypi.org/simple/')
+      expect(settingsMock.__store['inputDir']).toBe('/v2/chosen/input')
+      // outputDir was NOT pre-set → it should still get carried.
+      expect(settingsMock.__store['outputDir']).toBe(path.join(legacy.basePath, 'output'))
+      expect(telemetry.capture).toHaveBeenCalledWith(
+        'comfy.desktop.adopt.succeeded',
+        expect.objectContaining({
+          carry_skipped_keys: expect.arrayContaining(['pypiMirror', 'inputDir'])
+        })
+      )
+    } finally {
+      legacy.cleanup()
+    }
+  })
+
+  it('does not auto-update ComfyUI; preserves the adopted checkout', async () => {
+    getLatestStableTagMock.mockResolvedValue('v0.99.99')
+    const legacy = buildFakeLegacy({ configFiles: { 'comfy.settings.json': '{}' } })
+    try {
+      const tools = buildSilentTools()
+      const cloneFn = vi.fn(async (_url: string, dest: string) => {
+        fs.mkdirSync(dest, { recursive: true })
+        fs.mkdirSync(path.join(dest, '.git'), { recursive: true })
+        fs.writeFileSync(path.join(dest, 'main.py'), '# clone')
+        return { ok: true as const }
+      })
+      const record = await adoptDesktopInstall({
+        tools,
+        deps: buildDeps({ cloneSourceFromGit: cloneFn }, legacy.info)
+      })
+      // Frozen comfy: adoption must NOT roll the source forward to latest
+      // stable (issue #986). The user keeps their existing checkout.
+      expect(getLatestStableTagMock).not.toHaveBeenCalled()
+      expect(gitCheckoutCommitMock).not.toHaveBeenCalled()
+      expect(record).not.toHaveProperty('adoptedComfyTagAtMigration')
+      // autoUpdateComfyUI is opt-in; adopted installs stay off.
+      expect(record.autoUpdateComfyUI).toBe(false)
+      expect(telemetry.capture).toHaveBeenCalledWith(
+        'comfy.desktop.adopt.succeeded',
+        expect.objectContaining({
+          adopted_comfy_tag_at_migration: null
+        })
+      )
+    } finally {
+      legacy.cleanup()
+    }
+  })
+
+  it('populates comfyVersion from the freshly checked-out source so update checks see the real git tag', async () => {
+    // Without comfyVersion, the release-cache falls back to comparing
+    // installation.version ("0.24.0", bare) against latestTag ("v0.24.0",
+    // "v"-prefixed) and reports a false "update available" forever.
+    readGitHeadMock.mockReturnValue('deadbeefdeadbeefdeadbeefdeadbeefdeadbeef')
+    resolveLocalVersionMock.mockResolvedValue({
+      commit: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+      baseTag: 'v0.24.0',
+      commitsAhead: 0
+    })
+    getLatestStableTagMock.mockResolvedValue('v0.24.0')
+    const legacy = buildFakeLegacy({ configFiles: { 'comfy.settings.json': '{}' } })
+    try {
+      const cloneFn = vi.fn(async (_url: string, dest: string) => {
+        fs.mkdirSync(dest, { recursive: true })
+        fs.mkdirSync(path.join(dest, '.git'), { recursive: true })
+        fs.writeFileSync(path.join(dest, 'main.py'), '# clone')
+        fs.writeFileSync(path.join(dest, 'comfyui_version.py'), '__version__ = "0.24.0"\n')
+        return { ok: true as const }
+      })
+      const tools = buildSilentTools()
+      const record = await adoptDesktopInstall({
+        tools,
+        deps: buildDeps({ cloneSourceFromGit: cloneFn }, legacy.info)
+      })
+      // resolveLocalVersion was invoked against the destination ComfyUI
+      // dir with the adopted source's own version (comfyui_version.py) as
+      // the fallback tag.
+      expect(resolveLocalVersionMock).toHaveBeenCalledWith(
+        expect.stringContaining('ComfyUI'),
+        'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+        '0.24.0'
+      )
+      expect(fetchTagsMock).toHaveBeenCalledWith(expect.stringContaining('ComfyUI'))
+      expect(record.comfyVersion).toEqual({
+        commit: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+        baseTag: 'v0.24.0',
+        commitsAhead: 0
+      })
+      // The bare-string `version` field is still set (used as the
+      // human-friendly display in the manage view) — both coexist.
+      expect(record.version).toBe('0.24.0')
+    } finally {
+      legacy.cleanup()
+    }
+  })
+
+  it('omits comfyVersion when no .git directory exists in the source tree', async () => {
+    // Pre-swap-copy mode often delivers a tarball with no .git. We can't
+    // resolve a real tag in that case, and falling back to the bare
+    // __version__ string is intentional — the release-cache change
+    // tolerates that mismatch on the comparison side.
+    readGitHeadMock.mockReturnValue('deadbeefdeadbeefdeadbeefdeadbeefdeadbeef')
+    resolveLocalVersionMock.mockResolvedValue({
+      commit: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+      baseTag: 'v0.24.0',
+      commitsAhead: 0
+    })
+    const legacy = buildFakeLegacy({ configFiles: { 'comfy.settings.json': '{}' } })
+    try {
+      writeFakeStagedSource(path.join(legacy.configDir, 'legacy-staging', 'comfyui'), '0.24.0')
+      const tools = buildSilentTools()
+      const record = await adoptDesktopInstall({
+        tools,
+        deps: buildDeps({}, legacy.info)
+      })
+      expect(resolveLocalVersionMock).not.toHaveBeenCalled()
+      expect(record).not.toHaveProperty('comfyVersion')
+      expect(record.version).toBe('0.24.0')
+    } finally {
+      legacy.cleanup()
+    }
+  })
+
+  it('adoption is non-fatal when comfyVersion resolution throws', async () => {
+    readGitHeadMock.mockReturnValue('deadbeefdeadbeefdeadbeefdeadbeefdeadbeef')
+    resolveLocalVersionMock.mockRejectedValue(new Error('pygit2 not configured'))
+    const legacy = buildFakeLegacy({ configFiles: { 'comfy.settings.json': '{}' } })
+    try {
+      const cloneFn = vi.fn(async (_url: string, dest: string) => {
+        fs.mkdirSync(dest, { recursive: true })
+        fs.mkdirSync(path.join(dest, '.git'), { recursive: true })
+        fs.writeFileSync(path.join(dest, 'main.py'), '# clone')
+        return { ok: true as const }
+      })
+      const tools = buildSilentTools()
+      const record = await adoptDesktopInstall({
+        tools,
+        deps: buildDeps({ cloneSourceFromGit: cloneFn }, legacy.info)
+      })
+      expect(record).not.toHaveProperty('comfyVersion')
+      // Warning surfaced to the user-facing output stream
+      expect(tools.sendOutput).toHaveBeenCalledWith(
+        expect.stringContaining('could not resolve adopted ComfyUI version: pygit2 not configured')
+      )
+    } finally {
+      legacy.cleanup()
+    }
+  })
+
+  it('registers human-readable step labels for the progress UI', async () => {
+    const legacy = buildFakeLegacy({ configFiles: { 'comfy.settings.json': '{}' } })
+    try {
+      const tools = buildSilentTools()
+      await adoptDesktopInstall({
+        tools,
+        deps: buildDeps({}, legacy.info)
+      })
+      // The very first sendProgress call must announce the step list so
+      // the renderer can replace its phase-id fallback with the real
+      // labels (issue: "Migration progress is weird").
+      const stepsCalls = (tools.sendProgress as ReturnType<typeof vi.fn>).mock.calls.filter(
+        ([phase]) => phase === 'steps'
+      )
+      expect(stepsCalls).toHaveLength(1)
+      const stepList = (stepsCalls[0]![1] as { steps: Array<{ phase: string; label: string }> })
+        .steps
+      const phases = stepList.map((s) => s.phase)
+      // All adoption phases that emit sendProgress(...) below must be
+      // represented so the renderer never falls back to displaying the
+      // raw phase id like "source".
+      expect(phases).toContain('backup')
+      expect(phases).toContain('venv')
+      expect(phases).toContain('snapshot')
+      expect(phases).toContain('allocate')
+      expect(phases).toContain('source')
+      // Frozen comfy (#986): adoption no longer has an auto-update step.
+      expect(phases).not.toContain('comfy-update')
+      expect(phases).toContain('requirements')
+      expect(phases).toContain('settings')
+      expect(phases).toContain('register')
+      // `tcc` is darwin-only — assert symmetry with the actual platform.
+      if (process.platform === 'darwin') {
+        expect(phases).toContain('tcc')
+      } else {
+        expect(phases).not.toContain('tcc')
+      }
+      // Every registered step has a non-empty label string.
+      for (const step of stepList) {
+        expect(typeof step.label).toBe('string')
+        expect(step.label.length).toBeGreaterThan(0)
+        expect(step.label).not.toBe(step.phase)
+      }
+    } finally {
+      legacy.cleanup()
+    }
+  })
+
+  it('does not overwrite telemetryEnabled when already set', async () => {
+    const legacy = buildFakeLegacy({
+      configFiles: {
+        'comfy.settings.json': JSON.stringify({ 'Comfy-Desktop.SendStatistics': false })
+      }
+    })
+    try {
+      settingsMock.__store['telemetryEnabled'] = true
+      const tools = buildSilentTools()
+      await adoptDesktopInstall({
+        tools,
+        deps: buildDeps({}, legacy.info)
+      })
+      expect(settingsMock.__store['telemetryEnabled']).toBe(true)
+    } finally {
+      legacy.cleanup()
+    }
+  })
+
+  it('captures forensic snapshot under basePath/.snapshots', async () => {
+    const legacy = buildFakeLegacy({ configFiles: { 'comfy.settings.json': '{}' } })
+    try {
+      const tools = buildSilentTools()
+      await adoptDesktopInstall({
+        tools,
+        deps: buildDeps({}, legacy.info)
+      })
+      const snapshotDir = path.join(legacy.basePath, '.snapshots')
+      const entries = fs.readdirSync(snapshotDir)
+      expect(entries.some((f) => f.startsWith('legacy-adopted-') && f.endsWith('.json'))).toBe(true)
+    } finally {
+      legacy.cleanup()
+    }
+  })
+
+  it('backs up legacy state files into legacy-backup/<ts>', async () => {
+    const legacy = buildFakeLegacy({
+      configFiles: {
+        'config.json': '{"basePath":"x"}',
+        'comfy.settings.json': '{}',
+        'extra_models_config.yaml': 'c:\n  base_path: /a\n',
+        'window.json': '{}'
+      }
+    })
+    try {
+      const tools = buildSilentTools()
+      await adoptDesktopInstall({
+        tools,
+        deps: buildDeps({}, legacy.info)
+      })
+      const backupDirs = fs.readdirSync(path.join(legacy.configDir, 'legacy-backup'))
+      expect(backupDirs).toHaveLength(1)
+      const files = fs.readdirSync(path.join(legacy.configDir, 'legacy-backup', backupDirs[0]!))
+      expect(files.sort()).toEqual([
+        'comfy.settings.json',
+        'config.json',
+        'extra_models_config.yaml',
+        'window.json'
+      ])
+    } finally {
+      legacy.cleanup()
+    }
+  })
+
+  it('installs ComfyUI requirements via the legacy venv uv when present', async () => {
+    const legacy = buildFakeLegacy({ configFiles: { 'comfy.settings.json': '{}' } })
+    try {
+      // Drop a fake uv binary into the legacy venv so getLegacyVenvUvPath resolves.
+      const uvPath = getLegacyVenvUvPath(legacy.basePath)
+      fs.mkdirSync(path.dirname(uvPath), { recursive: true })
+      fs.writeFileSync(uvPath, '')
+      // Have the git-clone dep populate a real requirements.txt.
+      const cloneFn = vi.fn(async (_url: string, dest: string) => {
+        fs.mkdirSync(dest, { recursive: true })
+        fs.writeFileSync(path.join(dest, 'main.py'), '# clone')
+        fs.writeFileSync(path.join(dest, 'requirements.txt'), 'comfy_aimdo>=1.2.0\ntorch>=2.0\n')
+        fs.writeFileSync(path.join(dest, 'manager_requirements.txt'), 'pyyaml>=6\n')
+        return { ok: true as const }
+      })
+      const tools = buildSilentTools()
+      const record = await adoptDesktopInstall({
+        tools,
+        deps: buildDeps({ cloneSourceFromGit: cloneFn }, legacy.info)
+      })
+      // Both requirements files routed through installFilteredRequirements
+      // with the legacy uv + adopted python.
+      expect(installFilteredRequirementsMock).toHaveBeenCalledTimes(2)
+      const coreCall = installFilteredRequirementsMock.mock.calls[0]!
+      expect(coreCall[0]).toBe(path.join(record.installPath, 'ComfyUI', 'requirements.txt'))
+      expect(coreCall[1]).toBe(uvPath)
+      // pythonPath is the legacy venv python derived from basePath
+      expect(typeof coreCall[2]).toBe('string')
+      const mgrCall = installFilteredRequirementsMock.mock.calls[1]!
+      expect(mgrCall[0]).toBe(path.join(record.installPath, 'ComfyUI', 'manager_requirements.txt'))
+    } finally {
+      legacy.cleanup()
+    }
+  })
+
+  it('reconciles requirements on re-run against an already-adopted install', async () => {
+    const legacy = buildFakeLegacy({ configFiles: { 'comfy.settings.json': '{}' } })
+    try {
+      const uvPath = getLegacyVenvUvPath(legacy.basePath)
+      fs.mkdirSync(path.dirname(uvPath), { recursive: true })
+      fs.writeFileSync(uvPath, '')
+      const cloneFn = vi.fn(async (_url: string, dest: string) => {
+        fs.mkdirSync(dest, { recursive: true })
+        fs.writeFileSync(path.join(dest, 'main.py'), '# clone')
+        fs.writeFileSync(path.join(dest, 'requirements.txt'), 'comfy_aimdo>=1.2.0\n')
+        return { ok: true as const }
+      })
+      // First run: full adoption, installs requirements once.
+      const first = await adoptDesktopInstall({
+        tools: buildSilentTools(),
+        deps: buildDeps({ cloneSourceFromGit: cloneFn }, legacy.info)
+      })
+      expect(installFilteredRequirementsMock).toHaveBeenCalledTimes(1)
+      installFilteredRequirementsMock.mockClear()
+      // Second run: marker present → reconcile requirements without
+      // re-cloning / re-registering.
+      const second = await adoptDesktopInstall({
+        tools: buildSilentTools(),
+        deps: buildDeps({ cloneSourceFromGit: cloneFn }, legacy.info)
+      })
+      expect(second.id).toBe(first.id)
+      expect(cloneFn).toHaveBeenCalledTimes(1) // not re-cloned
+      // Requirements re-checked against the existing install's destSource.
+      expect(installFilteredRequirementsMock).toHaveBeenCalledTimes(1)
+      const reconcileCall = installFilteredRequirementsMock.mock.calls[0]!
+      expect(reconcileCall[0]).toBe(path.join(first.installPath, 'ComfyUI', 'requirements.txt'))
+      expect(reconcileCall[1]).toBe(uvPath)
+      // install.completed fires once for the first adoption only — the
+      // idempotent re-run returns the existing record before runAdoption,
+      // so it must NOT re-fire the once-per-install funnel event.
+      expect(telemetry.captureInstallCompleted).toHaveBeenCalledTimes(1)
+    } finally {
+      legacy.cleanup()
+    }
+  })
+
+  it('skips requirements install when the legacy venv uv is missing', async () => {
+    const legacy = buildFakeLegacy({ configFiles: { 'comfy.settings.json': '{}' } })
+    try {
+      // No uv binary written under .venv — should skip cleanly.
+      const tools = buildSilentTools()
+      await adoptDesktopInstall({
+        tools,
+        deps: buildDeps({}, legacy.info)
+      })
+      expect(installFilteredRequirementsMock).not.toHaveBeenCalled()
+      // pygit2 install requires uv too — it's skipped together.
+      expect(runUvPipMock).not.toHaveBeenCalled()
+    } finally {
+      legacy.cleanup()
+    }
+  })
+
+  it('installs pygit2 into the legacy venv during adoption so Manager + in-place updates work', async () => {
+    const legacy = buildFakeLegacy({ configFiles: { 'comfy.settings.json': '{}' } })
+    try {
+      const uvPath = getLegacyVenvUvPath(legacy.basePath)
+      fs.mkdirSync(path.dirname(uvPath), { recursive: true })
+      fs.writeFileSync(uvPath, '')
+      const cloneFn = vi.fn(async (_url: string, dest: string) => {
+        fs.mkdirSync(dest, { recursive: true })
+        fs.writeFileSync(path.join(dest, 'main.py'), '# clone')
+        // No requirements files so installFilteredRequirements isn't invoked
+        // and we can isolate the pygit2 call.
+        return { ok: true as const }
+      })
+      const tools = buildSilentTools()
+      await adoptDesktopInstall({
+        tools,
+        deps: buildDeps({ cloneSourceFromGit: cloneFn }, legacy.info)
+      })
+      // Exactly one runUvPip call, targeting pygit2 against the legacy uv
+      // and the adopted python.
+      expect(runUvPipMock).toHaveBeenCalledTimes(1)
+      const [calledUv, calledArgs] = runUvPipMock.mock.calls[0]!
+      expect(calledUv).toBe(uvPath)
+      expect(Array.isArray(calledArgs)).toBe(true)
+      const args = calledArgs as string[]
+      expect(args.slice(0, 3)).toEqual(['pip', 'install', 'pygit2'])
+      expect(args).toContain('--python')
+      // pygit2 result reported in telemetry succeeded payload.
+      expect(telemetry.capture).toHaveBeenCalledWith(
+        'comfy.desktop.adopt.succeeded',
+        expect.objectContaining({ requirements_pygit2_exit: 0 })
+      )
+    } finally {
+      legacy.cleanup()
+    }
+  })
+
+  it('records pygit2 install failure in telemetry without aborting adoption', async () => {
+    const legacy = buildFakeLegacy({ configFiles: { 'comfy.settings.json': '{}' } })
+    try {
+      const uvPath = getLegacyVenvUvPath(legacy.basePath)
+      fs.mkdirSync(path.dirname(uvPath), { recursive: true })
+      fs.writeFileSync(uvPath, '')
+      runUvPipMock.mockResolvedValueOnce(99)
+      const cloneFn = vi.fn(async (_url: string, dest: string) => {
+        fs.mkdirSync(dest, { recursive: true })
+        fs.writeFileSync(path.join(dest, 'main.py'), '# clone')
+        return { ok: true as const }
+      })
+      const tools = buildSilentTools()
+      const record = await adoptDesktopInstall({
+        tools,
+        deps: buildDeps({ cloneSourceFromGit: cloneFn }, legacy.info)
+      })
+      expect(record.adopted).toBe(true)
+      expect(telemetry.capture).toHaveBeenCalledWith(
+        'comfy.desktop.adopt.succeeded',
+        expect.objectContaining({ requirements_pygit2_exit: 99 })
+      )
+    } finally {
+      legacy.cleanup()
+    }
+  })
+
+  it('rolls back the installation record when the marker writeFile fails', async () => {
+    const legacy = buildFakeLegacy({ configFiles: { 'comfy.settings.json': '{}' } })
+    try {
+      // Targeted spy: fail only the marker write; let every other writeFile
+      // (snapshot, backup, etc.) succeed via the real impl.
+      const realWriteFile = fs.promises.writeFile.bind(fs.promises) as (
+        ...args: unknown[]
+      ) => Promise<void>
+      const markerPath = path.join(legacy.basePath, '.comfyui-desktop-2')
+      const spy = vi.spyOn(fs.promises, 'writeFile').mockImplementation(((...args: unknown[]) => {
+        const [file] = args
+        if (typeof file === 'string' && file === markerPath) {
+          return Promise.reject(Object.assign(new Error('disk full'), { code: 'ENOSPC' }))
+        }
+        return realWriteFile(...args)
+      }) as typeof fs.promises.writeFile)
+      try {
+        const tools = buildSilentTools()
+        await expect(
+          adoptDesktopInstall({
+            tools,
+            deps: buildDeps({}, legacy.info)
+          })
+        ).rejects.toThrow(/disk full/)
+        // DB rolled back — no orphaned record.
+        expect(installationsMock.__records).toHaveLength(0)
+      } finally {
+        spy.mockRestore()
+      }
+    } finally {
+      legacy.cleanup()
+    }
+  })
+})

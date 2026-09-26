@@ -7,7 +7,10 @@
 | 后端 · 引擎 | [Comfy-Org/ComfyUI](https://github.com/Comfy-Org/ComfyUI) | `ComfyUI/` | skills / mcp / agent / HTTP 路由 | `custom_nodes/comfy_studio/` |
 | 前端 · 桌面壳 | [Comfy-Org/Comfy-Desktop](https://github.com/Comfy-Org/Comfy-Desktop) | `Comfy-Desktop/` | MCP 宿主 / agent / 宿主进程接口 + 3 个主进程模块 | `lib/comfy_studio/`、`src/main/lib/` |
 
-两个上游仓库各自带 `.git`，被父仓库整目录忽略，就地保持原样；装进去的都是它们各自的**标准扩展位**
+两份上游工作树**整份收在父仓库里**（`ComfyUI/`、`Comfy-Desktop/` 的每个文件都由父仓库跟踪），
+因此它们自己没有 `.git` —— git 只可能把带 `.git` 的目录记成 gitlink，要把内容入库就必须把 `.git`
+挪走（本机那份在 `.cache/upstream-git/<检出名>.git`，要恢复成独立检出就搬回去）。
+装自己人代码用的都是它们各自的**标准扩展位**
 （ComfyUI 认 `custom_nodes/`，桌面壳的 `lib/` 是它既有的 Python 脚本目录，会被打进 `extraResources`）。
 除此之外的打通胶水收在 `setup/` 里。
 
@@ -17,22 +20,24 @@
 * `studio/patches/Comfy-Desktop/0001-comfy-studio-wiring.patch` —— 对上游既有文件的接线改动
   （桌面侧 5 个文件、121 行）。用补丁而不是覆盖整份文件：上游更新同一文件时 `git apply --check`
   会当场失败并报错，而不是静默把上游的改动顶掉。
-* `studio/upstream.json` —— 两份检出的基线 commit 与上游版本。`attach` / `detach` / `doctor` 都按它核对，
-  检出漂移就拒绝执行，要显式跑 `npm run attach -- --rebaseline` 才重新对齐。
+* `studio/upstream.json` —— 入库内容对应的上游 commit / 分支 / 版本。已入库形态下没有检出 HEAD 可对，
+  上游有没有动过就看父仓的 `git diff`；若把 `.cache/upstream-git/<检出名>.git` 搬回去恢复成独立检出，
+  `attach` / `doctor` 会改用检出 HEAD 核对，漂移就拒绝执行，要显式跑 `npm run attach -- --rebaseline`
+  才重新对齐。
 
-提交时只管 `studio/`、`setup/`、`README.md`、`package.json`：两个上游检出在父仓库里是 gitlink
-（各指向上游一个 commit），不要把它们加进索引。
+自己人代码有两重身份：检出里的那份是「跑起来的样子」（父仓库跟踪），`studio/` 里的是它的源。
+改代码请改 `studio/`，再跑 `npm run attach` 同步（幂等）；直接在检出里改，`attach` 与 `npm run doctor`
+会把「被就地改过」显式报出来，不会静默覆盖。确认无误后把 `studio/` 与检出一起提交。
 
-为什么非这样收不可：引擎侧落点 `custom_nodes/` 被上游自己的 `.gitignore` 忽略、桌面侧新增文件在检出里
-是未跟踪、父仓库又把两个检出整目录忽略（gitlink，且没有 `.gitmodules`）——不这样收，这些代码在三处
-git 里都不存在，换机器 clone 或一次 `git clean` 就没了。
+提交时留意检出里那些「藏着的」文件：引擎侧 `custom_nodes/` 被上游自己的 `.gitignore` 忽略，
+当初就是靠 `git add -f` 逐个加进父仓的 —— 也正因为上游默认忽略它，重建这棵树时最容易漏掉。
 
 ## 快速开始
 
 ```powershell
 npm run setup          # 给 ComfyUI 建 .venv 并装依赖（GPU 版 torch）
 npm run setup:desktop  # 装 Comfy-Desktop 的 Electron 依赖
-npm run attach         # 把自己人代码装进两份上游检出（studio/ → 各自的标准扩展位）
+npm run attach         # 校对自己人代码在检出里就位（幂等；改了 studio/ 之后跑它同步）
 npm run seed           # 把本仓 ComfyUI 注册成桌面的一个已有安装
 npm run dev            # 起桌面壳
 ```
@@ -44,7 +49,7 @@ npm run dev            # 起桌面壳
 ```powershell
 npm run doctor         # 四段式体检：覆盖层 / 引擎 / 桌面壳 / 接线，逐项通过或给出下一步命令
 npm run attach -- --check   # 只看覆盖层现在是什么状态、会装什么，不动盘
-npm run detach         # 把覆盖层与补丁撤出检出（升级上游、复现上游原始行为时用）
+npm run detach         # 只对独立检出有效：把覆盖层与补丁撤出去（已入库形态会拒绝并给出替代命令）
 npm run engine         # 不经桌面壳单独起引擎（默认 127.0.0.1:8188）
 npm run mcp            # 单独起引擎侧 MCP server（stdio），喂给外部 agent 客户端
 npm run studio         # 单独起桌面侧 comfy-studio 宿主（MCP 客户端 + skill 目录 + 对话 agent）
@@ -97,13 +102,15 @@ agent / skill / mcp 三件能力**前后端各有一份**，按各自项目里�
 
 ## 打通是怎么做到的
 
-除了上面新增的扩展位，胶水本身靠的是 Comfy-Desktop 自己就支持「接管已有的 git 检出 + 目录里的 venv」这个能力：
+除了上面新增的扩展位，胶水本身靠的是 Comfy-Desktop 自己就支持「接管一份已有的引擎检出 + 目录里的 venv」这个能力：
 
 1. **引擎侧**：`setup/install-engine.ps1` 在 `ComfyUI/.venv` 建 Python 3.11 环境，装 CUDA 版 torch（本机有 N 卡时；否则回退 CPU 轮子）和上游 `requirements.txt` 的其余依赖。
 2. **接线侧**：`setup/seed-desktop.mjs` 往 Comfy-Desktop 的安装清单
    （Windows：`%APPDATA%\comfyui-desktop-2\installations.json`）写一条 `sourceId: "git"` 的记录，指向本仓 `ComfyUI/` 与它的 `.venv`。
-   Comfy-Desktop 的 git 来源插件识别到目录里的 `.git` 就按 git 型安装处理，
-   启动命令是 `<venvPath>/Scripts/python.exe -s main.py <launchArgs>`，cwd 取 `main.py` 所在目录。
+   该来源插件的启动命令是 `<venvPath>/Scripts/python.exe -s main.py <launchArgs>`，cwd 取 `main.py`
+   所在目录 —— 这条路只用 `venvPath` 与 `main.py`，不读 `.git`，所以本仓这种已入库的检出照样能被拉起。
+   上游源码里 `.git` 只被 `probeInstallation`（UI 里「添加已有安装」那条路）和详情页的 git 动作用到，
+   我们直接写记录、不经过前者，代价是后者对本仓这个安装不可用。
    有了这条记录，首启的「用云端还是本地」向导也会被跳过（列表里已有非 cloud 安装）。
 3. **前端侧**：桌面壳启动引擎后，窗口直接加载引擎自带的画布
    （`comfyui_frontend_package`，ComfyUI 1.53.6 前端包由 pip 装进引擎 venv）。
@@ -118,13 +125,19 @@ agent / skill / mcp 三件能力**前后端各有一份**，按各自项目里�
   保证模板数据和缩略图都齐全 —— 否则前端模板库会因缩略图 404 而整片空白。
 - **`bootstrap-python` 未构建**：Comfy-Desktop 的 `predev` 会提示，
   它只影响「桌面内建 python 去 clone 新安装」那条路，跟我们这套「接管已有检出」无关，忽略即可。
+- **上游内容入库的代价**：`ComfyUI/` 与 `Comfy-Desktop/` 现在整份由父仓库跟踪（约 74 MB / 2200 个文件），
+  clone 一次就自带、不依赖上游可达；代价是这两个检出不再是独立 git 检出 —— 不能在本仓里 `git pull`
+  上游，仓库历史里也没有上游的提交记录。要更新上游：另 clone 一份到临时目录，按需把内容搬进来，
+  改 `studio/upstream.json` 的基线，再跑 `npm run doctor` 核对补丁还合不合得上。
+- **`detach` 只对独立检出有效**：已入库形态下父仓里那份就是「装了覆盖层」的工作形态，撤出会把它删成
+  一片删改，所以脚本直接拒绝并给替代命令（要纯净上游就另 clone 到临时目录）。
 
 ## 目录
 
 ```
 comfy-studio/
 ├─ studio/           # 自己人代码的源（父仓库跟踪，靠 npm run attach 装进检出）
-│  ├─ upstream.json                             # 两份检出的基线 commit 与上游版本
+│  ├─ upstream.json                             # 入库内容对应的上游 commit / 分支 / 版本
 │  ├─ overlay/ComfyUI/custom_nodes/comfy_studio/  # 引擎侧：skills / mcp / agent + routes
 │  │  └─ tests/                                 # 引擎侧自检（skills / 工具表 / 组合 / 路由 / stdio 协议）
 │  ├─ overlay/Comfy-Desktop/lib/comfy_studio/     # 桌面侧：mcp（宿主）/ skills / agent + 宿主进程接口
@@ -133,9 +146,9 @@ comfy-studio/
 │  └─ patches/Comfy-Desktop/                    # 对上游既有文件的接线改动（补丁）
 ├─ setup/            # 打通物料：attach / detach / 装环境 / 注册安装 / 体检 / 单独起引擎(engine) / mcp / studio
 │  └─ lib/overlay.mjs                           # 覆盖层装配与基线核对（attach / detach / doctor 共用）
-├─ ComfyUI/          # 上游引擎（父仓库忽略；自己人代码由 npm run attach 装进来）
-├─ Comfy-Desktop/    # 上游桌面壳（父仓库忽略；同上）
-└─ .cache/           # 过滤清单、自检输出、安装日志，以及被顶掉/删除内容的备份（父仓库忽略）
+├─ ComfyUI/          # 上游引擎：工作树整份入库（自己人代码在 custom_nodes/comfy_studio/）
+├─ Comfy-Desktop/    # 上游桌面壳：工作树整份入库（自己人代码在 lib/comfy_studio/ 与 src/main/lib/）
+└─ .cache/           # 过滤清单、自检输出、安装日志、被顶掉/删除内容的备份，以及两份上游的 .git（父仓库忽略）
 ```
 
 两组自检都要求自己人代码已经装进检出（没装会直接「找不到包」），先跑一次 `npm run attach`。

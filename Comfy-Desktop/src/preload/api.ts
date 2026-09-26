@@ -1,0 +1,558 @@
+/**
+ * Builds the `window.api` bridge exposed to renderer surfaces, shared by the panel
+ * and title-bar preloads via a Rollup chunk.
+ *
+ * Hosts loading this preload MUST set `sandbox: false`: sandboxed preloads can only
+ * `require()` the electron whitelist, so the chunked `require("./chunks/...")` would
+ * fail silently and leave `window.api` undefined. `contextIsolation` /
+ * `nodeIntegration: false` stay enabled.
+ */
+import { ipcRenderer, webUtils } from 'electron'
+import type { IpcRendererEvent } from 'electron'
+import type { ElectronApi, ResolvedTheme, AdoptPromptRequest } from '../types/ipc'
+
+export function buildElectronApi(): ElectronApi {
+  return {
+    platform: process.platform,
+
+    // Sources / New Install
+    getSources: () => ipcRenderer.invoke('get-sources'),
+    getFieldOptions: (sourceId, fieldId, selections, context) =>
+      ipcRenderer.invoke('get-field-options', sourceId, fieldId, selections, context),
+    buildInstallation: (sourceId, selections) =>
+      ipcRenderer.invoke('build-installation', sourceId, selections),
+    getDefaultInstallDir: () => ipcRenderer.invoke('get-default-install-dir'),
+    detectGPU: () => ipcRenderer.invoke('detect-gpu'),
+    validateHardware: () => ipcRenderer.invoke('validate-hardware'),
+    checkNvidiaDriver: () => ipcRenderer.invoke('check-nvidia-driver'),
+
+    // File/URL
+    browseFolder: (defaultPath?) => ipcRenderer.invoke('browse-folder', defaultPath),
+    importPerformanceTestWorkflow: (filePath?) =>
+      ipcRenderer.invoke('import-performance-test-workflow', filePath),
+    deletePerformanceTestWorkflow: (filePath) =>
+      ipcRenderer.invoke('delete-performance-test-workflow', filePath),
+    savePerformanceTestLogs: (filePath, logs) =>
+      ipcRenderer.invoke('save-performance-test-logs', filePath, logs),
+    listPerformanceTestBenchmarks: (folderPath?) =>
+      ipcRenderer.invoke('list-performance-test-benchmarks', folderPath),
+    deletePerformanceTestBenchmark: (folderPath, sessionId) =>
+      ipcRenderer.invoke('delete-performance-test-benchmark', folderPath, sessionId),
+    renamePerformanceTestBenchmark: (folderPath, sessionId, newSessionId) =>
+      ipcRenderer.invoke('rename-performance-test-benchmark', folderPath, sessionId, newSessionId),
+    readPerformanceTestResultsSummary: (filePath) =>
+      ipcRenderer.invoke('read-performance-test-results-summary', filePath),
+    runPerformanceTestWorkflow: (sessionId, filePath, measuredRuns, warmupRuns) =>
+      ipcRenderer.invoke(
+        'run-performance-test-workflow',
+        sessionId,
+        filePath,
+        measuredRuns,
+        warmupRuns
+      ),
+    exportResultsImage: (png, imageType, defaultPath?) =>
+      ipcRenderer.invoke('export-results-image', png, imageType, defaultPath),
+    openPath: (targetPath) => ipcRenderer.invoke('open-path', targetPath),
+    openExternal: (url) => ipcRenderer.invoke('open-external', url),
+    getDiskSpace: (targetPath) => ipcRenderer.invoke('get-disk-space', targetPath),
+    /** Read-only snapshot of an install's durable log buffer, as one joined
+     *  string. Seeds a chained launch op's terminal with install-leg lines. */
+    logsSnapshot: (installationId: string): Promise<string> =>
+      ipcRenderer.invoke('logs-snapshot', installationId),
+    validateInstallPath: (targetPath) => ipcRenderer.invoke('validate-install-path', targetPath),
+    getInstallationSize: (installationId) =>
+      ipcRenderer.invoke('get-installation-size', installationId),
+    cancelInstallationSize: () => ipcRenderer.invoke('cancel-installation-size'),
+
+    // Locale
+    getLocaleMessages: () => ipcRenderer.invoke('get-locale-messages'),
+    getAvailableLocales: () => ipcRenderer.invoke('get-available-locales'),
+    getLocale: () => ipcRenderer.invoke('get-locale'),
+
+    // First-use takeover state
+    getFirstUseState: () => ipcRenderer.invoke('get-first-use-state'),
+
+    // Installations
+    getInstallations: () => ipcRenderer.invoke('get-installations'),
+    getInstallationsSummary: () => ipcRenderer.invoke('get-installations-summary'),
+    addInstallation: (data) => ipcRenderer.invoke('add-installation', data),
+    reorderInstallations: (orderedIds) => ipcRenderer.invoke('reorder-installations', orderedIds),
+    probeInstallation: (dirPath) => ipcRenderer.invoke('probe-installation', dirPath),
+    trackInstallation: (data) => ipcRenderer.invoke('track-installation', data),
+    installInstance: (installationId, express) =>
+      ipcRenderer.invoke('install-instance', installationId, express),
+    skipTemplateDownload: (installationId) =>
+      ipcRenderer.invoke('skip-template-download', installationId),
+    updateInstallation: (installationId, data) =>
+      ipcRenderer.invoke('update-installation', installationId, data),
+
+    // Running
+    stopComfyUI: (installationId) => ipcRenderer.invoke('stop-comfyui', installationId),
+    focusComfyWindow: (installationId) => ipcRenderer.invoke('focus-comfy-window', installationId),
+
+    // Interactive console
+    terminalSubscribe: (installationId) => ipcRenderer.invoke('terminal-subscribe', installationId),
+    terminalUnsubscribe: (installationId) =>
+      ipcRenderer.invoke('terminal-unsubscribe', installationId),
+    terminalWrite: (installationId, data) =>
+      ipcRenderer.invoke('terminal-write', installationId, data),
+    terminalResize: (installationId, cols, rows) =>
+      ipcRenderer.invoke('terminal-resize', installationId, cols, rows),
+    terminalRestart: (installationId) => ipcRenderer.invoke('terminal-restart', installationId),
+    openInstallWindow: (installationId) =>
+      ipcRenderer.invoke('open-install-window', installationId),
+    closeComfyWindow: (installationId, opts) =>
+      ipcRenderer.invoke('close-comfy-window', installationId, opts),
+    closeHostWindow: () => ipcRenderer.invoke('close-host-window'),
+    returnToDashboard: () => ipcRenderer.invoke('return-to-dashboard'),
+    closeCurrentPanel: () => ipcRenderer.send('comfy-window:close-current-panel'),
+    /** Signal that an overlay panel (feedback / mcp-setup) has painted, so main
+     *  can reveal the until-now-hidden panel view without an opaque flash. */
+    signalOverlayReady: () => ipcRenderer.send('comfy-window:overlay-ready'),
+    resolveStartupRestoreReveal: (result) =>
+      ipcRenderer.send('comfy-window:startup-restore-reveal', { result }),
+    openGlobalSettings: (tab, opts) =>
+      ipcRenderer.send(
+        'comfy-titlepopup:open-global-settings',
+        tab || opts?.highlightField ? { tab, highlightField: opts?.highlightField } : undefined
+      ),
+    openInstancePicker: (opts) =>
+      ipcRenderer.send('comfy-window:open-instance-picker-for-install', {
+        installationId: opts?.installationId ?? null,
+        initialTab: opts?.initialTab ?? null,
+        autoAction: opts?.autoAction ?? null
+      }),
+    setFirstUseMode: (mode) => ipcRenderer.send('comfy-window:set-first-use-mode', { mode }),
+    onFirstUseSkip: (callback) => {
+      const handler = (): void => callback()
+      ipcRenderer.on('comfy-panel:first-use-skip', handler)
+      return () => ipcRenderer.removeListener('comfy-panel:first-use-skip', handler)
+    },
+    onOpenFeedback: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown): void => {
+        const source = (data as { source?: unknown } | null)?.source
+        callback({ source: source === 'menu' ? 'menu' : 'titlebar' })
+      }
+      ipcRenderer.on('comfy-panel:open-feedback', handler)
+      return () => ipcRenderer.removeListener('comfy-panel:open-feedback', handler)
+    },
+    onOpenAnnouncement: (callback) => {
+      const handler = (): void => callback()
+      ipcRenderer.on('comfy-panel:open-announcement', handler)
+      return () => ipcRenderer.removeListener('comfy-panel:open-announcement', handler)
+    },
+    onCloseRequest: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(data as { requestId: string })
+      ipcRenderer.on('comfy-window:request-close', handler)
+      return () => ipcRenderer.removeListener('comfy-window:request-close', handler)
+    },
+    respondCloseRequest: (payload) =>
+      ipcRenderer.send('comfy-window:request-close-response', payload),
+    ackCloseRequest: (payload) => ipcRenderer.send('comfy-window:request-close-ack', payload),
+    onReturnToDashboardRequest: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(data as { requestId: string })
+      ipcRenderer.on('comfy-window:request-return-to-dashboard', handler)
+      return () => ipcRenderer.removeListener('comfy-window:request-return-to-dashboard', handler)
+    },
+    respondReturnToDashboardRequest: (payload) =>
+      ipcRenderer.send('comfy-window:request-return-to-dashboard-response', payload),
+    ackReturnToDashboardRequest: (payload) =>
+      ipcRenderer.send('comfy-window:request-return-to-dashboard-ack', payload),
+    transferHostBoundsToInstall: (installationId) =>
+      ipcRenderer.invoke('transfer-host-bounds-to-install', installationId),
+    claimAttachHost: (installationId) => ipcRenderer.invoke('claim-attach-host', installationId),
+    releaseAttachHostPreview: () => ipcRenderer.invoke('release-attach-host-preview'),
+    getRunningInstances: () => ipcRenderer.invoke('get-running-instances'),
+    getLaunchingInstances: () => ipcRenderer.invoke('get-launching-instances'),
+    getStoppingInstances: () => ipcRenderer.invoke('get-stopping-instances'),
+    getActiveOperations: () => ipcRenderer.invoke('get-active-operations'),
+    getLastCrashError: (installationId: string) =>
+      ipcRenderer.invoke('get-last-crash-error', installationId),
+    getCrashInstances: () => ipcRenderer.invoke('get-crash-instances'),
+    cancelLaunch: () => ipcRenderer.invoke('cancel-launch'),
+    cancelOperation: (installationId) => ipcRenderer.invoke('cancel-operation', installationId),
+    killPortProcess: (port) => ipcRenderer.invoke('kill-port-process', port),
+
+    // Actions
+    getListActions: (installationId) => ipcRenderer.invoke('get-list-actions', installationId),
+    getDetailSections: (installationId) =>
+      ipcRenderer.invoke('get-detail-sections', installationId),
+    getComfyArgs: (installationId) => ipcRenderer.invoke('get-comfy-args', installationId),
+    runAction: (installationId, actionId, actionData?) =>
+      ipcRenderer.invoke('run-action', installationId, actionId, actionData),
+
+    // Snapshots
+    getSnapshots: (installationId) => ipcRenderer.invoke('get-snapshots', installationId),
+    getSnapshotDetail: (installationId, filename) =>
+      ipcRenderer.invoke('get-snapshot-detail', installationId, filename),
+    getSnapshotDiff: (installationId, filename, mode) =>
+      ipcRenderer.invoke('get-snapshot-diff', installationId, filename, mode),
+    exportSnapshot: (installationId, filename) =>
+      ipcRenderer.invoke('export-snapshot', installationId, filename),
+    exportAllSnapshots: (installationId) =>
+      ipcRenderer.invoke('export-all-snapshots', installationId),
+    importSnapshotsPreview: () => ipcRenderer.invoke('import-snapshots-preview'),
+    importSnapshotsDiff: (installationId: string) =>
+      ipcRenderer.invoke('import-snapshots-diff', installationId),
+    importSnapshotsConfirm: (installationId: string) =>
+      ipcRenderer.invoke('import-snapshots-confirm', installationId),
+    previewSnapshotFile: () => ipcRenderer.invoke('preview-snapshot-file'),
+    previewLocalMigration: (installationId: string) =>
+      ipcRenderer.invoke('preview-local-migration', installationId),
+    previewSnapshotPath: (filePath: string) =>
+      ipcRenderer.invoke('preview-snapshot-path', filePath),
+    createFromSnapshot: (
+      filePath: string,
+      name?: string,
+      releaseTag?: string,
+      variantId?: string
+    ) => ipcRenderer.invoke('create-from-snapshot', filePath, name, releaseTag, variantId),
+    getPathForFile: (file: File) => webUtils.getPathForFile(file),
+
+    // Settings
+    getSettingsSections: () => ipcRenderer.invoke('get-settings-sections'),
+    getModelsSections: () => ipcRenderer.invoke('get-models-sections'),
+    getUniqueName: (baseName: string) => ipcRenderer.invoke('get-unique-name', baseName),
+    getMediaSections: () => ipcRenderer.invoke('get-media-sections'),
+    setSetting: (key, value) => ipcRenderer.invoke('set-setting', key, value),
+    getSetting: (key) => ipcRenderer.invoke('get-setting', key),
+    getPendingBetaNotice: (installationId) =>
+      ipcRenderer.invoke('get-pending-beta-notice', installationId),
+    acknowledgeBetaNotice: (installationId, shownArgs) =>
+      ipcRenderer.invoke('acknowledge-beta-notice', installationId, shownArgs),
+
+    // Theme
+    getResolvedTheme: () => ipcRenderer.invoke('get-resolved-theme'),
+
+    // App
+    getAppVersion: () => ipcRenderer.invoke('get-app-version'),
+    getStableTags: (): Promise<string[]> => ipcRenderer.invoke('get-stable-tags'),
+    getCloudUserTier: () => ipcRenderer.invoke('get-cloud-user-tier'),
+    getCloudFreeRunsEnabled: () => ipcRenderer.invoke('get-cloud-free-runs-enabled'),
+    quitApp: () => ipcRenderer.invoke('quit-app'),
+    relaunchApp: () => ipcRenderer.invoke('app:relaunch'),
+    resetZoom: () => ipcRenderer.invoke('reset-zoom'),
+    getSystemInfo: () => ipcRenderer.invoke('get-system-info'),
+    getInstallationDdContext: (installationId: string) =>
+      ipcRenderer.invoke('get-installation-dd-context', installationId),
+    getInstallsInventory: () => ipcRenderer.invoke('get-installs-inventory'),
+    getDeviceId: () => ipcRenderer.invoke('get-device-id'),
+
+    // Dev platform (cloud auth + comfy-builder). Tokens never cross IPC; these
+    // only ever carry AuthStatus / Workspace / build display rows.
+    comfybuilder: {
+      signIn: () => ipcRenderer.invoke('comfybuilder:signIn'),
+      signOut: () => ipcRenderer.invoke('comfybuilder:signOut'),
+      getAuthStatus: () => ipcRenderer.invoke('comfybuilder:getAuthStatus'),
+      onAuthChanged: (callback) => {
+        const handler = (_event: IpcRendererEvent, status: unknown) =>
+          callback(status as Parameters<typeof callback>[0])
+        ipcRenderer.on('comfybuilder:authChanged', handler)
+        return () => ipcRenderer.removeListener('comfybuilder:authChanged', handler)
+      },
+      listWorkspaces: () => ipcRenderer.invoke('comfybuilder:listWorkspaces'),
+      switchWorkspace: (workspaceId) =>
+        ipcRenderer.invoke('comfybuilder:switchWorkspace', workspaceId),
+      listBuilds: () => ipcRenderer.invoke('comfybuilder:listBuilds'),
+      openBuildsPage: (workspaceId) =>
+        ipcRenderer.invoke('comfybuilder:openBuildsPage', workspaceId),
+      installBuild: (request) => ipcRenderer.invoke('comfybuilder:installBuild', request),
+      promoteLocalInstance: (installationId) =>
+        ipcRenderer.invoke('comfybuilder:promoteLocalInstance', installationId)
+    },
+
+    // Model downloads
+    listModelDownloads: () => ipcRenderer.invoke('model-download-list'),
+    // Controls take a download ref: the row's stable job id, or its URL for
+    // rows that predate ids. Main resolves either.
+    pauseModelDownload: (ref) => ipcRenderer.invoke('model-download-pause', { ref }),
+    resumeModelDownload: (ref) => ipcRenderer.invoke('model-download-resume', { ref }),
+    cancelModelDownload: (ref) => ipcRenderer.invoke('model-download-cancel', { ref }),
+    dismissModelDownload: (ref) => ipcRenderer.invoke('model-download-dismiss', { ref }),
+    clearFinishedModelDownloads: () => ipcRenderer.invoke('model-download-clear-finished'),
+    retryModelDownload: (ref) => ipcRenderer.invoke('model-download-retry', { ref }),
+    showDownloadInFolder: (savePath) => ipcRenderer.invoke('show-download-in-folder', { savePath }),
+    getDownloadThumbnail: (savePath) => ipcRenderer.invoke('download-thumbnail', { savePath }),
+
+    // Updates
+    checkForUpdate: () => ipcRenderer.invoke('check-for-update'),
+    downloadUpdate: () => ipcRenderer.invoke('download-update'),
+    installUpdate: () => ipcRenderer.invoke('install-update'),
+    getUpdateCapabilities: () => ipcRenderer.invoke('get-update-capabilities'),
+    getAppUpdateState: () => ipcRenderer.invoke('get-app-update-state'),
+
+    // Adopt prompts (in-app modal bridge; replaces native message boxes)
+    onAdoptPrompt: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(data as AdoptPromptRequest)
+      ipcRenderer.on('adopt-prompt', handler)
+      return () => ipcRenderer.removeListener('adopt-prompt', handler)
+    },
+    ackAdoptPrompt: (payload) => ipcRenderer.send('adopt-prompt-ack', payload),
+    respondAdoptPrompt: (payload) => ipcRenderer.send('adopt-prompt-response', payload),
+
+    // Event listeners (return unsubscribe functions)
+    onInstallProgress: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(data as Parameters<typeof callback>[0])
+      ipcRenderer.on('install-progress', handler)
+      return () => ipcRenderer.removeListener('install-progress', handler)
+    },
+    onComfyOutput: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(data as Parameters<typeof callback>[0])
+      ipcRenderer.on('comfy-output', handler)
+      return () => ipcRenderer.removeListener('comfy-output', handler)
+    },
+    onPerformanceTestProgress: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(data as Parameters<typeof callback>[0])
+      ipcRenderer.on('performance-test-progress', handler)
+      return () => ipcRenderer.removeListener('performance-test-progress', handler)
+    },
+    onComfyExited: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(data as Parameters<typeof callback>[0])
+      ipcRenderer.on('comfy-exited', handler)
+      return () => ipcRenderer.removeListener('comfy-exited', handler)
+    },
+    onInstanceCrashed: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(data as Parameters<typeof callback>[0])
+      ipcRenderer.on('instance-crashed', handler)
+      return () => ipcRenderer.removeListener('instance-crashed', handler)
+    },
+    onTerminalOutput: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(data as Parameters<typeof callback>[0])
+      ipcRenderer.on('terminal-output', handler)
+      return () => ipcRenderer.removeListener('terminal-output', handler)
+    },
+    onTerminalExited: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(data as Parameters<typeof callback>[0])
+      ipcRenderer.on('terminal-exited', handler)
+      return () => ipcRenderer.removeListener('terminal-exited', handler)
+    },
+    onComfyBootLog: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(data as Parameters<typeof callback>[0])
+      ipcRenderer.on('comfy-boot-log', handler)
+      return () => ipcRenderer.removeListener('comfy-boot-log', handler)
+    },
+    onInstanceLaunching: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(data as Parameters<typeof callback>[0])
+      ipcRenderer.on('instance-launching', handler)
+      return () => ipcRenderer.removeListener('instance-launching', handler)
+    },
+    onInstanceLaunchFailed: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(data as Parameters<typeof callback>[0])
+      ipcRenderer.on('instance-launch-failed', handler)
+      return () => ipcRenderer.removeListener('instance-launch-failed', handler)
+    },
+    onInstanceStarted: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(data as Parameters<typeof callback>[0])
+      ipcRenderer.on('instance-started', handler)
+      return () => ipcRenderer.removeListener('instance-started', handler)
+    },
+    onInstanceStopping: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(data as Parameters<typeof callback>[0])
+      ipcRenderer.on('instance-stopping', handler)
+      return () => ipcRenderer.removeListener('instance-stopping', handler)
+    },
+    onInstanceStopped: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(data as Parameters<typeof callback>[0])
+      ipcRenderer.on('instance-stopped', handler)
+      return () => ipcRenderer.removeListener('instance-stopped', handler)
+    },
+    onOperationChanged: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(data as Parameters<typeof callback>[0])
+      ipcRenderer.on('operation-changed', handler)
+      return () => ipcRenderer.removeListener('operation-changed', handler)
+    },
+    onThemeChanged: (callback) => {
+      const handler = (_event: IpcRendererEvent, theme: unknown) => callback(theme as ResolvedTheme)
+      ipcRenderer.on('theme-changed', handler)
+      return () => ipcRenderer.removeListener('theme-changed', handler)
+    },
+    onLocaleChanged: (callback) => {
+      const handler = (_event: IpcRendererEvent, payload: unknown) =>
+        callback(payload as { locale: string; messages: Record<string, unknown> })
+      ipcRenderer.on('locale-changed', handler)
+      return () => ipcRenderer.removeListener('locale-changed', handler)
+    },
+    onConfirmQuit: (callback) => {
+      const handler = (_event: IpcRendererEvent, details: unknown) =>
+        callback(details as Parameters<typeof callback>[0])
+      ipcRenderer.on('confirm-quit', handler)
+      return () => ipcRenderer.removeListener('confirm-quit', handler)
+    },
+    onInstallationsChanged: (callback) => {
+      const handler = () => callback()
+      ipcRenderer.on('installations-changed', handler)
+      return () => ipcRenderer.removeListener('installations-changed', handler)
+    },
+    onReleaseCacheEnriched: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(data as { repo: string })
+      ipcRenderer.on('release-cache-enriched', handler)
+      return () => ipcRenderer.removeListener('release-cache-enriched', handler)
+    },
+    onInstallationsVersionsUpdated: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) => {
+        const updates = (data as Record<string, unknown>).updates as {
+          id: string
+          version: string
+        }[]
+        callback(updates)
+      }
+      ipcRenderer.on('installations-versions-updated', handler)
+      return () => ipcRenderer.removeListener('installations-versions-updated', handler)
+    },
+    onAppUpdatePromptRestart: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(data as { version: string })
+      ipcRenderer.on('app-update:prompt-restart', handler)
+      return () => ipcRenderer.removeListener('app-update:prompt-restart', handler)
+    },
+    onAppUpdateStateChanged: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(data as Parameters<typeof callback>[0])
+      ipcRenderer.on('app-update:state-changed', handler)
+      return () => ipcRenderer.removeListener('app-update:state-changed', handler)
+    },
+    onAppUpdateDownloadProgress: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(data as Parameters<typeof callback>[0])
+      ipcRenderer.on('app-update:download-progress', handler)
+      return () => ipcRenderer.removeListener('app-update:download-progress', handler)
+    },
+    onAppUpdateUserActionFailed: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(data as { message: string })
+      ipcRenderer.on('app-update:user-action-failed', handler)
+      return () => ipcRenderer.removeListener('app-update:user-action-failed', handler)
+    },
+    onZoomChanged: (callback) => {
+      const handler = (_event: IpcRendererEvent, level: unknown) => callback(level as number)
+      ipcRenderer.on('zoom-changed', handler)
+      return () => ipcRenderer.removeListener('zoom-changed', handler)
+    },
+    onModelDownloadProgress: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(data as Parameters<typeof callback>[0])
+      ipcRenderer.on('model-download-progress', handler)
+      return () => ipcRenderer.removeListener('model-download-progress', handler)
+    },
+    onModelDownloadRemoved: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(data as Parameters<typeof callback>[0])
+      ipcRenderer.on('model-download-removed', handler)
+      return () => ipcRenderer.removeListener('model-download-removed', handler)
+    },
+    onModelDownloadsClearedFinished: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(data as Parameters<typeof callback>[0])
+      ipcRenderer.on('model-downloads-cleared-finished', handler)
+      return () => ipcRenderer.removeListener('model-downloads-cleared-finished', handler)
+    },
+    onTelemetrySettingChanged: (callback) => {
+      const handler = (_event: IpcRendererEvent, enabled: unknown) =>
+        callback(enabled as Parameters<typeof callback>[0])
+      ipcRenderer.on('telemetry-setting-changed', handler)
+      return () => ipcRenderer.removeListener('telemetry-setting-changed', handler)
+    },
+    captureTelemetry: (event, properties) => {
+      try {
+        ipcRenderer.send('telemetry:capture', { event, properties })
+      } catch {
+        // ignore: telemetry must never break the renderer
+      }
+    },
+    captureExceptionTelemetry: (payload) => {
+      try {
+        ipcRenderer.send('telemetry:captureException', payload)
+      } catch {
+        // ignore
+      }
+    },
+    registerTelemetryProperties: (properties) => {
+      try {
+        ipcRenderer.send('telemetry:registerProperties', properties)
+      } catch {
+        // ignore
+      }
+    },
+    telemetryGetExperimentFlag: (key) => ipcRenderer.invoke('telemetry:getExperimentFlag', key),
+    telemetryRecordExposure: (payload) => {
+      try {
+        ipcRenderer.send('telemetry:recordExposure', payload)
+      } catch {
+        // ignore
+      }
+    },
+    onDatadogError: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(data as Parameters<typeof callback>[0])
+      ipcRenderer.on('dd-error', handler)
+      return () => ipcRenderer.removeListener('dd-error', handler)
+    },
+    onTelemetryActionFromMain: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(data as Parameters<typeof callback>[0])
+      ipcRenderer.on('telemetry-action-from-main', handler)
+      return () => ipcRenderer.removeListener('telemetry-action-from-main', handler)
+    },
+    onErrorDetail: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(data as Parameters<typeof callback>[0])
+      ipcRenderer.on('error-detail', handler)
+      return () => ipcRenderer.removeListener('error-detail', handler)
+    },
+    onSuggestChineseMirrors: (callback) => {
+      const handler = () => callback()
+      ipcRenderer.on('suggest-chinese-mirrors', handler)
+      return () => ipcRenderer.removeListener('suggest-chinese-mirrors', handler)
+    },
+    onSettingsChanged: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) => callback(data as { key: string })
+      ipcRenderer.on('settings-changed', handler)
+      return () => ipcRenderer.removeListener('settings-changed', handler)
+    },
+    onPanelSwitch: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(data as { panel: string; installationId?: string })
+      ipcRenderer.on('panel-switch', handler)
+      return () => ipcRenderer.removeListener('panel-switch', handler)
+    },
+    onPanelTriggerOverlay: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(
+          data as {
+            kind:
+              | 'install-update'
+              | 'app-update-restart-prompt'
+              | 'app-update-download-prompt'
+              | 'open-settings'
+              | 'picker-pick-install'
+              | 'picker-install-action'
+            installationId?: string
+            actionId?: string
+            version?: string | null
+            settingsTab?: 'comfy' | 'directories' | 'downloads' | 'global' | 'global-storage'
+            startupRestore?: boolean
+          }
+        )
+      ipcRenderer.on('panel-trigger-overlay', handler)
+      return () => ipcRenderer.removeListener('panel-trigger-overlay', handler)
+    }
+  }
+}

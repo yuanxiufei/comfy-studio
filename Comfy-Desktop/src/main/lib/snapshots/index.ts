@@ -1,0 +1,58 @@
+export type {
+  RestoreMode,
+  Snapshot,
+  SnapshotEntry,
+  SnapshotExportEnvelope,
+  SnapshotDiff,
+  SnapshotDiffSummary,
+  SnapshotSummary,
+  SnapshotDetailData,
+  SnapshotDiffData,
+  RestoreResult,
+  RestoreRevertOutcome,
+  NodeRestoreResult
+} from './types'
+
+export {
+  formatSnapshotVersion,
+  resolveSnapshotVersion,
+  diffSnapshots,
+  diffAgainstCurrent
+} from './diff'
+
+export {
+  captureSnapshotIfChanged,
+  deleteSnapshot,
+  getSnapshotCount,
+  listSnapshots,
+  loadSnapshot,
+  saveSnapshot,
+  statesMatch,
+  ensureCurrentSnapshotOnTop,
+  deduplicatePreUpdateSnapshot,
+  pruneAutoSnapshots
+} from './store'
+
+export {
+  buildExportEnvelope,
+  validateExportEnvelope,
+  importSnapshots,
+  stageSnapshotEnvelope,
+  loadStagedSnapshotEnvelope,
+  releaseStagedSnapshotEnvelope
+} from './exportImport'
+
+export {
+  restoreComfyUIVersion,
+  buildPostRestoreState,
+  frozenSnapshotInstallOverrides,
+  restorePipPackages,
+  restoreCustomNodes,
+  repairNodeRequirements,
+  protectedPackageDrift,
+  describePackageRevert,
+  preexistingOnDisk
+} from './restore'
+export type { RequirementsRepairResult, ProtectedDriftEntry } from './restore'
+
+export { getSnapshotListData, getSnapshotDetailData, getSnapshotDiffVsPrevious } from './tabData'

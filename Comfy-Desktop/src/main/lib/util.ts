@@ -1,0 +1,82 @@
+import type { DownloadProgress } from './download'
+
+export function parseUrl(
+  raw: string | null | undefined
+): { href: string; hostname: string; port: number } | null {
+  const trimmed = (raw || '').trim()
+  if (!trimmed) return null
+  try {
+    const url = new URL(trimmed.includes('://') ? trimmed : `http://${trimmed}`)
+    return {
+      href: url.href.replace(/\/+$/, ''),
+      hostname: url.hostname,
+      port: parseInt(url.port, 10) || (url.protocol === 'https:' ? 443 : 80)
+    }
+  } catch {
+    return null
+  }
+}
+
+export function formatTime(secs: number): string {
+  if (secs < 0 || !isFinite(secs)) return '—'
+  const s = Math.round(secs)
+  if (s < 60) return `${s}s`
+  return `${Math.floor(s / 60)}m ${s % 60}s`
+}
+
+/** The one bytes/speed/ETA line every download progress surface shows,
+ *  e.g. `120.0 / 800.0 MB  ·  22.1 MB/s  ·  5s elapsed  ·  31s remaining`. */
+export function formatDownloadDetail(p: DownloadProgress): string {
+  const speed = `${p.speedMBs.toFixed(1)} MB/s`
+  const elapsed = formatTime(p.elapsedSecs)
+  const eta = p.etaSecs >= 0 ? formatTime(p.etaSecs) : '—'
+  return `${p.receivedMB} / ${p.totalMB} MB  ·  ${speed}  ·  ${elapsed} elapsed  ·  ${eta} remaining`
+}
+
+export function extractPort(args: string[], defaultPort = 8188): number {
+  let port = defaultPort
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--port' && args[i + 1]) {
+      port = parseInt(args[i + 1]!, 10) || defaultPort
+      i++
+    } else {
+      const m = args[i]!.match(/^--port=(\d+)$/)
+      if (m) port = parseInt(m[1]!, 10) || defaultPort
+    }
+  }
+  return port
+}
+
+export function parseArgSpans(str: string): { value: string; start: number; end: number }[] {
+  const args: { value: string; start: number; end: number }[] = []
+  let current = ''
+  let inQuote: string | null = null
+  let start = -1
+  for (let i = 0; i < str.length; i++) {
+    const ch = str[i]!
+    if (start === -1 && !/\s/.test(ch)) start = i
+    if (inQuote) {
+      if (ch === inQuote) {
+        inQuote = null
+        continue
+      }
+      current += ch
+    } else if (ch === '"' || ch === "'") {
+      inQuote = ch
+    } else if (/\s/.test(ch)) {
+      if (current.length > 0) {
+        args.push({ value: current, start, end: i })
+        current = ''
+      }
+      start = -1
+    } else {
+      current += ch
+    }
+  }
+  if (current.length > 0) args.push({ value: current, start, end: str.length })
+  return args
+}
+
+export function parseArgs(str: string): string[] {
+  return parseArgSpans(str).map((arg) => arg.value)
+}

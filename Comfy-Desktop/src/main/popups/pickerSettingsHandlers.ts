@@ -1,0 +1,171 @@
+import { app, ipcMain } from 'electron'
+import type { IpcMainInvokeEvent } from 'electron'
+import { PICKER_SETTINGS_CHANNELS as CH } from '../../types/ipc'
+
+/**
+ * Picker expanded-Manage IPC handlers. The picker popup has its own preload (no `window.api`), so each
+ * popup-facing channel forwards to the existing panel-facing handler.
+ *
+ * Forwarding uses `ipcMain._invokeHandlers`, a private Electron map (stable as of v33, not contractual).
+ * If a future release removes it, factor the panel handlers into plain async functions both sides call.
+ */
+type InvokeHandler = (event: IpcMainInvokeEvent, ...args: unknown[]) => unknown
+function dispatchInvoke(
+  channel: string,
+  event: IpcMainInvokeEvent,
+  ...args: unknown[]
+): Promise<unknown> {
+  const internal = ipcMain as unknown as {
+    _invokeHandlers: Map<string, InvokeHandler>
+  }
+  const handler = internal._invokeHandlers?.get(channel)
+  if (!handler) {
+    return Promise.reject(new Error(`No handler registered for '${channel}'`))
+  }
+  return Promise.resolve(handler(event, ...args))
+}
+
+export interface PickerSettingsIpcOptions {
+  /** Controlled quit used for the relaunch path. Must route through
+   *  `app.quit()` semantics (destroying host windows whose close handlers
+   *  would otherwise consult/prompt), NEVER `app.exit()`: exit() skips
+   *  `will-quit`, where active managed model downloads park their staged
+   *  bytes for resume, so it would strand in-flight transfers. */
+  quitForRelaunch: () => void
+}
+
+export function registerPickerSettingsIpc(options: PickerSettingsIpcOptions): void {
+  ipcMain.handle(CH.getDetailSections, (event, payload: { installationId?: unknown }) =>
+    dispatchInvoke('get-detail-sections', event, payload?.installationId)
+  )
+
+  ipcMain.handle(CH.getDiskSpace, (event, payload: { path?: unknown }) =>
+    dispatchInvoke('get-disk-space', event, payload?.path)
+  )
+
+  ipcMain.handle(CH.getInstallationSize, (event, payload: { installationId?: unknown }) =>
+    dispatchInvoke('get-installation-size', event, payload?.installationId)
+  )
+
+  ipcMain.handle(
+    CH.updateInstallation,
+    (event, payload: { installationId?: unknown; data?: unknown }) =>
+      dispatchInvoke('update-installation', event, payload?.installationId, payload?.data)
+  )
+
+  ipcMain.handle(
+    CH.runAction,
+    (event, payload: { installationId?: unknown; actionId?: unknown; actionData?: unknown }) =>
+      dispatchInvoke(
+        'run-action',
+        event,
+        payload?.installationId,
+        payload?.actionId,
+        payload?.actionData
+      )
+  )
+
+  ipcMain.handle(
+    CH.getFieldOptions,
+    (event, payload: { sourceId?: unknown; fieldId?: unknown; selections?: unknown }) =>
+      dispatchInvoke(
+        'get-field-options',
+        event,
+        payload?.sourceId,
+        payload?.fieldId,
+        payload?.selections
+      )
+  )
+
+  ipcMain.handle(CH.getInstallations, (event) => dispatchInvoke('get-installations', event))
+
+  ipcMain.handle(CH.getStableTags, (event) => dispatchInvoke('get-stable-tags', event))
+
+  ipcMain.handle(CH.getUniqueName, (event, payload: { baseName?: unknown }) =>
+    dispatchInvoke('get-unique-name', event, payload?.baseName)
+  )
+
+  ipcMain.handle(CH.stopComfyUI, (event, payload: { installationId?: unknown }) =>
+    dispatchInvoke('stop-comfyui', event, payload?.installationId)
+  )
+
+  ipcMain.handle(CH.cancelOperation, (event, payload: { installationId?: unknown }) =>
+    dispatchInvoke('cancel-operation', event, payload?.installationId)
+  )
+
+  ipcMain.handle(CH.getSnapshots, (event, payload: { installationId?: unknown }) =>
+    dispatchInvoke('get-snapshots', event, payload?.installationId)
+  )
+
+  ipcMain.handle(
+    CH.getSnapshotDetail,
+    (event, payload: { installationId?: unknown; filename?: unknown }) =>
+      dispatchInvoke('get-snapshot-detail', event, payload?.installationId, payload?.filename)
+  )
+
+  ipcMain.handle(
+    CH.getSnapshotDiff,
+    (event, payload: { installationId?: unknown; filename?: unknown; mode?: unknown }) =>
+      dispatchInvoke(
+        'get-snapshot-diff',
+        event,
+        payload?.installationId,
+        payload?.filename,
+        payload?.mode
+      )
+  )
+
+  ipcMain.handle(
+    CH.exportSnapshot,
+    (event, payload: { installationId?: unknown; filename?: unknown }) =>
+      dispatchInvoke('export-snapshot', event, payload?.installationId, payload?.filename)
+  )
+
+  ipcMain.handle(CH.exportAllSnapshots, (event, payload: { installationId?: unknown }) =>
+    dispatchInvoke('export-all-snapshots', event, payload?.installationId)
+  )
+
+  ipcMain.handle(CH.importSnapshotsPreview, (event) =>
+    dispatchInvoke('import-snapshots-preview', event)
+  )
+
+  ipcMain.handle(CH.importSnapshotsDiff, (event, payload: { installationId?: unknown }) =>
+    dispatchInvoke('import-snapshots-diff', event, payload?.installationId)
+  )
+
+  ipcMain.handle(CH.importSnapshotsConfirm, (event, payload: { installationId?: unknown }) =>
+    dispatchInvoke('import-snapshots-confirm', event, payload?.installationId)
+  )
+
+  ipcMain.handle(CH.previewSnapshotFile, (event) => dispatchInvoke('preview-snapshot-file', event))
+
+  ipcMain.handle(CH.getComfyArgs, (event, payload: { installationId?: unknown }) =>
+    dispatchInvoke('get-comfy-args', event, payload?.installationId)
+  )
+
+  ipcMain.handle(CH.browseFolder, (event, payload: { defaultPath?: unknown }) =>
+    dispatchInvoke('browse-folder', event, payload?.defaultPath)
+  )
+
+  ipcMain.handle(CH.previewLocalMigration, (event, payload: { installationId?: unknown }) =>
+    dispatchInvoke('preview-local-migration', event, payload?.installationId)
+  )
+
+  // Fire-and-forget. If `relaunch()` throws (sandboxed builds), skip the quit
+  // so the user isn't killed without a respawn. The quit itself is the
+  // controlled path (see PickerSettingsIpcOptions.quitForRelaunch), so active
+  // model downloads park resumably instead of being killed mid-write.
+  ipcMain.on(CH.relaunchApp, () => {
+    try {
+      app.relaunch()
+    } catch (err) {
+      console.error('Picker: relaunch failed', err)
+      return
+    }
+    options.quitForRelaunch()
+  })
+
+  // Pull main's full i18n catalog so keys like `actions.restart` resolve inside the popup.
+  ipcMain.handle(CH.getLocaleMessages, (event) => dispatchInvoke('get-locale-messages', event))
+  ipcMain.handle(CH.getLocale, (event) => dispatchInvoke('get-locale', event))
+}

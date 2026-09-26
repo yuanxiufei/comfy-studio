@@ -1,0 +1,890 @@
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+
+const devPlatformMocks = vi.hoisted(() => ({
+  isSignedInToCloud: vi.fn(() => false),
+  signInToCloud: vi.fn(async () => ({ signedIn: true }))
+}))
+
+// The file menu decides on sign-in state and starts sign-ins from main. Stub
+// both so the menu tests drive that state directly instead of opening a browser.
+vi.mock('../lib/ipc/registerDevPlatformHandlers', () => ({
+  isSignedInToCloud: devPlatformMocks.isSignedInToCloud,
+  signInToCloud: devPlatformMocks.signInToCloud
+}))
+
+// shared.ts (via registry.ts) loads electron at import, so mock it first.
+vi.mock('electron', () => ({
+  app: {
+    isPackaged: false,
+    getPath: () => '/tmp',
+    getVersion: () => '0.0.0-test',
+    getLocale: () => 'en'
+  },
+  ipcMain: { handle: vi.fn(), on: vi.fn(), off: vi.fn() },
+  dialog: {},
+  shell: {},
+  WebContentsView: class {},
+  BrowserWindow: { getAllWindows: () => [] },
+  nativeTheme: { on: vi.fn(), shouldUseDarkColors: false }
+}))
+
+// The menu-click handler emits PostHog Node telemetry on every activation;
+// stub it so the dispatch tests stay pure and don't bootstrap the SDK.
+vi.mock('../lib/telemetry', () => ({ emit: vi.fn() }))
+
+vi.mock('../lib/ipc/registerSettingsHandlers', async () => ({
+  ...(await vi.importActual('../lib/ipc/registerSettingsHandlers')),
+  applySettingSet: vi.fn()
+}))
+
+import {
+  _test_buildGlobalSettingsSnapshot,
+  _test_deleteTitlePopupEntry,
+  _test_setTitlePopupEntry,
+  activateTitlePopupMenuItem,
+  buildInstancePickerSnapshot,
+  resolvePickerSelectedInstallId,
+  buildTitlePopupMenuItems,
+  computePopupHeight,
+  decideFlowMenuItemTarget,
+  isFlowMenuItemId,
+  registerTitlePopupIpc,
+  requiresPerOpenConfigSync,
+  type FlowMenuItemId,
+  type InstancePickerInstall,
+  type TitlePopupEntry,
+  type TitlePopupHostBindings
+} from './titlePopup'
+import { comfyWindows, nextWindowKey, type ComfyWindowEntry } from '../host/registry'
+import { applySettingSet } from '../lib/ipc/registerSettingsHandlers'
+import * as settings from '../settings'
+
+beforeEach(() => {
+  vi.clearAllMocks()
+  // Signed out is the default: every assertion that does not say otherwise
+  // describes a user who has not logged in yet.
+  devPlatformMocks.isSignedInToCloud.mockReturnValue(false)
+})
+
+afterEach(() => {
+  comfyWindows.clear()
+})
+
+interface FakeComfyWebContents {
+  destroyed: boolean
+  zoomLevel: number
+  isDestroyed: () => boolean
+  getZoomLevel: () => number
+}
+
+function makeEntry(
+  opts: {
+    installationId?: string | null
+    activePanel?: ComfyWindowEntry['activePanel']
+    firstUseMode?: ComfyWindowEntry['firstUseMode']
+    comfyDestroyed?: boolean
+    zoomLevel?: number
+  } = {}
+): ComfyWindowEntry {
+  const wc: FakeComfyWebContents = {
+    destroyed: opts.comfyDestroyed ?? false,
+    zoomLevel: opts.zoomLevel ?? 0,
+    isDestroyed: () => wc.destroyed,
+    getZoomLevel: () => wc.zoomLevel
+  }
+  return {
+    windowKey: nextWindowKey(),
+    window: {} as ComfyWindowEntry['window'],
+    comfyView: {
+      webContents: wc as unknown
+    } as unknown as ComfyWindowEntry['comfyView'],
+    titleBarView: { webContents: {} } as unknown as ComfyWindowEntry['titleBarView'],
+    panelView: null,
+    activePanel: opts.activePanel ?? 'comfy',
+    lastTheme: { bg: '#000', text: '#fff' },
+    layoutViews: () => {},
+    comfyUrl: '',
+    installationId: opts.installationId ?? null,
+    constructedPartition: null,
+    firstUseMode: opts.firstUseMode ?? 'none',
+    titleBarText: '',
+    sourceCategory: null,
+    previewInstallationId: null,
+    coldStartPendingReveal: false,
+    _installCleanup: null,
+    detachInstall: () => {}
+  }
+}
+
+describe('computePopupHeight', () => {
+  it('counts items at 28px and separators at 9px plus the 10px chrome budget', () => {
+    // 1 item + 1 sep + 1 item + 1 sep + 1 item = 28+9+28+9+28 = 102 + 10 chrome = 112
+    const h = computePopupHeight([
+      { id: 'a', label: 'A' },
+      { kind: 'separator' },
+      { id: 'b', label: 'B' },
+      { kind: 'separator' },
+      { id: 'c', label: 'C' }
+    ])
+    expect(h).toBe(112)
+  })
+
+  it('returns chrome-only height for an empty item list', () => {
+    expect(computePopupHeight([])).toBe(10)
+  })
+
+  it('handles a single item', () => {
+    expect(computePopupHeight([{ id: 'a', label: 'A' }])).toBe(38)
+  })
+
+  it('handles a single separator', () => {
+    expect(computePopupHeight([{ kind: 'separator' }])).toBe(19)
+  })
+})
+
+describe('buildTitlePopupMenuItems', () => {
+  it('returns only Skip Onboarding during post-consent first-use', () => {
+    const entry = makeEntry({ firstUseMode: 'post-consent' })
+    const items = buildTitlePopupMenuItems(entry)
+    expect(items).toHaveLength(1)
+    expect(items[0]).toMatchObject({ id: 'skip-onboarding' })
+  })
+
+  it('includes install-creation entries on a chooser host', () => {
+    const items = buildTitlePopupMenuItems(makeEntry({ installationId: null }))
+    const ids = items.map((i) => i.id ?? null)
+    expect(ids).toContain('new-install')
+    expect(ids).toContain('track')
+    expect(ids).toContain('load-snapshot')
+    expect(ids).not.toContain('return-to-dashboard')
+  })
+
+  it('includes install-creation entries on an install-backed host', () => {
+    const items = buildTitlePopupMenuItems(makeEntry({ installationId: 'inst-1' }))
+    const ids = items.map((i) => i.id ?? null)
+    expect(ids).toContain('new-install')
+    expect(ids).toContain('track')
+    expect(ids).toContain('load-snapshot')
+  })
+
+  it('chooser host includes Performance Test, Benchmarks, Settings, and window actions', () => {
+    const items = buildTitlePopupMenuItems(makeEntry({ installationId: null }))
+    const ids = items.map((i) => i.id ?? null)
+    expect(ids).toContain('new-window')
+    expect(ids).toContain('performance-test')
+    expect(items.find((item) => item.id === 'performance-test')?.label).toBe('Performance Tests')
+    expect(ids).toContain('benchmarks')
+    expect(items.find((item) => item.id === 'benchmarks')?.label).toBe('Benchmarks')
+    expect(ids).toContain('settings')
+    expect(ids).toContain('feedback')
+    expect(ids).toContain('exit-window')
+    expect(ids).toContain('close-all-windows')
+    const quit = items.find((i) => i.id === 'close-all-windows')
+    expect(quit?.label).toBe('Quit Desktop')
+  })
+
+  it('chooser host matches the canonical order, signed out', () => {
+    const items = buildTitlePopupMenuItems(makeEntry({ installationId: null }))
+    const ids = items.map((i) => i.id ?? null).filter((id) => id !== null)
+    expect(ids).toEqual([
+      'new-window',
+      'new-install',
+      'track',
+      'load-snapshot',
+      'sign-in',
+      'performance-test',
+      'benchmarks',
+      'settings',
+      'feedback',
+      'exit-window',
+      'close-all-windows'
+    ])
+    const signIn = items.find((i) => i.id === 'sign-in')
+    expect(signIn?.label).toBe('Log in')
+    expect(signIn?.labelKey).toBe('fileMenu.signIn')
+  })
+
+  it('install host matches the canonical order with Close Window between Send Feedback and Quit Desktop', () => {
+    const items = buildTitlePopupMenuItems(makeEntry({ installationId: 'inst-1' }))
+    const ids = items.map((i) => i.id ?? null).filter((id) => id !== null)
+    expect(ids).toEqual([
+      'new-window',
+      'new-install',
+      'track',
+      'load-snapshot',
+      'sign-in',
+      'performance-test',
+      'benchmarks',
+      'settings',
+      'feedback',
+      'exit-window',
+      'close-all-windows'
+    ])
+    const closeWindow = items.find((i) => i.id === 'exit-window')
+    expect(closeWindow?.label).toBe('Close Window')
+    const quit = items.find((i) => i.id === 'close-all-windows')
+    expect(quit?.label).toBe('Quit Desktop')
+  })
+
+  it('chooser host matches the canonical order once signed in', () => {
+    devPlatformMocks.isSignedInToCloud.mockReturnValue(true)
+    const items = buildTitlePopupMenuItems(makeEntry({ installationId: null }))
+    const ids = items.map((i) => i.id ?? null).filter((id) => id !== null)
+    expect(ids).toEqual([
+      'new-window',
+      'new-install',
+      'track',
+      'load-snapshot',
+      'performance-test',
+      'benchmarks',
+      'settings',
+      'feedback',
+      'exit-window',
+      'close-all-windows'
+    ])
+  })
+
+  it('install host keeps Log in ahead of Reset Zoom when both are live', () => {
+    const items = buildTitlePopupMenuItems(makeEntry({ installationId: 'inst-1', zoomLevel: 2 }))
+    const ids = items.map((i) => i.id ?? null).filter((id) => id !== null)
+    expect(ids).toEqual([
+      'new-window',
+      'new-install',
+      'track',
+      'load-snapshot',
+      'sign-in',
+      'performance-test',
+      'benchmarks',
+      'settings',
+      'feedback',
+      'reset-zoom',
+      'exit-window',
+      'close-all-windows'
+    ])
+  })
+
+  // Login is the precondition for the account-scoped Comfy Developer Platform rollout, so
+  // it is never gated on that rollout — only on whether you are already in.
+  it('omits Log in once the user is signed in', () => {
+    devPlatformMocks.isSignedInToCloud.mockReturnValue(true)
+    const items = buildTitlePopupMenuItems(makeEntry({ installationId: null }))
+    expect(items.find((i) => i.id === 'sign-in')).toBeUndefined()
+  })
+
+  it('keeps the post-consent menu to Skip Onboarding, with no Log in item', () => {
+    const items = buildTitlePopupMenuItems(makeEntry({ firstUseMode: 'post-consent' }))
+    expect(items.map((i) => i.id ?? null)).toEqual(['skip-onboarding'])
+  })
+
+  it('install host omits Return to Dashboard — picker Home is the canonical dashboard escape', () => {
+    const items = buildTitlePopupMenuItems(makeEntry({ installationId: 'inst-1' }))
+    const ids = items.map((i) => i.id ?? null)
+    expect(ids).not.toContain('return-to-dashboard')
+  })
+
+  it('omits Reset Zoom on chooser hosts even if the dummy comfy view has a zoom level', () => {
+    const items = buildTitlePopupMenuItems(makeEntry({ installationId: null, zoomLevel: 2 }))
+    expect(items.find((i) => i.id === 'reset-zoom')).toBeUndefined()
+  })
+
+  it('exposes Reset Zoom on install host when comfy zoom is non-zero', () => {
+    const zoomed = buildTitlePopupMenuItems(makeEntry({ installationId: 'inst-1', zoomLevel: 2 }))
+    const resetZoom = zoomed.find((i) => i.id === 'reset-zoom')
+    expect(resetZoom).toBeDefined()
+    expect(resetZoom?.label).toBe('Reset Zoom (144%)')
+  })
+
+  it('omits Reset Zoom from the install host menu when the comfy webContents has been destroyed', () => {
+    const items = buildTitlePopupMenuItems(
+      makeEntry({ installationId: 'inst-1', comfyDestroyed: true, zoomLevel: 2 })
+    )
+    expect(items.find((i) => i.id === 'reset-zoom')).toBeUndefined()
+  })
+
+  it('places New Window first and Quit Desktop last on a chooser host', () => {
+    const items = buildTitlePopupMenuItems(makeEntry({ installationId: null }))
+    const ids = items.map((i) => i.id ?? null)
+    expect(ids[0]).toBe('new-window')
+    expect(ids[ids.length - 1]).toBe('close-all-windows')
+  })
+
+  it('separates Log in from the Performance Test and Benchmarks group', () => {
+    const items = buildTitlePopupMenuItems(makeEntry({ installationId: null }))
+    const signInIdx = items.findIndex((i) => i.id === 'sign-in')
+    expect(items[signInIdx + 1]?.kind).toBe('separator')
+    expect(items[signInIdx + 2]?.id).toBe('performance-test')
+    expect(items[signInIdx + 3]?.id).toBe('benchmarks')
+  })
+
+  it('does not leave a doubled separator above Performance Test once signed in', () => {
+    devPlatformMocks.isSignedInToCloud.mockReturnValue(true)
+    const items = buildTitlePopupMenuItems(makeEntry({ installationId: null }))
+    const performanceTestsIdx = items.findIndex((i) => i.id === 'performance-test')
+    expect(items[performanceTestsIdx - 1]?.kind).toBe('separator')
+    expect(items[performanceTestsIdx - 2]?.kind).not.toBe('separator')
+  })
+
+  it('groups Performance Test and Benchmarks above a separator and Desktop Settings', () => {
+    const items = buildTitlePopupMenuItems(makeEntry({ installationId: null }))
+    const settingsIdx = items.findIndex((i) => i.id === 'settings')
+    expect(items[settingsIdx - 1]?.kind).toBe('separator')
+    expect(items[settingsIdx - 2]?.id).toBe('benchmarks')
+    expect(items[settingsIdx - 3]?.id).toBe('performance-test')
+  })
+
+  it('separators bracket the install-creation block on both hosts', () => {
+    for (const installationId of [null, 'inst-1'] as const) {
+      const items = buildTitlePopupMenuItems(makeEntry({ installationId }))
+      const newWindowIdx = items.findIndex((i) => i.id === 'new-window')
+      expect(items[newWindowIdx + 1]?.kind).toBe('separator')
+      const newInstallIdx = items.findIndex((i) => i.id === 'new-install')
+      expect(newInstallIdx).toBeGreaterThan(newWindowIdx + 1)
+    }
+  })
+
+  // Loading-lockdown keeps the full menu live so the user can act while a long op runs.
+  it('returns the same item set during loading-lockdown as in normal mode', () => {
+    for (const installationId of [null, 'inst-1'] as const) {
+      const normal = buildTitlePopupMenuItems(makeEntry({ installationId }))
+      const locked = buildTitlePopupMenuItems(
+        makeEntry({ installationId, firstUseMode: 'loading-lockdown' })
+      )
+      expect(locked.map((i) => i.id ?? null)).toEqual(normal.map((i) => i.id ?? null))
+    }
+  })
+})
+
+describe('activateTitlePopupMenuItem', () => {
+  // Minimal popup entry: the reset-zoom branch reads `kind` + `parentEntryId`
+  // (the latter resolves the host from `comfyWindows`), and the shared
+  // `hideTitlePopup` tail reads `view`. An inert closed view makes the
+  // dismiss a no-op so the test stays focused on the dispatch.
+  function makePopupEntry(parentEntryId: number) {
+    return {
+      kind: 'menu',
+      parentEntryId,
+      view: { isOpen: false, pendingShowTimer: null, hide: vi.fn() }
+    } as unknown as Parameters<typeof activateTitlePopupMenuItem>[0]
+  }
+
+  it.each([null, 'inst-1'] as const)(
+    'opens Performance Test in a new host when installationId is %s',
+    (installationId) => {
+      const host = makeEntry({ installationId })
+      comfyWindows.set(host.windowKey, host)
+      const bindings = {
+        openChooserHostWindow: vi.fn(),
+        setActivePanel: vi.fn()
+      } as unknown as TitlePopupHostBindings
+
+      activateTitlePopupMenuItem(makePopupEntry(host.windowKey), 'performance-test', bindings)
+
+      expect(bindings.openChooserHostWindow).toHaveBeenCalledExactlyOnceWith('performance-test')
+      expect(bindings.setActivePanel).not.toHaveBeenCalled()
+    }
+  )
+
+  it.each([null, 'inst-1'] as const)(
+    'opens Benchmarks in a new host when installationId is %s',
+    (installationId) => {
+      const host = makeEntry({ installationId })
+      comfyWindows.set(host.windowKey, host)
+      const bindings = {
+        openChooserHostWindow: vi.fn(),
+        setActivePanel: vi.fn()
+      } as unknown as TitlePopupHostBindings
+
+      activateTitlePopupMenuItem(makePopupEntry(host.windowKey), 'benchmarks', bindings)
+
+      expect(bindings.openChooserHostWindow).toHaveBeenCalledExactlyOnceWith('benchmarks')
+      expect(bindings.setActivePanel).not.toHaveBeenCalled()
+    }
+  )
+
+  it('routes Reset Zoom through resetComfyZoom with the host installation id', () => {
+    const host = makeEntry({ installationId: 'inst-1', zoomLevel: 3 })
+    comfyWindows.set(host.windowKey, host)
+    const bindings = { resetComfyZoom: vi.fn() } as unknown as TitlePopupHostBindings
+
+    activateTitlePopupMenuItem(makePopupEntry(host.windowKey), 'reset-zoom', bindings)
+
+    expect(bindings.resetComfyZoom).toHaveBeenCalledExactlyOnceWith('inst-1')
+  })
+
+  it('defensively ignores Reset Zoom on an install-less host', () => {
+    const host = makeEntry({ installationId: null })
+    comfyWindows.set(host.windowKey, host)
+    const bindings = { resetComfyZoom: vi.fn() } as unknown as TitlePopupHostBindings
+
+    activateTitlePopupMenuItem(makePopupEntry(host.windowKey), 'reset-zoom', bindings)
+
+    expect(bindings.resetComfyZoom).not.toHaveBeenCalled()
+  })
+
+  // The shared primitive, not `session.login()` — it carries the sign-out race
+  // guard the `comfybuilder:signIn` IPC relies on.
+  it('routes Log in through the shared login primitive', () => {
+    const host = makeEntry({ installationId: null })
+    comfyWindows.set(host.windowKey, host)
+
+    activateTitlePopupMenuItem(
+      makePopupEntry(host.windowKey),
+      'sign-in',
+      {} as unknown as TitlePopupHostBindings
+    )
+
+    expect(devPlatformMocks.signInToCloud).toHaveBeenCalledOnce()
+  })
+
+  it('swallows a cancelled or failed sign-in handoff', async () => {
+    const host = makeEntry({ installationId: null })
+    comfyWindows.set(host.windowKey, host)
+    devPlatformMocks.signInToCloud.mockRejectedValueOnce(new Error('user closed the browser'))
+
+    expect(() =>
+      activateTitlePopupMenuItem(
+        makePopupEntry(host.windowKey),
+        'sign-in',
+        {} as unknown as TitlePopupHostBindings
+      )
+    ).not.toThrow()
+    // Let the rejected promise settle so an unhandled rejection would surface.
+    await Promise.resolve()
+  })
+})
+
+describe('decideFlowMenuItemTarget', () => {
+  const flowIds: FlowMenuItemId[] = ['new-install', 'track', 'load-snapshot', 'quick-install']
+
+  it.each(flowIds)('dashboard host routes %s to in-place takeover', (id) => {
+    const target = decideFlowMenuItemTarget(makeEntry({ installationId: null }), id)
+    expect(target).toEqual({ kind: 'set-active-panel', panel: id })
+  })
+
+  it.each(flowIds)('install host routes %s to a fresh chooser window', (id) => {
+    const target = decideFlowMenuItemTarget(makeEntry({ installationId: 'inst-1' }), id)
+    expect(target).toEqual({ kind: 'open-chooser-host', panel: id })
+  })
+})
+
+describe('isFlowMenuItemId', () => {
+  it('accepts the four flow ids and rejects everything else', () => {
+    expect(isFlowMenuItemId('new-install')).toBe(true)
+    expect(isFlowMenuItemId('track')).toBe(true)
+    expect(isFlowMenuItemId('load-snapshot')).toBe(true)
+    expect(isFlowMenuItemId('quick-install')).toBe(true)
+    expect(isFlowMenuItemId('new-window')).toBe(false)
+    expect(isFlowMenuItemId('settings')).toBe(false)
+    expect(isFlowMenuItemId('feedback')).toBe(false)
+    expect(isFlowMenuItemId('')).toBe(false)
+  })
+})
+
+describe('requiresPerOpenConfigSync', () => {
+  // A deep-linked global-settings open (e.g. the instance pane's "Manage
+  // Shared Directories" -> Storage tab) must bypass the identical-config
+  // fast path: the cached popup may sit on another tab even though the
+  // config JSON is unchanged, so the snapshot must be re-pushed for the
+  // view's tab-retarget watch to fire.
+  it('forces a config re-send for a global-settings open with a requested tab', () => {
+    expect(
+      requiresPerOpenConfigSync({ kind: 'global-settings', snapshot: { initialTab: 'storage' } })
+    ).toBe(true)
+  })
+
+  it('keeps the fast path for a global-settings open without a requested tab', () => {
+    expect(
+      requiresPerOpenConfigSync({ kind: 'global-settings', snapshot: { initialTab: null } })
+    ).toBe(false)
+  })
+
+  it('keeps the fast path for non-global-settings kinds', () => {
+    expect(requiresPerOpenConfigSync({ kind: 'menu' })).toBe(false)
+    expect(requiresPerOpenConfigSync({ kind: 'downloads' })).toBe(false)
+    expect(
+      requiresPerOpenConfigSync({ kind: 'instance-picker', snapshot: { initialTab: 'storage' } })
+    ).toBe(false)
+  })
+})
+
+describe('resolvePickerSelectedInstallId', () => {
+  function makeInstall(overrides: Partial<InstancePickerInstall>): InstancePickerInstall {
+    return {
+      id: 'x',
+      name: 'X',
+      sourceLabel: 'Standalone',
+      sourceCategory: 'local',
+      ...overrides
+    } as InstancePickerInstall
+  }
+
+  it('prefers an explicit selection over the host install', () => {
+    const installs = [makeInstall({ id: 'a' }), makeInstall({ id: 'b' })]
+    expect(resolvePickerSelectedInstallId('b', 'a', installs)).toBe('b')
+  })
+
+  it('falls back to the host install when no explicit selection', () => {
+    const installs = [makeInstall({ id: 'a' }), makeInstall({ id: 'b' })]
+    expect(resolvePickerSelectedInstallId(null, 'b', installs)).toBe('b')
+  })
+
+  it('defaults to the most-recently-launched install on an install-less host', () => {
+    // 'b' (most recent) is second to prove recency, not list order, decides the default.
+    const installs = [
+      makeInstall({ id: 'a', lastLaunchedAt: 1000 }),
+      makeInstall({ id: 'b', lastLaunchedAt: 5000 }),
+      makeInstall({ id: 'c', lastLaunchedAt: 2000 })
+    ]
+    expect(resolvePickerSelectedInstallId(null, null, installs)).toBe('b')
+  })
+
+  it('falls back to the first install on an install-less host when none have been launched', () => {
+    const installs = [makeInstall({ id: 'a' }), makeInstall({ id: 'b' })]
+    expect(resolvePickerSelectedInstallId(null, null, installs)).toBe('a')
+  })
+
+  it('does not default to the seeded cloud entry just because it sorts first', () => {
+    // The seeded cloud install sorts first but has no launch history; a real install wins.
+    const installs = [
+      makeInstall({ id: 'cloud', sourceCategory: 'cloud' }),
+      makeInstall({ id: 'local-a', sourceCategory: 'local' }),
+      makeInstall({ id: 'local-b', sourceCategory: 'local' })
+    ]
+    expect(resolvePickerSelectedInstallId(null, null, installs)).toBe('local-a')
+  })
+
+  it('still defaults to cloud when it was genuinely launched most-recently', () => {
+    const installs = [
+      makeInstall({ id: 'local-a', sourceCategory: 'local', lastLaunchedAt: 1000 }),
+      makeInstall({ id: 'cloud', sourceCategory: 'cloud', lastLaunchedAt: 5000 })
+    ]
+    expect(resolvePickerSelectedInstallId(null, null, installs)).toBe('cloud')
+  })
+
+  it('falls back to cloud when it is the only install', () => {
+    const installs = [makeInstall({ id: 'cloud', sourceCategory: 'cloud' })]
+    expect(resolvePickerSelectedInstallId(null, null, installs)).toBe('cloud')
+  })
+
+  it('returns null when there are no installs to select', () => {
+    expect(resolvePickerSelectedInstallId(null, null, [])).toBeNull()
+  })
+})
+
+describe('buildInstancePickerSnapshot', () => {
+  function makeInstall(overrides: Partial<InstancePickerInstall>): InstancePickerInstall {
+    return {
+      id: 'x',
+      name: 'X',
+      sourceLabel: 'Standalone',
+      sourceCategory: 'local',
+      ...overrides
+    } as InstancePickerInstall
+  }
+
+  const EMPTY_STORAGE = {
+    sharedDirectoriesFields: [],
+    modelsDirs: [],
+    modelsSystemDefault: ''
+  }
+
+  it('forwards the install array verbatim under `installs`', () => {
+    const installs = [makeInstall({ id: 'a', name: 'A' }), makeInstall({ id: 'b', name: 'B' })]
+    const snap = buildInstancePickerSnapshot({
+      installs,
+      hostInstallationId: null,
+      runningInstallationIds: [],
+      launchingInstallationIds: [],
+      storage: EMPTY_STORAGE
+    })
+    expect(snap.installs).toEqual(installs)
+  })
+
+  it('echoes the host installation id under `activeInstallationId`', () => {
+    const snap = buildInstancePickerSnapshot({
+      installs: [makeInstall({ id: 'a' })],
+      hostInstallationId: 'a',
+      runningInstallationIds: [],
+      launchingInstallationIds: [],
+      storage: EMPTY_STORAGE
+    })
+    expect(snap.activeInstallationId).toBe('a')
+  })
+
+  it('sets `activeInstallationId` to null on an install-less host', () => {
+    const snap = buildInstancePickerSnapshot({
+      installs: [],
+      hostInstallationId: null,
+      runningInstallationIds: [],
+      launchingInstallationIds: [],
+      storage: EMPTY_STORAGE
+    })
+    expect(snap.activeInstallationId).toBeNull()
+  })
+
+  it('flattens running ids into a stable string array', () => {
+    const snap = buildInstancePickerSnapshot({
+      installs: [],
+      hostInstallationId: null,
+      runningInstallationIds: ['b', 'a', 'c'],
+      launchingInstallationIds: [],
+      storage: EMPTY_STORAGE
+    })
+    expect(snap.runningInstallationIds).toEqual(['b', 'a', 'c'])
+  })
+
+  it('returns an empty runningInstallationIds when nothing is running', () => {
+    const snap = buildInstancePickerSnapshot({
+      installs: [makeInstall({ id: 'a' })],
+      hostInstallationId: null,
+      runningInstallationIds: [],
+      launchingInstallationIds: [],
+      storage: EMPTY_STORAGE
+    })
+    expect(snap.runningInstallationIds).toEqual([])
+  })
+
+  it('falls back to previewInstallationId when no real attach yet', () => {
+    // Chooser host that staked an attach claim pre-launch: previewInstallationId
+    // is set while installationId is still null, but it should still "own" the install.
+    const snap = buildInstancePickerSnapshot({
+      installs: [makeInstall({ id: 'a' })],
+      hostInstallationId: null,
+      previewInstallationId: 'a',
+      runningInstallationIds: [],
+      launchingInstallationIds: ['a'],
+      storage: EMPTY_STORAGE
+    })
+    expect(snap.activeInstallationId).toBe('a')
+  })
+
+  it('prefers the real hostInstallationId over previewInstallationId', () => {
+    // Once `attachInstall` runs, the real id takes over; a stale preview must not override it.
+    const snap = buildInstancePickerSnapshot({
+      installs: [makeInstall({ id: 'a' }), makeInstall({ id: 'b' })],
+      hostInstallationId: 'a',
+      previewInstallationId: 'b',
+      runningInstallationIds: ['a'],
+      launchingInstallationIds: [],
+      storage: EMPTY_STORAGE
+    })
+    expect(snap.activeInstallationId).toBe('a')
+  })
+
+  it('surfaces launchingInstallationIds verbatim for popup hydration', () => {
+    const snap = buildInstancePickerSnapshot({
+      installs: [makeInstall({ id: 'a' })],
+      hostInstallationId: null,
+      runningInstallationIds: [],
+      launchingInstallationIds: ['a', 'b'],
+      storage: EMPTY_STORAGE
+    })
+    expect(snap.launchingInstallationIds).toEqual(['a', 'b'])
+  })
+
+  // The picker treats `selectedInstallationId` as authoritative only when
+  // `pickerSelectionEpoch` advances; only `openInstancePickerForHost` bumps it.
+  it('defaults pickerSelectionEpoch to 0 when not provided', () => {
+    const snap = buildInstancePickerSnapshot({
+      installs: [],
+      hostInstallationId: null,
+      runningInstallationIds: [],
+      launchingInstallationIds: [],
+      storage: EMPTY_STORAGE
+    })
+    expect(snap.pickerSelectionEpoch).toBe(0)
+  })
+
+  it('preserves pickerSelectionEpoch verbatim when provided', () => {
+    const snap = buildInstancePickerSnapshot({
+      installs: [],
+      hostInstallationId: null,
+      runningInstallationIds: [],
+      launchingInstallationIds: [],
+      pickerSelectionEpoch: 7,
+      storage: EMPTY_STORAGE
+    })
+    expect(snap.pickerSelectionEpoch).toBe(7)
+  })
+})
+
+describe('title popup renderer readiness', () => {
+  type IpcListener = (event: Electron.IpcMainEvent) => void
+  let ready: IpcListener
+
+  beforeAll(async () => {
+    const { ipcMain } = await import('electron')
+    registerTitlePopupIpc({} as TitlePopupHostBindings)
+    const call = vi
+      .mocked(ipcMain.on)
+      .mock.calls.find(([channel]) => channel === 'comfy-titlepopup:ready')
+    if (!call) throw new Error('IPC listener not registered: comfy-titlepopup:ready')
+    ready = call[1] as IpcListener
+  })
+
+  afterAll(() => {
+    _test_deleteTitlePopupEntry(404)
+  })
+
+  it('replays the last config when the cached popup renderer reloads', () => {
+    const config = {
+      kind: 'menu' as const,
+      items: [{ id: 'settings', label: 'Desktop Settings' }],
+      theme: { bg: '#111111', text: '#eeeeee' }
+    }
+    const send = vi.fn()
+    const entry = {
+      view: {
+        rendererReady: false,
+        popup: { webContents: { isDestroyed: () => false, send } }
+      },
+      pendingConfig: null,
+      lastConfigJson: JSON.stringify(config),
+      lastSyncedConfigJson: JSON.stringify(config)
+    } as unknown as TitlePopupEntry
+    _test_setTitlePopupEntry(404, entry)
+
+    ready({ sender: { id: 404 } } as Electron.IpcMainEvent)
+
+    expect(entry.view.rendererReady).toBe(true)
+    expect(entry.lastSyncedConfigJson).toBeNull()
+    expect(send).toHaveBeenCalledExactlyOnceWith('comfy-titlepopup:set-config', config)
+  })
+})
+
+describe('global settings IPC handlers', () => {
+  type IpcHandler = (
+    event: Electron.IpcMainInvokeEvent,
+    payload?: Record<string, unknown>
+  ) => unknown
+
+  let updateField: IpcHandler
+  let setModelsDirs: IpcHandler
+
+  const eventFor = (id: number): Electron.IpcMainInvokeEvent =>
+    ({ sender: { id } }) as unknown as Electron.IpcMainInvokeEvent
+
+  beforeAll(async () => {
+    const { ipcMain } = await import('electron')
+    registerTitlePopupIpc({} as TitlePopupHostBindings)
+    const handlerFor = (channel: string): IpcHandler => {
+      const call = vi.mocked(ipcMain.handle).mock.calls.find(([name]) => name === channel)
+      if (!call) throw new Error(`IPC handler not registered: ${channel}`)
+      return call[1] as IpcHandler
+    }
+    updateField = handlerFor('comfy-titlepopup:global-settings-update-field')
+    setModelsDirs = handlerFor('comfy-titlepopup:global-settings-set-models-dirs')
+    _test_setTitlePopupEntry(101, { kind: 'global-settings' } as TitlePopupEntry)
+    _test_setTitlePopupEntry(102, { kind: 'instance-picker' } as TitlePopupEntry)
+    _test_setTitlePopupEntry(103, { kind: 'downloads' } as TitlePopupEntry)
+  })
+
+  beforeEach(() => {
+    vi.mocked(applySettingSet).mockReset()
+  })
+
+  afterAll(() => {
+    _test_deleteTitlePopupEntry(101)
+    _test_deleteTitlePopupEntry(102)
+    _test_deleteTitlePopupEntry(103)
+  })
+
+  it('updates a field for a global-settings sender', () => {
+    expect(updateField(eventFor(101), { fieldId: 'inputDir', value: '/shared/in' })).toEqual({
+      ok: true
+    })
+    expect(applySettingSet).toHaveBeenCalledExactlyOnceWith('inputDir', '/shared/in')
+  })
+
+  it('updates a field for an instance-picker sender', () => {
+    expect(updateField(eventFor(102), { fieldId: 'theme', value: 'dark' })).toEqual({ ok: true })
+    expect(applySettingSet).toHaveBeenCalledExactlyOnceWith('theme', 'dark')
+  })
+
+  it('rejects an unknown sender updating a field', () => {
+    expect(updateField(eventFor(999), { fieldId: 'inputDir', value: '/shared/in' })).toEqual({
+      ok: false,
+      message: 'Global Settings popup not active.'
+    })
+    expect(applySettingSet).not.toHaveBeenCalled()
+  })
+
+  it('rejects a non-settings popup updating a field', () => {
+    expect(updateField(eventFor(103), { fieldId: 'inputDir', value: '/shared/in' })).toEqual({
+      ok: false,
+      message: 'Global Settings popup not active.'
+    })
+    expect(applySettingSet).not.toHaveBeenCalled()
+  })
+
+  it.each([undefined, ''])('rejects invalid field id %j', (fieldId) => {
+    expect(updateField(eventFor(101), { fieldId })).toEqual({
+      ok: false,
+      message: 'Invalid field id.'
+    })
+    expect(applySettingSet).not.toHaveBeenCalled()
+  })
+
+  it('returns an applySettingSet error when updating a field', () => {
+    vi.mocked(applySettingSet).mockImplementationOnce(() => {
+      throw new Error('boom')
+    })
+    expect(updateField(eventFor(101), { fieldId: 'inputDir', value: '/shared/in' })).toEqual({
+      ok: false,
+      message: 'boom'
+    })
+  })
+
+  it('sets models directories for a settings sender', () => {
+    const dirs = ['/a', '/b']
+    expect(setModelsDirs(eventFor(101), { dirs })).toEqual({ ok: true })
+    expect(applySettingSet).toHaveBeenCalledExactlyOnceWith('modelsDirs', dirs)
+  })
+
+  it.each(['/a', undefined])('rejects non-array models directories %j', (dirs) => {
+    expect(setModelsDirs(eventFor(101), { dirs })).toEqual({ ok: false })
+    expect(applySettingSet).not.toHaveBeenCalled()
+  })
+
+  it('rejects models directories containing a non-string', () => {
+    expect(setModelsDirs(eventFor(101), { dirs: ['/a', 5] })).toEqual({ ok: false })
+    expect(applySettingSet).not.toHaveBeenCalled()
+  })
+
+  it('rejects an unknown sender setting models directories', () => {
+    expect(setModelsDirs(eventFor(999), { dirs: ['/a'] })).toEqual({ ok: false })
+    expect(applySettingSet).not.toHaveBeenCalled()
+  })
+})
+
+// `telemetryGranted` is a TOP-LEVEL snapshot property, not a settings field:
+// todo 16's toggle needs the raw consent state to decide whether opting in is
+// even offered, and a `DetailField` can only carry the beta value itself.
+describe('buildGlobalSettingsSnapshot telemetry grant', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  function snapshotWithConsent(consent: unknown): { telemetryGranted: boolean } {
+    const actualGet = settings.get
+    vi.spyOn(settings, 'get').mockImplementation(((key: string) =>
+      key === 'telemetryEnabled' ? consent : actualGet(key)) as typeof settings.get)
+    // Stubbed so building a snapshot never seeds (and persists) the real store.
+    vi.spyOn(settings, 'resolveBetaFeaturesEnabled').mockReturnValue(false)
+    return _test_buildGlobalSettingsSnapshot()
+  }
+
+  it('grants only on an explicit opt-in', () => {
+    expect(snapshotWithConsent(true).telemetryGranted).toBe(true)
+  })
+
+  // Strictly `=== true`: the telemetry FIELD coerces undefined to enabled via
+  // `!== false`, and reusing that here would report a grant nobody gave.
+  it('does not grant when consent was never recorded', () => {
+    expect(snapshotWithConsent(undefined).telemetryGranted).toBe(false)
+  })
+
+  it('does not grant on an explicit opt-out', () => {
+    expect(snapshotWithConsent(false).telemetryGranted).toBe(false)
+  })
+})

@@ -1,0 +1,226 @@
+import { net } from 'electron'
+
+import type { FirebaseProjectConfig } from './config'
+import type { SupportedProvider } from './intercept'
+
+// Reached via net.fetch (Chromium's stack), not Node's undici: it resolves
+// the OS proxy, which is the only route to Google endpoints for many CN users.
+const IDP_BASE = 'https://identitytoolkit.googleapis.com/v1'
+
+interface CreateAuthUriResponse {
+  authUri: string
+  /** Opaque token we must echo back on signInWithIdp so Firebase can match the in-flight session. */
+  sessionId: string
+  providerId: string
+}
+
+export interface ProviderUserInfo {
+  providerId?: string
+  rawId?: string
+  email?: string
+  displayName?: string
+  photoUrl?: string
+}
+
+interface SignInWithIdpResponse {
+  idToken: string
+  refreshToken: string
+  /** Seconds until idToken expires. Stringified. */
+  expiresIn: string
+  localId: string
+  email?: string
+  emailVerified?: boolean
+  displayName?: string
+  photoUrl?: string
+  providerId?: string
+  rawUserInfo?: string
+  oauthAccessToken?: string
+  oauthIdToken?: string
+  federatedId?: string
+  rawId?: string
+  isNewUser?: boolean
+  providerUserInfo?: ProviderUserInfo[]
+}
+
+/**
+ * Ask Firebase to generate an OAuth URL for the requested IdP, using the
+ * bridge's loopback origin as `continueUri`. Firebase lists `localhost` and
+ * `127.0.0.1` on the authorized-domains list for both prod and dev projects.
+ */
+export async function createOauthAuthUri(
+  apiKey: string,
+  providerId: SupportedProvider,
+  continueUri: string
+): Promise<CreateAuthUriResponse> {
+  // Scopes mirror Firebase's signInWithPopup to keep the consent screen identical.
+  const oauthScope = providerId === 'github.com' ? 'read:user user:email' : 'profile email'
+  const resp = await net.fetch(`${IDP_BASE}/accounts:createAuthUri?key=${apiKey}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ providerId, continueUri, oauthScope }),
+    credentials: 'omit'
+  })
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '')
+    throw new Error(`createAuthUri ${resp.status}: ${text || resp.statusText}`)
+  }
+  const data = (await resp.json()) as CreateAuthUriResponse
+  if (!data.authUri || !data.sessionId) {
+    throw new Error('createAuthUri returned without authUri/sessionId')
+  }
+  return data
+}
+
+/**
+ * Exchange the OAuth `code` for a Firebase user. `requestUri` MUST be the full
+ * URL the IdP redirected the browser to (including the query string).
+ */
+export async function signInWithIdpExchange(
+  apiKey: string,
+  providerId: SupportedProvider,
+  requestUri: string,
+  sessionId: string
+): Promise<SignInWithIdpResponse> {
+  const queryStart = requestUri.indexOf('?')
+  const queryParams = queryStart >= 0 ? requestUri.slice(queryStart + 1) : ''
+  // Firebase expects providerId echoed in the postBody alongside the raw OAuth response.
+  const postBody = `${queryParams}&providerId=${encodeURIComponent(providerId)}`
+  const resp = await net.fetch(`${IDP_BASE}/accounts:signInWithIdp?key=${apiKey}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      postBody,
+      requestUri,
+      sessionId,
+      returnIdpCredential: true,
+      returnSecureToken: true
+    }),
+    credentials: 'omit'
+  })
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '')
+    throw new Error(`signInWithIdp ${resp.status}: ${text || resp.statusText}`)
+  }
+  return (await resp.json()) as SignInWithIdpResponse
+}
+
+/** One entry of the persisted user's `providerData` array. */
+export interface PersistedProviderData {
+  providerId: string
+  uid: string
+  displayName: string | null
+  email: string | null
+  phoneNumber: null
+  photoURL: string | null
+}
+
+export function mapProviderUserInfo(
+  list: ProviderUserInfo[] | undefined,
+  fallbackProviderId: string,
+  fallbackUid: string
+): PersistedProviderData[] {
+  return (list ?? []).map((p) => ({
+    providerId: p.providerId ?? fallbackProviderId,
+    uid: p.rawId ?? fallbackUid,
+    displayName: p.displayName ?? null,
+    email: p.email ?? null,
+    phoneNumber: null,
+    photoURL: p.photoUrl ?? null
+  }))
+}
+
+export function expiresInSecondsOrDefault(expiresIn: string | undefined): number {
+  const parsed = Number(expiresIn)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 3600
+}
+
+/** Profile + token fields a sign-in path must supply to persist a user. */
+export interface PersistedUserProfile {
+  uid: string
+  email: string | null
+  emailVerified: boolean
+  displayName: string | null
+  photoURL: string | null
+  providerData: PersistedProviderData[]
+  refreshToken: string
+  /** Firebase ID token; persisted as `stsTokenManager.accessToken`. */
+  idToken: string
+  /** ms-epoch when the ID token expires. */
+  expirationTime: number
+  /** Stringified ms-epochs (the SDK's metadata format). */
+  createdAt: string
+  lastLoginAt: string
+}
+
+/**
+ * Assemble the JSON shape Firebase JS SDK persists to IndexedDB at
+ * `firebase:authUser:<apiKey>:[DEFAULT]`. Must match the SDK's `User.toJSON()`
+ * schema for the fields it reads on rehydration (stable across v9-v11).
+ * Single source of truth for that contract — shared by the OAuth-code and
+ * desktop-login-code (custom token) sign-in paths.
+ */
+export function assemblePersistedUser(
+  apiKey: string,
+  profile: PersistedUserProfile
+): Record<string, unknown> {
+  return {
+    uid: profile.uid,
+    email: profile.email,
+    emailVerified: profile.emailVerified,
+    displayName: profile.displayName,
+    isAnonymous: false,
+    photoURL: profile.photoURL,
+    phoneNumber: null,
+    tenantId: null,
+    providerData: profile.providerData,
+    stsTokenManager: {
+      refreshToken: profile.refreshToken,
+      accessToken: profile.idToken,
+      expirationTime: profile.expirationTime
+    },
+    createdAt: profile.createdAt,
+    lastLoginAt: profile.lastLoginAt,
+    apiKey,
+    appName: '[DEFAULT]'
+  }
+}
+
+/** Build the persisted user from a signInWithIdp exchange. */
+export function buildPersistedUser(
+  config: FirebaseProjectConfig,
+  resp: SignInWithIdpResponse,
+  providerId: SupportedProvider
+): Record<string, unknown> {
+  const nowMs = Date.now()
+  const expiresInSec = expiresInSecondsOrDefault(resp.expiresIn)
+  // Prefer Firebase's parsed list, else synthesise one entry from the top-level fields.
+  const providerData: PersistedProviderData[] =
+    resp.providerUserInfo && resp.providerUserInfo.length > 0
+      ? mapProviderUserInfo(resp.providerUserInfo, providerId, resp.localId)
+      : [
+          {
+            providerId,
+            uid: resp.federatedId ?? resp.rawId ?? resp.localId,
+            displayName: resp.displayName ?? null,
+            email: resp.email ?? null,
+            phoneNumber: null,
+            photoURL: resp.photoUrl ?? null
+          }
+        ]
+
+  return assemblePersistedUser(config.apiKey, {
+    uid: resp.localId,
+    email: resp.email ?? null,
+    emailVerified: resp.emailVerified ?? false,
+    displayName: resp.displayName ?? null,
+    photoURL: resp.photoUrl ?? null,
+    providerData,
+    refreshToken: resp.refreshToken,
+    idToken: resp.idToken,
+    expirationTime: nowMs + expiresInSec * 1000,
+    // Stringified ms-epochs; true createdAt is unknown so both default to now and
+    // get re-minted on subsequent token refreshes.
+    createdAt: String(nowMs),
+    lastLoginAt: String(nowMs)
+  })
+}

@@ -1,0 +1,40 @@
+import { defineStore } from 'pinia'
+import { ref } from 'vue'
+import type { Installation } from '../types/ipc'
+
+export const useInstallationStore = defineStore('installation', () => {
+  const installations = ref<Installation[]>([])
+  const loading = ref(true)
+
+  async function fetchInstallations(): Promise<Installation[]> {
+    loading.value = true
+    try {
+      installations.value = await window.api.getInstallations()
+      return installations.value
+    } finally {
+      loading.value = false
+    }
+  }
+
+  window.api.onInstallationsChanged(() => {
+    fetchInstallations()
+  })
+
+  window.api.onInstallationsVersionsUpdated((updates) => {
+    for (const { id, version } of updates) {
+      const inst = installations.value.find((i) => i.id === id)
+      if (inst) inst.version = version
+    }
+  })
+
+  function getById(id: string): Installation | undefined {
+    return installations.value.find((i) => i.id === id)
+  }
+
+  return {
+    installations,
+    loading,
+    fetchInstallations,
+    getById
+  }
+})

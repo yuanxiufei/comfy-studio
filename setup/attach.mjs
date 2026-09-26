@@ -3,9 +3,10 @@
  * 把覆盖层装进两份上游检出：studio/overlay/ 里的自己人代码各就各位，
  * studio/patches/ 里的补丁打到上游既有文件上。
  *
- * 为什么要跑它：这些代码在上游检出里是被忽略（ComfyUI 的 .gitignore 忽略 /custom_nodes/）
- * 或未跟踪的，父仓库又把两个检出整目录忽略 —— 所以它们只由 studio/ 跟踪。
- * 新 clone 下来、上游更新之后、或者别处 detach 过，都要跑一次。
+ * 为什么要跑它：上游检出整份收在父仓库里，但自己人代码在那两棵树里是"藏着的"：
+ *   引擎侧落在 custom_nodes/（被上游 ComfyUI 的 .gitignore 忽略）、
+ *   桌面侧对上游既有文件的接线改动是补丁。
+ * 改动一律先落在 studio/，再跑一次把它同步进检出（幂等，装好的会跳过）。
  *
  * 用法：
  *   npm run attach                 装（已就位的内容与已打上的补丁自动跳过，可重复执行）
@@ -30,7 +31,14 @@ const check = argv.includes('--check')
 try {
   if (check) {
     for (const side of inspect(repoRoot)) {
-      const baseline = side.baselineOk ? `基线 ${side.head.slice(0, 7)} ✓` : `基线漂移（记录 ${side.baselineCommit.slice(0, 7)}，检出 ${side.head.slice(0, 7)}）`
+      // mode 'embedded'：检出已入库（没有独立 .git），没有 HEAD 可核对，基线只看记录值。
+      const recorded = `${side.baselineCommit.slice(0, 7)}${side.upstreamVersion ? ` / 上游 ${side.upstreamVersion}` : ''}`
+      const baseline =
+        side.mode === 'embedded'
+          ? `已入库（无独立 .git，记录基线 ${recorded}）`
+          : side.baselineOk
+            ? `基线 ${side.head.slice(0, 7)} ✓`
+            : `基线漂移（记录 ${side.baselineCommit.slice(0, 7)}，检出 ${side.head.slice(0, 7)}）`
       const files = `${side.filesTotal} 个文件：已就位 ${side.installed}，待装 ${side.filesTotal - side.installed - side.drifted.length}`
       const patches = side.pendingPatches.length + side.droppedPatches.length + side.brokenPatches.length
       console.log(`[check] ${side.checkout} ${baseline}  ${files}` + (patches > 0 ? `，补丁 待打 ${side.pendingPatches.length}` : ''))

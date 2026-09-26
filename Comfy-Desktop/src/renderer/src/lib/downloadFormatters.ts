@@ -1,0 +1,153 @@
+// Shared, pure formatting + status-class helpers for the model-download UIs (popup + Settings tab).
+
+export interface DownloadFormatInput {
+  filename: string
+  directory?: string
+  progress: number
+  receivedBytes?: number
+  totalBytes?: number
+  speedBytesPerSec?: number
+  etaSeconds?: number
+  status: 'pending' | 'downloading' | 'paused' | 'completed' | 'error' | 'cancelled'
+  error?: string
+}
+
+export function fileLabel(d: Pick<DownloadFormatInput, 'filename' | 'directory'>): string {
+  return d.directory ? `${d.directory} / ${d.filename}` : d.filename
+}
+
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1048576) return `${(bytes / 1024).toFixed(0)} KB`
+  if (bytes < 1073741824) return `${(bytes / 1048576).toFixed(1)} MB`
+  return `${(bytes / 1073741824).toFixed(2)} GB`
+}
+
+export function formatSpeed(bytesPerSec: number): string {
+  if (bytesPerSec < 1048576) return `${(bytesPerSec / 1024).toFixed(0)} KB/s`
+  return `${(bytesPerSec / 1048576).toFixed(1)} MB/s`
+}
+
+export function formatEta(seconds: number): string {
+  if (seconds < 60) return `${Math.ceil(seconds)}s`
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.ceil(seconds % 60)}s`
+  const h = Math.floor(seconds / 3600)
+  const m = Math.ceil((seconds % 3600) / 60)
+  return `${h}h ${m}m`
+}
+
+/** Single-line status summary; pass `completedShowsSize` to append total size to the completed line. */
+export function statusLine(
+  d: DownloadFormatInput,
+  opts: { completedShowsSize?: boolean } = {}
+): string {
+  const pct = Math.round(d.progress * 100)
+  switch (d.status) {
+    case 'pending':
+      return 'Waiting…'
+    case 'downloading': {
+      const parts: string[] = []
+      if (d.totalBytes && d.totalBytes > 0 && d.receivedBytes != null) {
+        parts.push(`${formatBytes(d.receivedBytes)} / ${formatBytes(d.totalBytes)}`)
+      }
+      parts.push(`${pct}%`)
+      if (d.speedBytesPerSec && d.speedBytesPerSec > 0) {
+        parts.push(formatSpeed(d.speedBytesPerSec))
+      }
+      if (d.etaSeconds != null && d.etaSeconds > 0 && isFinite(d.etaSeconds)) {
+        parts.push(formatEta(d.etaSeconds))
+      }
+      return parts.join(' · ')
+    }
+    case 'paused':
+      return `Paused at ${pct}%`
+    case 'completed':
+      return opts.completedShowsSize && d.totalBytes
+        ? `Completed · ${formatBytes(d.totalBytes)}`
+        : 'Completed'
+    case 'error':
+      return d.error || 'Error'
+    case 'cancelled':
+      return 'Cancelled'
+    default:
+      return ''
+  }
+}
+
+export function statusKindClass(d: Pick<DownloadFormatInput, 'status'>): string {
+  switch (d.status) {
+    case 'completed':
+      return 'is-completed'
+    case 'error':
+      return 'is-error'
+    case 'cancelled':
+      return 'is-cancelled'
+    case 'paused':
+      return 'is-paused'
+    default:
+      return 'is-active'
+  }
+}
+
+/** Human-readable relative time from a wall-clock ms timestamp. `now` is
+ *  injectable so callers can drive a ticking clock for live re-rendering. */
+export function relativeTime(timestampMs: number | undefined, now = Date.now()): string {
+  if (!timestampMs) return ''
+  const delta = Math.max(0, now - timestampMs)
+  const secs = Math.floor(delta / 1000)
+  if (secs < 60) return 'Just now'
+  const mins = Math.floor(secs / 60)
+  if (mins < 60) return `${mins}m ago`
+  const hours = Math.floor(mins / 60)
+  if (hours < 24) return `${hours}h ago`
+  const days = Math.floor(hours / 24)
+  return `${days}d ago`
+}
+
+export interface ModalFormatInput extends DownloadFormatInput {
+  createdAt?: number
+  totalBytes?: number
+}
+
+/** Rich subtitle for the Downloads Modal: progress details for active, size + time for terminal.
+ *  `now` is injectable so the relative-time portion can re-render against a ticking clock. */
+export function modalSubtitle(d: ModalFormatInput, now = Date.now()): string {
+  const pct = Math.round(d.progress * 100)
+  switch (d.status) {
+    case 'pending':
+      return 'Waiting…'
+    case 'downloading': {
+      const parts: string[] = []
+      if (d.totalBytes && d.totalBytes > 0 && d.receivedBytes != null) {
+        parts.push(`${formatBytes(d.receivedBytes)} / ${formatBytes(d.totalBytes)}`)
+      }
+      if (d.speedBytesPerSec && d.speedBytesPerSec > 0) {
+        parts.push(formatSpeed(d.speedBytesPerSec))
+      }
+      if (d.etaSeconds != null && d.etaSeconds > 0 && isFinite(d.etaSeconds)) {
+        parts.push(`~${formatEta(d.etaSeconds)} left`)
+      }
+      return parts.join(' · ') || `${pct}%`
+    }
+    case 'paused': {
+      const parts = [`Paused at ${pct}%`]
+      if (d.totalBytes && d.totalBytes > 0 && d.receivedBytes != null) {
+        parts.push(`${formatBytes(d.receivedBytes)} / ${formatBytes(d.totalBytes)}`)
+      }
+      return parts.join(' · ')
+    }
+    case 'completed': {
+      const parts: string[] = []
+      if (d.totalBytes) parts.push(formatBytes(d.totalBytes))
+      const ago = relativeTime(d.createdAt, now)
+      if (ago) parts.push(ago)
+      return parts.join(' · ') || 'Completed'
+    }
+    case 'error':
+      return d.error || 'Download failed'
+    case 'cancelled':
+      return 'Cancelled'
+    default:
+      return ''
+  }
+}

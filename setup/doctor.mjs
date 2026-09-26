@@ -59,21 +59,33 @@ function venvSitePackages() {
 // 自己方代码都住在 studio/（父仓库跟踪），靠覆盖层装进两份上游检出的扩展位。
 // 这里核对的是「装得对不对、上游有没有漂移」——没装的话后面那些检查会以一个
 // 更难懂的方式失败（引擎缺 custom node、桌面壳缺 lib/comfy_studio）。
+//
+// 两种检出形态（见 setup/lib/overlay.mjs 的 checkoutMode）：
+//   独立检出（有 .git）：基线用检出 HEAD 对记录值核对，漂移了就跑 attach --rebaseline。
+//   已入库（无独立 .git，内容由父仓跟踪）：没有 HEAD 可对，基线只剩记录值 —— 这种情况下
+//   "上游漂移"就体现为父仓的 git diff，所以不拿它当失败，也不假装核对过。
 console.log('\n== 覆盖层：自己方代码 ==')
 try {
   for (const side of inspect(repoRoot)) {
     const drifted = side.drifted.length
     const missing = side.filesTotal - side.installed - drifted
-    const ok = side.baselineOk && drifted === 0 && missing === 0 && side.pendingPatches.length === 0 && side.brokenPatches.length === 0
+    const embedded = side.mode === 'embedded'
+    const baselineBad = side.baselineOk === false
+    const ok = !baselineBad && drifted === 0 && missing === 0 && side.pendingPatches.length === 0 && side.brokenPatches.length === 0
+    const recorded = `${side.baselineCommit.slice(0, 7)}${side.upstreamVersion ? ` / 上游 ${side.upstreamVersion}` : ''}`
     const detail =
-      (side.baselineOk ? '' : `基线漂移（记录 ${side.baselineCommit.slice(0, 7)}，检出 ${side.head.slice(0, 7)}）`) +
+      (embedded
+        ? `已入库（无独立 .git，记录基线 ${recorded}）`
+        : baselineBad
+          ? `基线漂移（记录 ${side.baselineCommit.slice(0, 7)}，检出 ${side.head.slice(0, 7)}）`
+          : '') +
       `文件 ${side.installed}/${side.filesTotal} 就位` +
       (drifted > 0 ? `，${drifted} 个被就地改过` : '') +
       (missing > 0 ? `，待装 ${missing}` : '') +
       (side.droppedPatches.length + side.pendingPatches.length > 0
         ? `，补丁 已打 ${side.droppedPatches.length} 待打 ${side.pendingPatches.length}`
         : '')
-    const hint = !side.baselineOk
+    const hint = baselineBad
       ? `上游动过了：核对那几处改动后跑 npm run attach -- --rebaseline`
       : side.brokenPatches.length > 0
         ? `补丁既打不上也退不掉：${side.brokenPatches.join(', ')}（先 git -C ${side.checkout} diff 看清去留）`
