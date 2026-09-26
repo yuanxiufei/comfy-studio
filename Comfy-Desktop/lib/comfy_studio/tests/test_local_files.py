@@ -26,8 +26,8 @@ from comfy_studio.localfiles import (
 from comfy_studio.mcp import McpError
 
 
-def _call(client: LocalFilesClient, name: str, **args):
-    return asyncio.run(client.call_tool(name, args))
+def _call(client: LocalFilesClient, tool: str, **args):
+    return asyncio.run(client.call_tool(tool, args))
 
 
 def _payload(result: dict) -> dict:

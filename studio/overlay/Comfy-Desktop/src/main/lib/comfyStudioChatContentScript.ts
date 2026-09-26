@@ -44,6 +44,13 @@ let cachedScript: string | null = null
  * this drawer. The event paints a question card; submitting it posts
  * `agent/answer`. An answer that arrives after the host stopped waiting comes
  * back as `delivered: false` — late, not wrong — so the card just says so.
+ *
+ * Plan: `plan__submit` (see `lib/comfy_studio/plan.py`) is the same round trip
+ * one step earlier — a raw idea gets broken into a checklist and parked until
+ * the user nods. The card paints the steps plus two buttons (`就按这个来` /
+ * `改一下` + a line of feedback) and posts `agent/plan_result`. `plan__progress`
+ * is the one-way sibling: it ticks a step in whichever checklist the current
+ * turn painted, so nothing needs to wait on a notification.
  */
 const STUDIO_CHAT_MAIN_JS = `
 var STATE = window.__comfyStudioChat;
@@ -128,7 +135,42 @@ var CHAT_CSS =
   '#' + DRAWER_ID + ' .cs-ask[data-state="answered"] .cs-ask-form,' +
   '#' + DRAWER_ID + ' .cs-ask[data-state="answered"] .cs-ask-options,' +
   '#' + DRAWER_ID + ' .cs-ask[data-state="stale"] .cs-ask-form,' +
-  '#' + DRAWER_ID + ' .cs-ask[data-state="stale"] .cs-ask-options{display:none;}';
+  '#' + DRAWER_ID + ' .cs-ask[data-state="stale"] .cs-ask-options{display:none;}' +
+  // 灵感输入：agent 把一句想法拆出来的多步清单。蓝边，跟工具卡的灰边、问句的琥珀边分开。
+  // 一整张卡的态度放 data-state，单步的进展放那一步的 data-step-state。
+  '#' + DRAWER_ID + ' .cs-plan{align-self:stretch;display:flex;flex-direction:column;gap:6px;' +
+  'border:1px solid #4a7fd055;background:#4a7fd00f;}' +
+  '#' + DRAWER_ID + ' .cs-plan-goal{font-weight:600;}' +
+  '#' + DRAWER_ID + ' .cs-plan-steps{margin:0;padding-left:20px;display:flex;flex-direction:column;gap:3px;}' +
+  '#' + DRAWER_ID + ' .cs-plan-step{font-size:12px;}' +
+  '#' + DRAWER_ID + ' .cs-plan-step[data-step-state="running"]{color:#e0b400;}' +
+  '#' + DRAWER_ID + ' .cs-plan-step[data-step-state="done"]{color:' + MUTED + ';}' +
+  '#' + DRAWER_ID + ' .cs-plan-step[data-step-state="failed"]{color:#ff8080;}' +
+  '#' + DRAWER_ID + ' .cs-plan-step[data-step-state="skipped"]{color:' + MUTED + ';text-decoration:line-through;}' +
+  '#' + DRAWER_ID + ' .cs-plan-tool,' +
+  '#' + DRAWER_ID + ' .cs-plan-detail,' +
+  '#' + DRAWER_ID + ' .cs-plan-progress,' +
+  '#' + DRAWER_ID + ' .cs-plan-note,' +
+  '#' + DRAWER_ID + ' .cs-plan-notes{color:' + MUTED + ';font-size:11px;}' +
+  '#' + DRAWER_ID + ' .cs-plan-actions{display:flex;gap:6px;}' +
+  '#' + DRAWER_ID + ' .cs-plan-ok,' +
+  '#' + DRAWER_ID + ' .cs-plan-change{border:1px solid ' + BORDER + ';border-radius:4px;background:transparent;' +
+  'color:inherit;cursor:pointer;font:inherit;font-size:12px;padding:3px 8px;}' +
+  '#' + DRAWER_ID + ' .cs-plan-ok:hover,' +
+  '#' + DRAWER_ID + ' .cs-plan-change:hover{background:' + INPUT_BG + ';}' +
+  '#' + DRAWER_ID + ' .cs-plan-change{color:' + MUTED + ';}' +
+  '#' + DRAWER_ID + ' .cs-plan-feedback{display:none;flex-direction:column;gap:6px;}' +
+  '#' + DRAWER_ID + ' .cs-plan[data-state="editing"] .cs-plan-feedback{display:flex;}' +
+  '#' + DRAWER_ID + ' .cs-plan-input{box-sizing:border-box;width:100%;border:1px solid ' + BORDER + ';' +
+  'border-radius:4px;background:' + INPUT_BG + ';color:inherit;font:inherit;font-size:12px;' +
+  'padding:4px 6px;resize:vertical;}' +
+  '#' + DRAWER_ID + ' .cs-plan[data-state="approved"]{border-color:#3fa34d55;background:#3fa34d0f;}' +
+  '#' + DRAWER_ID + ' .cs-plan[data-state="rejected"]{border-color:#e0b40055;}' +
+  '#' + DRAWER_ID + ' .cs-plan[data-state="failed"]{border-color:#d9534f55;background:#d9534f0f;}' +
+  '#' + DRAWER_ID + ' .cs-plan[data-state="stale"]{border-color:' + BORDER + ';background:transparent;}' +
+  // 态度送出去之后就把按钮和表单收起来：留着会让人以为还能再表一次态
+  '#' + DRAWER_ID + ' .cs-plan:not([data-state="waiting"]):not([data-state="editing"]) .cs-plan-actions,' +
+  '#' + DRAWER_ID + ' .cs-plan:not([data-state="waiting"]):not([data-state="editing"]) .cs-plan-feedback{display:none;}';
 
 function ensureStyle() {
   if (document.getElementById(STYLE_ID)) return;
@@ -641,6 +683,16 @@ function onEvent(payload) {
     addAskUser(params);
     return;
   }
+  if (type === 'plan') {
+    // 灵感输入：宿主那张 plan__submit 正挂着等这张清单卡的态度。
+    addPlan(params);
+    return;
+  }
+  if (type === 'plan_progress') {
+    // 单向通知：回来给清单里的某一步打勾，没有谁在等它。
+    markPlanStep(params);
+    return;
+  }
   // final 不画：最终文本由请求结果给，画两遍就重复了。
 }
 
@@ -661,12 +713,14 @@ function sendTurn() {
 
   STATE.turn = {};
   STATE.cards = {};
+  STATE.planCard = null;
   addPending();
   var finish = function () {
     // 收尾统一摘掉"正在思考"：成功时回答已经插在它前面，失败时错误行也是。
     removePending();
     STATE.turn = null;
     STATE.cards = {};
+    STATE.planCard = null;
     STATE.busy = false;
     setSendEnabled(true);
     setStopVisible(false);
@@ -1091,6 +1145,190 @@ function addAskUser(params) {
   return card;
 }
 
+// ---- 灵感输入：一句话拆成多步清单 ---------------------------------------
+
+// 宿主那张 plan__submit（见 lib/comfy_studio/plan.py）会挂着等用户过目：
+// 点「就按这个来」= approved:true；点「改一下」再写一句 = approved:false + feedback。
+// 两条都经 agent/plan_result 送回宿主；送晚了（超时、或这一轮已经停了）宿主回
+// delivered:false —— 跟审核一样是"晚了"而不是"错了"。
+var PLAN_STEP_LABEL = { running: '进行中', done: '完成', failed: '失败', skipped: '跳过' };
+
+function addPlan(params) {
+  var card = makeRow('plan');
+  card.setAttribute('data-state', 'waiting');
+  var callId = params && params.call_id != null ? String(params.call_id) : '';
+
+  var goal = document.createElement('div');
+  goal.className = 'cs-plan-goal';
+  // 没有 goal 是宿主/模型那头的问题，清单照样画出来让人看见，别静默吞掉。
+  goal.textContent = String((params && params.goal) || '（没说要做什么）');
+  card.appendChild(goal);
+
+  var steps = (params && params.steps) || [];
+  var list = document.createElement('ol');
+  list.className = 'cs-plan-steps';
+  for (var i = 0; i < steps.length; i++) {
+    var item = steps[i] || {};
+    var step = document.createElement('li');
+    step.className = 'cs-plan-step';
+    step.setAttribute('data-step', String(i + 1));
+    step.setAttribute('data-step-state', 'pending');
+    var title = document.createElement('div');
+    title.textContent = String(item.title || '（这一步没写做什么）');
+    step.appendChild(title);
+    if (item.tool) {
+      var tool = document.createElement('div');
+      tool.className = 'cs-plan-tool';
+      tool.textContent = String(item.tool);
+      step.appendChild(tool);
+    }
+    if (item.detail) {
+      var detail = document.createElement('div');
+      detail.className = 'cs-plan-detail';
+      detail.textContent = String(item.detail);
+      step.appendChild(detail);
+    }
+    list.appendChild(step);
+  }
+  card.appendChild(list);
+
+  if (params && params.notes) {
+    var notes = document.createElement('div');
+    notes.className = 'cs-plan-notes';
+    notes.textContent = String(params.notes);
+    card.appendChild(notes);
+  }
+
+  var note = document.createElement('div');
+  note.className = 'cs-plan-note';
+
+  function finish(approved, feedback) {
+    // 一次只送一条：state 一离开 waiting/editing 就锁住，省得双击送两遍。
+    var state = card.getAttribute('data-state');
+    if (state !== 'waiting' && state !== 'editing') return;
+    if (callId === '') {
+      card.setAttribute('data-state', 'failed');
+      note.textContent = '这张清单没带 call_id，态度送不回去';
+      return;
+    }
+    card.setAttribute('data-state', 'sending');
+    note.textContent = approved ? '已认可，正在送回宿主…' : '正在把要改的地方送回宿主…';
+    Promise.resolve(
+      bridge.request('agent/plan_result', {
+        call_id: callId,
+        approved: approved,
+        feedback: feedback,
+      })
+    ).then(
+      function (response) {
+        if (!response || response.ok !== true) {
+          var error = (response && response.error) || {};
+          card.setAttribute('data-state', 'failed');
+          note.textContent = '没送到: ' + (error.message || '未知错误');
+          return;
+        }
+        var result = response.result || {};
+        if (result.delivered !== true) {
+          card.setAttribute('data-state', 'stale');
+          note.textContent = '这一轮已经不等了（超时或已停），这份态度没被用上';
+          return;
+        }
+        card.setAttribute('data-state', approved ? 'approved' : 'rejected');
+        note.textContent = approved ? '已认可，照清单走' : '已经说了要改：' + feedback;
+      },
+      function (err) {
+        card.setAttribute('data-state', 'failed');
+        note.textContent = '没送到: ' + message(err);
+      }
+    );
+  }
+
+  var actions = document.createElement('div');
+  actions.className = 'cs-plan-actions';
+  var approve = document.createElement('button');
+  approve.type = 'button';
+  approve.className = 'cs-plan-ok';
+  approve.textContent = '就按这个来';
+  approve.addEventListener('click', function () {
+    finish(true, '');
+  });
+  var change = document.createElement('button');
+  change.type = 'button';
+  change.className = 'cs-plan-change';
+  change.textContent = '改一下';
+  change.addEventListener('click', function () {
+    card.setAttribute('data-state', 'editing');
+    note.textContent = '要改哪里？写一句再送';
+    feedback.focus();
+  });
+  actions.appendChild(approve);
+  actions.appendChild(change);
+  card.appendChild(actions);
+
+  var form = document.createElement('form');
+  form.className = 'cs-plan-feedback';
+  var feedback = document.createElement('textarea');
+  feedback.className = 'cs-plan-input';
+  feedback.rows = 2;
+  feedback.placeholder = '例如：第 2 步换成 Flux 那套';
+  feedback.setAttribute('aria-label', '要改的地方');
+  var send = document.createElement('button');
+  send.type = 'submit';
+  send.className = 'cs-plan-ok';
+  send.textContent = '把改动送回去';
+  form.appendChild(feedback);
+  form.appendChild(send);
+  form.addEventListener('submit', function (event) {
+    event.preventDefault();
+    var text = feedback.value.trim();
+    if (text === '') {
+      // 否掉却没说改什么，宿主那边也会挡（agent/plan_result 要求 feedback 非空）：
+      // 就地提示一句，省得白跑一趟再被退回来。
+      note.textContent = '要改哪里，写一句再送';
+      feedback.focus();
+      return;
+    }
+    finish(false, text);
+  });
+  card.appendChild(form);
+  card.appendChild(note);
+
+  appendNode(card);
+  // 记下这一轮的清单卡：plan__progress 的事件要回来找它打勾（每轮至多一张）。
+  STATE.planCard = card;
+  if (STATE.open) feedback.focus();
+  return card;
+}
+
+// plan__progress：单向通知。回来要么给清单里的某一步打勾，要么另起一行说明。
+function markPlanStep(params) {
+  var step = params && params.step != null ? String(params.step) : '';
+  var status = String((params && params.status) || '');
+  var note = params && params.note ? String(params.note) : '';
+  var label = PLAN_STEP_LABEL[status] || status || '更新';
+  var card = STATE.planCard && STATE.planCard.parentNode ? STATE.planCard : null;
+  var item = card ? card.querySelector('.cs-plan-step[data-step="' + step + '"]') : null;
+  if (!item) {
+    // 对不上清单也照样让人看见（模型可能自己报进度，或者面板刚重开）：
+    // 宁可多一行，也别把进度静默丢掉。
+    var line = makeRow('agent');
+    line.textContent = '计划第 ' + (step || '?') + ' 步 ' + label + (note ? '：' + note : '');
+    return appendNode(line);
+  }
+  item.setAttribute('data-step-state', status || 'pending');
+  if (note !== '') {
+    var detail = item.querySelector('.cs-plan-progress');
+    if (!detail) {
+      detail = document.createElement('div');
+      detail.className = 'cs-plan-progress';
+      item.appendChild(detail);
+    }
+    detail.textContent = note;
+  }
+  scrollLog(logEl());
+  return item;
+}
+
 start();
 `
 
@@ -1103,7 +1341,7 @@ export function getComfyStudioChatContentScript(): string {
     `if (!window.__comfyDesktop2.ComfyStudio) return;\n` +
     `if (window.__comfyStudioChat) return;\n` +
     `window.__comfyStudioChat = { started: false, open: false, busy: false, turn: null, ` +
-    `model: '', session: 'default', pending: null, cards: {} };\n` +
+    `model: '', session: 'default', pending: null, cards: {}, planCard: null };\n` +
     STUDIO_CHAT_MAIN_JS +
     `})();\n`
   return cachedScript

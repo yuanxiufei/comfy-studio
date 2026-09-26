@@ -887,4 +887,209 @@ describe('getComfyStudioChatContentScript', () => {
     expect(askCards()).toHaveLength(0)
   })
 
+  // ---- 灵感输入：一句话拆成多步清单，用户点头或要改 -------------------------
+
+  const planCards = (): Element[] =>
+    Array.from(document.querySelectorAll(`#${LOG_ID} [data-kind="plan"]`))
+
+  const planNote = (card: Element): string => card.querySelector('.cs-plan-note')?.textContent ?? ''
+
+  /** 每步第一行才是"这一步做什么"，后头挂的工具名/备注不算标题。 */
+  const stepTitles = (card: Element): string[] =>
+    Array.from(card.querySelectorAll('.cs-plan-step')).map(
+      (step) => step.firstElementChild?.textContent ?? ''
+    )
+
+  const stepStates = (card: Element): (string | null)[] =>
+    Array.from(card.querySelectorAll('.cs-plan-step')).map((step) =>
+      step.getAttribute('data-step-state')
+    )
+
+  /** agent/plan_result 那次请求的参数，没发过就是 undefined。 */
+  const planCall = (
+    request: ReturnType<typeof vi.fn>
+  ): [string, Record<string, unknown>] | undefined =>
+    request.mock.calls.find((call) => call[0] === 'agent/plan_result') as
+      | [string, Record<string, unknown>]
+      | undefined
+
+  /** 与 turnThen 同形，只是回程换成了 agent/plan_result。 */
+  const planTurnThen = (
+    onVerdict: (params: Record<string, unknown>) => unknown
+  ): ReturnType<typeof vi.fn> =>
+    vi.fn((method: string, params: unknown) => {
+      if (method === 'agent/chat') return new Promise(() => {}) // 这一轮停在等人过目
+      if (method === 'agent/plan_result')
+        return onVerdict((params ?? {}) as Record<string, unknown>)
+      return { ok: true, result: {} }
+    })
+
+  const planEvent = (overrides: Record<string, unknown> = {}): void => {
+    emit({
+      params: {
+        type: 'plan',
+        call_id: 'plan-1',
+        goal: '把这张图改成赛博朋克海报感',
+        steps: [
+          { title: '先用 SDXL 出一版草稿', tool: 'comfy_run_skill' },
+          { title: '再把草稿放大到 2K' }
+        ],
+        notes: '第 2 步放大比较吃显存',
+        ...overrides
+      }
+    })
+  }
+
+  const progressEvent = (overrides: Record<string, unknown> = {}): void => {
+    emit({ params: { type: 'plan_progress', step: 1, status: 'running', ...overrides } })
+  }
+
+  it('paints the plan and its steps when the host submits one', async () => {
+    await startTurn(planTurnThen(() => ({ ok: true, result: { delivered: true } })))
+
+    planEvent()
+
+    const cards = planCards()
+    expect(cards).toHaveLength(1)
+    expect(cards[0]?.getAttribute('data-state')).toBe('waiting')
+    expect(cards[0]?.querySelector('.cs-plan-goal')?.textContent).toBe('把这张图改成赛博朋克海报感')
+    expect(stepTitles(cards[0]!)).toEqual(['先用 SDXL 出一版草稿', '再把草稿放大到 2K'])
+    expect(cards[0]?.querySelector('.cs-plan-tool')?.textContent).toBe('comfy_run_skill')
+    expect(cards[0]?.querySelector('.cs-plan-notes')?.textContent).toBe('第 2 步放大比较吃显存')
+    expect(stepStates(cards[0]!)).toEqual(['pending', 'pending'])
+  })
+
+  it('sends approval back when the user takes the plan as it is', async () => {
+    const request = planTurnThen(() => ({ ok: true, result: { delivered: true } }))
+    await startTurn(request)
+    planEvent()
+
+    const card = planCards()[0]!
+    ;(card.querySelector('.cs-plan-ok') as HTMLButtonElement).click()
+    await flush()
+
+    expect(planCall(request)?.[1]).toEqual({ call_id: 'plan-1', approved: true, feedback: '' })
+    expect(card.getAttribute('data-state')).toBe('approved')
+  })
+
+  it('sends the change request back when the user rejects the plan', async () => {
+    const request = planTurnThen(() => ({ ok: true, result: { delivered: true } }))
+    await startTurn(request)
+    planEvent()
+
+    const card = planCards()[0]!
+    ;(card.querySelector('.cs-plan-change') as HTMLButtonElement).click()
+    expect(card.getAttribute('data-state')).toBe('editing')
+
+    const input = card.querySelector('.cs-plan-input') as HTMLTextAreaElement
+    input.value = '  第 2 步换成 Flux 那套  '
+    card.querySelector('form')!.dispatchEvent(new Event('submit', { cancelable: true }))
+    await flush()
+
+    expect(planCall(request)?.[1]).toEqual({
+      call_id: 'plan-1',
+      approved: false,
+      feedback: '第 2 步换成 Flux 那套'
+    })
+    expect(card.getAttribute('data-state')).toBe('rejected')
+    expect(planNote(card)).toContain('第 2 步换成 Flux 那套')
+  })
+
+  it('refuses to send a rejection without saying what to change', async () => {
+    const request = planTurnThen(() => ({ ok: true, result: { delivered: true } }))
+    await startTurn(request)
+    planEvent()
+
+    const card = planCards()[0]!
+    ;(card.querySelector('.cs-plan-change') as HTMLButtonElement).click()
+    card.querySelector('form')!.dispatchEvent(new Event('submit', { cancelable: true }))
+    await flush()
+
+    // 宿主那边也会挡（feedback 非空），就地提醒省得白跑一趟。
+    expect(planCall(request)).toBeUndefined()
+    expect(card.getAttribute('data-state')).toBe('editing')
+    expect(planNote(card)).toContain('要改哪里')
+  })
+
+  it('marks the step the host reports progress on', async () => {
+    await startTurn(planTurnThen(() => ({ ok: true, result: { delivered: true } })))
+    planEvent()
+    progressEvent({ step: 2, status: 'done', note: '放大完了' })
+
+    const card = planCards()[0]!
+    expect(stepStates(card)).toEqual(['pending', 'done'])
+    expect(card.querySelector('.cs-plan-step[data-step="2"] .cs-plan-progress')?.textContent).toBe(
+      '放大完了'
+    )
+  })
+
+  it('starts a fresh line when the progress does not match the list', async () => {
+    await startTurn(planTurnThen(() => ({ ok: true, result: { delivered: true } })))
+    planEvent()
+    progressEvent({ step: 5, status: 'failed' })
+
+    // 对不上也照样让人看见，而不是静默丢掉。
+    const lines = Array.from(document.querySelectorAll(`#${LOG_ID} [data-kind="agent"]`))
+    expect(lines[lines.length - 1]?.textContent).toContain('第 5 步 失败')
+    expect(stepStates(planCards()[0]!)).toEqual(['pending', 'pending'])
+  })
+
+  it('reports a late verdict as stale rather than an error', async () => {
+    const request = planTurnThen(() => ({
+      ok: true,
+      result: { call_id: 'plan-1', delivered: false }
+    }))
+    await startTurn(request)
+    planEvent()
+
+    const card = planCards()[0]!
+    ;(card.querySelector('.cs-plan-ok') as HTMLButtonElement).click()
+    await flush()
+
+    expect(card.getAttribute('data-state')).toBe('stale')
+    expect(planNote(card)).toContain('不等了')
+  })
+
+  it('reports a verdict the host refused', async () => {
+    const request = planTurnThen(() => ({
+      ok: false,
+      error: { code: -32602, message: 'feedback 不能为空' }
+    }))
+    await startTurn(request)
+    planEvent()
+
+    const card = planCards()[0]!
+    ;(card.querySelector('.cs-plan-change') as HTMLButtonElement).click()
+    const input = card.querySelector('.cs-plan-input') as HTMLTextAreaElement
+    input.value = '换个模型'
+    card.querySelector('form')!.dispatchEvent(new Event('submit', { cancelable: true }))
+    await flush()
+
+    expect(card.getAttribute('data-state')).toBe('failed')
+    expect(planNote(card)).toContain('没送到: feedback 不能为空')
+  })
+
+  it('flags a plan card that carries no call_id instead of posting a stray verdict', async () => {
+    const request = planTurnThen(() => ({ ok: true, result: { delivered: true } }))
+    await startTurn(request)
+    planEvent({ call_id: undefined })
+
+    const card = planCards()[0]!
+    ;(card.querySelector('.cs-plan-ok') as HTMLButtonElement).click()
+    await flush()
+
+    expect(planCall(request)).toBeUndefined()
+    expect(card.getAttribute('data-state')).toBe('failed')
+    expect(planNote(card)).toContain('call_id')
+  })
+
+  it('ignores a plan event that arrives with no turn in flight', () => {
+    installBridge()
+    setupDom()
+    new Function(script)()
+
+    planEvent()
+
+    expect(planCards()).toHaveLength(0)
+  })
 })

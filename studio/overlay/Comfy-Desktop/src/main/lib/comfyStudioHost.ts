@@ -105,7 +105,10 @@ export function resolveStudioCommand(installation: InstallationRecord): ComfyStu
       // `review__ask_user` needs somebody to paint the question and carry the
       // answer back — the injected panel does both. Same deal: this shell asks
       // for that tool table, no other caller does.
-      '--review'
+      '--review',
+      // Same for `plan__submit` / `plan__progress`: the panel paints the step
+      // list and posts the verdict back through `agent/plan_result`.
+      '--plan'
     ],
     cwd: getBundledLibDir(),
     comfyuiDir

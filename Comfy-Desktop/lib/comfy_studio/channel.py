@@ -3,12 +3,14 @@
 有些能力宿主进程自己够不着：
 
 * 画布在 ComfyUI 前端页面里 —— 只有那一页拿着用户手头未必保存过的图；
-* 「这样做行不行」得问用户本人 —— 只有桌面壳连着一个能回答的人。
+* 「这样做行不行」得问用户本人 —— 只有桌面壳连着一个能回答的人；
+* 「这份多步计划照做吗」同样得问本人 —— 一句想法拆出来的路走不走得通，用户比模型清楚。
 
-这两件事的形状是一样的：宿主推一条 ``agent/event`` 通知出去，桌面壳接住、办完再用一条
+这几件事的形状是一样的：宿主推一条 ``agent/event`` 通知出去，桌面壳接住、办完再用一条
 RPC 把结果送回来，唤醒等着的 future。所以实现只留一份：:class:`Channel` 管「发事件 +
 等 future + 收结果」，事件类型、call_id 前缀、报错措辞由用它的模块定下来
-（见 :mod:`comfy_studio.canvas` 与 :mod:`comfy_studio.review`）。
+（见 :mod:`comfy_studio.canvas`、:mod:`comfy_studio.review` 与 :mod:`comfy_studio.plan`）。
+只想"告诉你一声"、不用谁回话的通知（计划进度）走 :meth:`Channel.notify`，不建 future。
 
 emit 用 contextvars 而不是成员变量：一个宿主进程里可以同时跑好几个会话的一轮，工具执行
 又都在 ``asyncio.create_task`` 里，正好顺着 context 传下去。
@@ -111,6 +113,27 @@ class Channel:
         if reply.get("ok") is not True:
             raise self.error_type(str(reply.get("error") or f"{what}失败"))
         return reply.get("result")
+
+    async def notify(
+        self,
+        payload: dict[str, Any],
+        *,
+        event_type: str | None = None,
+        what: str = "推事件",
+        cancel: CancelToken | None = None,
+    ) -> None:
+        """推一条**单向**事件出去：不建 future、不等谁回话。
+
+        进度播报这种"告诉你一声就行"的事走这里；它不该像 :meth:`_round_trip` 那样把
+        这一轮对话挂在一个 future 上。但"没人接"这件事仍然要如实报出来——静默丢一条
+        通知，等于让模型以为用户看见了。
+        """
+        emit = _CURRENT_EMIT.get()
+        if emit is None:
+            raise self.error_type(f"这一轮没有绑定桌面壳通道：{what}只能在 agent/chat 里做")
+        if cancel is not None:
+            cancel.raise_if_cancelled(what)
+        await emit("agent/event", {"type": event_type or self.event_type, **payload})
 
     def resolve(
         self, call_id: str, *, ok: bool, result: Any = None, error: str | None = None

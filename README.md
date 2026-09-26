@@ -63,8 +63,10 @@ agent / skill / mcp 三件能力**前后端各有一份**，按各自项目里�
 
 * `skills/` —— skill = 参数化的工作流模板（`skills/workflows/*.json`）+ 严格参数校验
   （`params.py`）+ 执行器（`runner.py`：注入参数 → 入队 → 等完成 → 收图片）。
-* `mcp/` —— 把引擎能力开成 MCP server：7 个通用工具（模型列表 / 提交工作流 / 队列 /
-  历史 / 中断 / 列 skill / 跑 skill）外加每个 skill 一把 `skill__<id>`。
+  目录视图是可热重载的 `SkillRegistry`（内置目录 + 用户目录），所以对话里刚用
+  `comfy_save_skill` 沉淀下来的 skill **同一个进程里立刻能跑**，不用重启。
+* `mcp/` —— 把引擎能力开成 MCP server：8 个通用工具（模型列表 / 提交工作流 / 队列 /
+  历史 / 中断 / 列 skill / 跑 skill / 存 skill）外加每个 skill 一把 `skill__<id>`。
   入口 `python -m comfy_studio.mcp`，cwd 必须是 `custom_nodes/`。
 * `agent/` —— 对话式 agent 循环（OpenAI 兼容 tool calling），工具直接走进程内的引擎原语。
 * `routes.py` —— 挂在 `/comfy-studio/*` 上的 HTTP 接口（skills / models / queue / interrupt /
@@ -86,6 +88,24 @@ agent / skill / mcp 三件能力**前后端各有一份**，按各自项目里�
   那个安装的画布页面里执行 → `agent/canvas_result` 把结果送回宿主等着的 future。没人接这条通道
   （例如直接拿 `run-mcp.mjs` 喂别的 MCP 客户端）时工具会明确回"等不到回音"，不假装读到一张空图；
   桌面壳启动宿主时带 `--canvas`，这张工具表才会出现。
+* `channel.py` —— 上面那条「回程」的公共骨架（emit → 等 future → 超时/幂等回填），
+  `canvas.py` 与 `review.py` 都是它的一种：两者只有工具名、id 前缀与超时不同。
+* `review.py` —— 审核通道：`review__ask_user` 让 agent 在关键节点问用户（带选项）、
+  **真的停住**等回答，回答经 `agent/answer` 回填；同一张卡片再答一次只会回 `delivered: false`
+  （人答晚了不是错误）。桌面壳启动宿主时带 `--review`，工具表里才有它。
+* `plan.py` —— 计划通道（灵感输入）：用户只给一句想法（“做张赛博朋克海报感的猫”）时，
+  `plan__submit` 先拆成 2~8 步清单**交给用户过一眼**（面板画成清单卡：点「就按这个来」=
+  `approved: true`；点「改一下」+ 写一句 = `approved: false` + `feedback`，两条都经
+  `agent/plan_result` 回填）；用户点头后再用 `plan__progress` 逐步播报（running / done /
+  failed / skipped），让清单上的那一步打上勾。进度那条走的是 `channel.py` 的**单向通知**
+  （`notify`，不建 future）——播报不该再把一轮对话卡住。否掉却不说要改哪里会被两头挡住
+  （面板就地提示 + 宿主回 -32602），免得模型瞎猜。桌面壳启动宿主时带 `--plan`。
+* `localfiles.py` —— 本机文件衔接：`localfiles__import_file` 把用户指的本机素材接进
+  ComfyUI 的 `input/`（返回能填进 `LoadImage.image` 那类字段的相对名 —— 加载类节点认不了
+  磁盘绝对路径）、`localfiles__list_files` 报产出的**真实路径**（引擎的 history 只有
+  filename）、`localfiles__read_text` 读本机文本。它不推事件、不等谁回话，只要
+  `--comfyui-dir` 给了就挂上；换过引擎的 `--input-directory` / `--output-directory` 时
+  用 `--input-dir` / `--output-dir`（或 `COMFY_INPUT_DIR` / `COMFY_OUTPUT_DIR`）跟着指。
 
 对话要模型，配在环境变量里（不落盘、不进仓库）：`COMFY_STUDIO_LLM_MODEL`（必填）、
 `COMFY_STUDIO_LLM_BASE_URL`、`COMFY_STUDIO_LLM_API_KEY`。没配的话 `agent/config` 会明确
@@ -111,6 +131,17 @@ agent / skill / mcp 三件能力**前后端各有一份**，按各自项目里�
 画布那两个工具既是给模型用的也是给用户用的：问"我这张图里有什么"，它会先
 `canvas__snapshot` 看清再答；说"把这份工作流放到画布上"，就落到
 `canvas__load_workflow`（它会替换当前画布，工具描述里写明了，模型会先说清楚再动手）。
+
+用户本机的文件也是同一张表里的事：说"用 D:\图片\cat.png 当参考图"，模型会先
+`localfiles__import_file` 把它接进 `input/`，再拿返回的名字去填 `LoadImage`；
+问"刚生成的图存哪了"就用 `localfiles__list_files` 拿到盘上的真实路径，而不是拿
+引擎给的 filename 拼。这些都不需要谁接话，也不写在代码里写死盘符 —— 目录一律
+由 `--comfyui-dir` 推出来。
+
+一句想法也一样：说"做张赛博朋克海报感的猫，海报感"，模型不会闷头自己编排到底，而是先用
+`plan__submit` 拆出几步交给你过目（要好几步才能做完的事尤其如此）；你点了「就按这个来」，
+它才开跑，并逐步用 `plan__progress` 在清单上打勾。已经在清楚地下命令（"用 SDXL 跑 4 张"）
+就不用麻烦这一趟 —— 这条只用在"听得出要干什么、看不出该怎么落地"的时候。
 
 ## 打通是怎么做到的
 
@@ -182,11 +213,16 @@ cd ComfyUI/custom_nodes
 ```powershell
 cd Comfy-Desktop/lib
 ..\..\ComfyUI\.venv\Scripts\python.exe -m unittest comfy_studio.tests.test_host_e2e -v
+# 纯逻辑用例（本机文件 / 计划通道，不拉子进程）：test_local_files.py、test_plan_tools.py
+..\..\ComfyUI\.venv\Scripts\python.exe -m unittest discover -s comfy_studio/tests
 ```
 
 它用本地假模型服务顶替真 LLM（顺带提供 `GET /models`）：第一轮让模型要一次
 `comfy_list_skills`，第二轮给结论，以此确认「agent 真的经 MCP 工具拿了引擎的数据」，
 另外还验了模型清单与切换（切完之后请求体里的 `model` 真的变了），全程不联网。
+回程那三条通道各有端到端用例：审核（问完真的停住等人答）、本机素材进出（素材真落进
+`input/`、产出报回盘上的真实路径）、计划（一句想法拆成清单等人点头、点头后才逐步播报），
+测试自己就是那个"桌面壳"，收事件再按 RPC 把结果送回去。
 桌面壳自己的 TypeScript 侧测试走 `pnpm test`（新增面板脚本的用例在
 `src/main/lib/comfyStudioChatContentScript.test.ts`，含模型下拉：填充、切换、
-被拒时回滚、一轮在飞时禁用）。
+被拒时回滚、一轮在飞时禁用；以及审核卡与计划清单卡：画清单、点头/要改、进度打勾）。

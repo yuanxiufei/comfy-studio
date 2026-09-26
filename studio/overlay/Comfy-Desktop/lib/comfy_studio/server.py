@@ -20,12 +20,14 @@
 ``agent/cancel``         ``{session_id?}`` → 让正在跑的那一轮尽快停下（幂等）
 ``agent/canvas_result``   画布通道的回程：桌面壳把页面执行画布动作的结果送回来
 ``agent/answer``         审核通道的回程：``{call_id, answer}`` → 唤醒等着的提问
+``agent/plan_result``    计划通道的回程：``{call_id, approved, feedback?}`` → 唤醒等着的确认
 ``agent/reset``          清空某个会话的历史
 ======================  ==============================================
 
-``agent/canvas_result`` 与 ``agent/answer`` 是两条「回程」：桌面壳要显式打开
-``--canvas`` / ``--review``，接住 ``agent/event`` 里的动作、办完再把结果送回来
-（见 :mod:`comfy_studio.canvas` 与 :mod:`comfy_studio.review`）。
+``agent/canvas_result`` / ``agent/answer`` / ``agent/plan_result`` 是三条「回程」：桌面壳要
+显式打开 ``--canvas`` / ``--review`` / ``--plan``，接住 ``agent/event`` 里的动作、办完再把
+结果送回来（见 :mod:`comfy_studio.canvas`、:mod:`comfy_studio.review` 与
+:mod:`comfy_studio.plan`）。
 
 本机文件那几张工具（``localfiles__*``，见 :mod:`comfy_studio.localfiles`）不走回程：
 它只要知道 ComfyUI 装在哪，因此由 ``--comfyui-dir`` 决定挂不挂，不需要额外开关。
@@ -43,6 +45,7 @@ from .cancel import CancelToken, Cancelled
 from .channel import bind_emit, unbind_emit
 from .localfiles import LocalFiles, LocalFilesClient
 from .mcp import McpHub, McpServerConfig
+from .plan import PlanChannel, PlanClient
 from .review import ReviewChannel, ReviewClient
 from .rpc import INTERNAL_ERROR, INVALID_PARAMS, RpcContext, RpcError, StdioRpcServer
 from .skills import SkillCatalog, SkillsError
@@ -87,6 +90,7 @@ class StudioHost:
         max_sessions: int = MAX_SESSIONS,
         canvas: CanvasChannel | None = None,
         review: ReviewChannel | None = None,
+        plan: PlanChannel | None = None,
         local_files: LocalFilesClient | None = None,
     ) -> None:
         self.hub = hub
@@ -98,6 +102,8 @@ class StudioHost:
         self.canvas = canvas
         #: 审核通道（同上）；None 时工具表里不会有 review__ask_user。
         self.review = review
+        #: 计划通道（同上）；None 时工具表里不会有 plan__submit / plan__progress。
+        self.plan = plan
         #: 本机文件工具（知道 ComfyUI 装在哪才有）；None 时工具表里不会有 localfiles__*。
         self.local_files = local_files
         #: 面板里切过的模型；None = 用环境变量里那个（进程内有效，不落盘）。
@@ -125,6 +131,7 @@ class StudioHost:
         self.server.on("agent/cancel", self.agent_cancel)
         self.server.on("agent/canvas_result", self.agent_canvas_result)
         self.server.on("agent/answer", self.agent_answer)
+        self.server.on("agent/plan_result", self.agent_plan_result)
         self.server.on("agent/reset", self.agent_reset)
 
     # ---- 方法 -----------------------------------------------------------
@@ -144,6 +151,7 @@ class StudioHost:
             "busy": sorted(self._turns),
             "canvas": self.canvas is not None,
             "review": self.review is not None,
+            "plan": self.plan is not None,
             "local_files": self.local_files is not None,
         }
 
@@ -340,6 +348,30 @@ class StudioHost:
         delivered = self.review.resolve(call_id, ok=True, result=answer)
         return {"call_id": call_id, "delivered": delivered}
 
+    def agent_plan_result(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
+        """计划通道的回程：面板把用户对 ``plan__submit`` 的态度送回来。
+
+        ``approved=false`` 时必须带上 ``feedback``（要改哪里）——否掉却不说话，模型只能瞎猜。
+        幂等和另外两条通道一样：这一轮已经不等了就回 ``delivered: false``。
+        """
+        args = _object(params, "agent/plan_result")
+        call_id = _text(args, "call_id")
+        approved = args.get("approved")
+        if not isinstance(approved, bool):
+            raise RpcError(INVALID_PARAMS, "approved 必须是布尔值")
+        feedback = args.get("feedback")
+        if feedback is not None and not isinstance(feedback, str):
+            raise RpcError(INVALID_PARAMS, "feedback 必须是字符串")
+        feedback = (feedback or "").strip()
+        if not approved and feedback == "":
+            raise RpcError(INVALID_PARAMS, "否掉计划时必须说清要改哪里（feedback 不能为空）")
+        if self.plan is None:
+            return {"call_id": call_id, "delivered": False}
+        delivered = self.plan.resolve(
+            call_id, ok=True, result={"approved": approved, "feedback": feedback}
+        )
+        return {"call_id": call_id, "delivered": delivered}
+
     def agent_reset(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
         args = _object(params, "agent/reset")
         session_id = args.get("session_id") or DEFAULT_SESSION
@@ -408,21 +440,24 @@ async def serve_stdio(
     comfy_url: str | None = None,
     canvas: bool = False,
     review: bool = False,
+    plan: bool = False,
     input_dir: str | None = None,
     output_dir: str | None = None,
 ) -> None:
     """拉起全部 MCP server，然后在 stdin/stdout 上服务到 EOF。
 
-    ``canvas=True`` / ``review=True`` 各挂一条「回程」通道（画布动作见
-    :mod:`comfy_studio.canvas`；向用户提问见 :mod:`comfy_studio.review`）：那两张工具表
-    都要靠桌面壳接住 ``agent/event``、办完再把结果送回 ``agent/canvas_result`` /
-    ``agent/answer``。所以默认**不开**——单独给别的 MCP 客户端用时开了也没人接，
-    动作只会等到超时。本机文件那几张（:mod:`comfy_studio.localfiles`）不需要谁接话，
-    只要 ``comfyui_dir`` 给了就挂上；``input_dir`` / ``output_dir`` 用来对应引擎
-    启动参数 ``--input-directory`` / ``--output-directory``（默认就是 comfyui_dir 下的同名目录）。
+    ``canvas=True`` / ``review=True`` / ``plan=True`` 各挂一条「回程」通道（画布动作见
+    :mod:`comfy_studio.canvas`；向用户提问见 :mod:`comfy_studio.review`；多步计划见
+    :mod:`comfy_studio.plan`）：那几张工具表都要靠桌面壳接住 ``agent/event``、办完再把
+    结果送回 ``agent/canvas_result`` / ``agent/answer`` / ``agent/plan_result``。
+    所以默认**不开**——单独给别的 MCP 客户端用时开了也没人接，动作只会等到超时。
+    本机文件那几张（:mod:`comfy_studio.localfiles`）不需要谁接话，只要 ``comfyui_dir``
+    给了就挂上；``input_dir`` / ``output_dir`` 用来对应引擎启动参数
+    ``--input-directory`` / ``--output-directory``（默认就是 comfyui_dir 下的同名目录）。
     """
     canvas_channel = CanvasChannel() if canvas else None
     review_channel = ReviewChannel() if review else None
+    plan_channel = PlanChannel() if plan else None
     local_files = (
         LocalFilesClient(LocalFiles(comfyui_dir, input_dir=input_dir, output_dir=output_dir))
         if comfyui_dir
@@ -433,6 +468,8 @@ async def serve_stdio(
         extra.append(CanvasClient(canvas_channel))
     if review_channel is not None:
         extra.append(ReviewClient(review_channel))
+    if plan_channel is not None:
+        extra.append(PlanClient(plan_channel))
     if local_files is not None:
         extra.append(local_files)
     hub = McpHub(configs, request_timeout=request_timeout, extra_clients=extra)
@@ -446,6 +483,7 @@ async def serve_stdio(
             comfy_url=comfy_url,
             canvas=canvas_channel,
             review=review_channel,
+            plan=plan_channel,
             local_files=local_files,
         )
         # stdin 一关（面板退出）就先叫停在飞的轮次，别让退出卡在长任务上。

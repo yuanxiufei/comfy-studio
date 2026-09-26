@@ -24,7 +24,6 @@ import tempfile
 import threading
 import time
 import unittest
-from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -63,6 +62,19 @@ class _FakeCompletions(BaseHTTPRequestHandler):
 
     #: 用户话里带这个标记就让这一轮把一套工作流沉淀成 skill（方法复用用例）。
     SAVE_MARKER = "存下来"
+    #: 本地衔接用例：把标记后面那串路径当用户的本地素材，接进引擎的 input。
+    FILE_MARKER = "接进来"
+    FILE_SUBFOLDER = "refs"
+    #: 本地衔接用例的另一半：问本地产出在哪，让这一轮去查 output 目录。
+    LOOKUP_MARKER = "产出在哪"
+    #: 灵感输入用例：一句话先拆成多步清单交上去等人过目。
+    PLAN_MARKER = "一步步来"
+    PLAN_GOAL = "把这张图改成赛博朋克海报感"
+    #: 故意一步写成对象、一步写成光字符串：验证两种写法都会收成同一种形状。
+    PLAN_STEPS = [
+        {"title": "先用 SDXL 出一版草稿", "tool": "comfy_run_skill"},
+        "再把草稿放大到 2K",
+    ]
     SAVE_SKILL = {
         "id": "e2e-saved",
         "title": "对话里存下来的",
@@ -148,6 +160,100 @@ class _FakeCompletions(BaseHTTPRequestHandler):
                         }
                     ],
                 }
+        elif self.FILE_MARKER in _last_user_text(messages):
+            # 本地衔接用例：第一轮把用户给的本机路径交给 localfiles__import_file，
+            # 第二轮把它返回的工作流取值念出来（断言真的能拿去填节点字段）。
+            tool_messages = [m for m in messages if m.get("role") == "tool"]
+            if tool_messages:
+                payload = json.loads(tool_messages[0]["content"])
+                message = {"role": "assistant", "content": f"接好了，填 {payload['value']}"}
+            else:
+                # 标记后面那一整串就是路径（子串切一刀，路径里有空格也不怕）。
+                source = _last_user_text(messages).split(self.FILE_MARKER, 1)[1].strip()
+                message = {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_import",
+                            "type": "function",
+                            "function": {
+                                "name": "localfiles__import_file",
+                                "arguments": json.dumps(
+                                    {"path": source, "subfolder": self.FILE_SUBFOLDER}
+                                ),
+                            },
+                        }
+                    ],
+                }
+        elif self.LOOKUP_MARKER in _last_user_text(messages):
+            # 产出那一侧：第一轮查 output 目录，第二轮把盘上的真实路径念出来。
+            tool_messages = [m for m in messages if m.get("role") == "tool"]
+            if tool_messages:
+                payload = json.loads(tool_messages[0]["content"])
+                message = {"role": "assistant", "content": payload["files"][0]["path"]}
+            else:
+                message = {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_list",
+                            "type": "function",
+                            "function": {
+                                "name": "localfiles__list_files",
+                                "arguments": json.dumps({"type": "output"}),
+                            },
+                        }
+                    ],
+                }
+        elif self.PLAN_MARKER in _last_user_text(messages):
+            # 灵感输入用例：第一轮把一句想法拆成清单交上去等人点头；点头之后报一次进度
+            # （单向通知），最后用文字收尾。
+            tool_messages = [m for m in messages if m.get("role") == "tool"]
+            verdict = json.loads(tool_messages[0]["content"]) if tool_messages else None
+            if verdict is None:
+                message = {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_plan",
+                            "type": "function",
+                            "function": {
+                                "name": "plan__submit",
+                                "arguments": json.dumps(
+                                    {
+                                        "goal": self.PLAN_GOAL,
+                                        "steps": self.PLAN_STEPS,
+                                        "notes": "第 2 步放大比较吃显存",
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                            },
+                        }
+                    ],
+                }
+            elif len(tool_messages) == 1 and verdict.get("approved"):
+                # 用户点头了才开工；报进度这一步是单向的，报完还得接着说人话。
+                message = {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_progress",
+                            "type": "function",
+                            "function": {
+                                "name": "plan__progress",
+                                "arguments": json.dumps({"step": 1, "status": "running"}),
+                            },
+                        }
+                    ],
+                }
+            elif len(tool_messages) == 1:
+                message = {"role": "assistant", "content": f"用户要改：{verdict['feedback']}"}
+            else:
+                message = {"role": "assistant", "content": f"按计划开工（approved={verdict['approved']}）"}
         else:
             tool_messages = [m for m in messages if m.get("role") == "tool"]
             if tool_messages:
@@ -200,6 +306,14 @@ class StudioHostE2ETest(unittest.TestCase):
         # 不能写到开发机上真实的 ~/.comfy-studio/skills 去。
         cls._skills_tmp = tempfile.TemporaryDirectory(prefix="comfy-studio-user-skills-")
         cls.user_skills_dir = cls._skills_tmp.name
+        # 本机文件那几张工具会真的往 input/output 目录里读写，所以把这两个目录钉在
+        # 临时目录里（对应引擎的 --input-directory / --output-directory），
+        # 别去动开发机上真实的 ComfyUI/input、ComfyUI/output。
+        cls._files_tmp = tempfile.TemporaryDirectory(prefix="comfy-studio-local-files-")
+        cls.files_root = Path(cls._files_tmp.name)
+        cls.input_dir = cls.files_root / "input"
+        cls.output_dir = cls.files_root / "output"
+        cls.output_dir.mkdir(parents=True)
         cls.llm = ThreadingHTTPServer(("127.0.0.1", 0), _FakeCompletions)
         threading.Thread(target=cls.llm.serve_forever, daemon=True).start()
         port = cls.llm.server_address[1]
@@ -217,6 +331,14 @@ class StudioHostE2ETest(unittest.TestCase):
                 # review__ask_user 得有桌面壳接住才成立，而这个测试就是那个壳：
                 # 它收下 ask_user 事件，再用 agent/answer 把答案送回去。
                 "--review",
+                # plan__submit 同理：这张测试壳也当那个面板，接住 plan 事件后用
+                # agent/plan_result 把"过 / 改"送回去。
+                "--plan",
+                # 本机素材/产出那两个目录换成临时目录，别写进仓库里的 ComfyUI 检出。
+                "--input-dir",
+                str(cls.input_dir),
+                "--output-dir",
+                str(cls.output_dir),
             ],
             cwd=str(LIB_DIR),
             stdin=subprocess.PIPE,
@@ -245,6 +367,7 @@ class StudioHostE2ETest(unittest.TestCase):
             cls.proc.kill()
         cls.llm.shutdown()
         cls._skills_tmp.cleanup()
+        cls._files_tmp.cleanup()
 
     @classmethod
     def _pump_stdout(cls) -> None:
@@ -312,15 +435,20 @@ class StudioHostE2ETest(unittest.TestCase):
         self.assertEqual(info.get("name"), "comfy-studio-desktop")
         self.assertIn("agent/chat", info.get("methods", []))
         self.assertIn("skills/run", info.get("methods", []))
-        # 状态里如实报出两条回程通道挂没挂：画布没开，审核开了（见启动参数）。
+        # 状态里如实报出各条回程通道挂没挂：画布没开，审核与计划开了（见启动参数）。
         self.assertIs(info.get("canvas"), False)
         self.assertIs(info.get("review"), True)
+        self.assertIs(info.get("plan"), True)
+        # 本机文件那几张不用谁接话，只要 --comfyui-dir 给了就挂上。
+        self.assertIs(info.get("local_files"), True)
 
     def test_02_tools_are_namespaced_by_server(self) -> None:
         tools = self.call(2, "mcp/tools").get("result", {}).get("tools", [])
         names = [t["qualified_name"] for t in tools]
         self.assertIn("comfy-studio__comfy_list_skills", names)
         self.assertIn("review__ask_user", names)
+        self.assertIn("plan__submit", names)
+        self.assertIn("plan__progress", names)
         # 每把工具都严格是 <server>__<tool>：回程那条通道（review）也不破例。
         for tool in tools:
             self.assertTrue(tool["qualified_name"].startswith(f"{tool['server']}__"), tool)
@@ -515,6 +643,99 @@ class StudioHostE2ETest(unittest.TestCase):
         path = Path(self.user_skills_dir, "e2e-saved.json")
         self.assertTrue(path.is_file(), path)
         self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["id"], "e2e-saved")
+
+
+    def test_18_local_file_in_and_local_output_path_out(self) -> None:
+        """本地衔接：用户指的本机素材真的进了 input；产出能换算回盘上的路径。"""
+        source = self.files_root / "ref.png"
+        source.write_bytes(b"\x89PNG-ref")
+
+        reply = self.call(
+            31,
+            "agent/chat",
+            {"text": f"把这张图接进来 {source}", "session_id": "files-e2e"},
+        )
+        self.assertNotIn("error", reply, reply)
+        # 拿回来的 value 是工作流里能填的那种相对名，不是磁盘绝对路径。
+        self.assertEqual(reply.get("result", {}).get("text", ""), "接好了，填 refs/ref.png")
+
+        landed = self.input_dir / "refs" / "ref.png"
+        self.assertTrue(landed.is_file(), landed)
+        self.assertEqual(landed.read_bytes(), b"\x89PNG-ref")
+
+        calls = [
+            e["params"]["name"]
+            for e in self.notifications(31)
+            if e["params"].get("type") == "tool_call"
+        ]
+        self.assertIn("localfiles__import_file", calls, calls)
+
+        # 另一半：问产出在哪，宿主回的是 output 目录里的真实路径（引擎只给 filename）。
+        # 另起一个会话：假模型是按"对话里有没有 tool 消息"分轮的，接着上一个会话跑会把
+        # 上一次 import 的返回值当成这一轮的工具结果。
+        produced = self.output_dir / "out-0001.png"
+        produced.write_bytes(b"\x89PNG-out")
+        reply = self.call(
+            32,
+            "agent/chat",
+            {"text": "刚才的产出在哪", "session_id": "lookup-e2e"},
+        )
+        self.assertNotIn("error", reply, reply)
+        self.assertEqual(reply.get("result", {}).get("text", ""), str(produced))
+
+    def test_19_a_one_liner_becomes_a_plan_the_user_confirms(self) -> None:
+        """灵感输入：一句想法先拆成多步清单等人过目；点头后逐步播报进度。"""
+        session = "plan-e2e"
+        self.send(
+            33,
+            "agent/chat",
+            {"text": "一步步来，把这张图做成赛博朋克海报", "session_id": session},
+        )
+
+        # 宿主推到面板上的是一张清单：要做什么、分几步、每步打算用哪把工具。
+        plan = self.wait_for_event(33, "plan")
+        self.assertEqual(plan["params"]["goal"], _FakeCompletions.PLAN_GOAL)
+        self.assertEqual(
+            [s["title"] for s in plan["params"]["steps"]],
+            ["先用 SDXL 出一版草稿", "再把草稿放大到 2K"],
+        )
+        # 一步是对象、一步是光字符串，收下来形状要一样，面板才不用分情况画。
+        self.assertEqual(plan["params"]["steps"][0]["tool"], "comfy_run_skill")
+        self.assertEqual(plan["params"]["steps"][1]["tool"], None)
+        self.assertEqual(plan["params"]["notes"], "第 2 步放大比较吃显存")
+        call_id = plan["params"]["call_id"]
+        self.assertTrue(str(call_id).startswith("plan-"), plan)
+
+        # 还没人过目：这一轮就该停在那儿，不能自己往下跑。
+        with self.lock:
+            ended_early = any(m.get("id") == 33 for m in self.lines)
+        self.assertFalse(ended_early, "还没人过目，这一轮不该已经结束")
+
+        # 否掉却不说改哪里 = 让模型瞎猜：挡住了，而且不算回过话（这一轮还在等）。
+        silent = self.call(
+            34, "agent/plan_result", {"call_id": call_id, "approved": False, "feedback": "   "}
+        )
+        self.assertEqual(silent.get("error", {}).get("code"), -32602, silent)
+        with self.lock:
+            still_waiting = not any(m.get("id") == 33 for m in self.lines)
+        self.assertTrue(still_waiting, "被挡下的回话不该把这一轮放走")
+
+        delivered = self.call(35, "agent/plan_result", {"call_id": call_id, "approved": True})
+        self.assertIs(delivered.get("result", {}).get("delivered"), True, delivered)
+
+        reply = self.wait(33, SKILLS_TIMEOUT)
+        self.assertNotIn("error", reply, reply)
+        # 用户的态度真的回到了模型手里，而不是被吞掉。
+        self.assertIn("approved=True", reply.get("result", {}).get("text", ""), reply)
+
+        # 进度是单向通知：面板收得到，但它不建 future，不会再把这一轮卡住。
+        progress = self.wait_for_event(33, "plan_progress")
+        self.assertEqual(progress["params"]["step"], 1)
+        self.assertEqual(progress["params"]["status"], "running")
+
+        # 幂等：这一轮早不等了，晚了再点一遍只是白点，不是错误。
+        late = self.call(36, "agent/plan_result", {"call_id": call_id, "approved": True})
+        self.assertIs(late.get("result", {}).get("delivered"), False, late)
 
 
 if __name__ == "__main__":
