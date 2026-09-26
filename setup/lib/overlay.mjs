@@ -228,11 +228,13 @@ function backupBeforeDamage(repoRoot, entries, kind) {
  *
  * 返回 null = 没能确认（git check-ignore 非正常退出）：调用方必须显式报出来，
  * 不许当成"一个都没被忽略"——那正好是把新文件放跑的方向。
+ *
+ * cwd 决定"在哪个 git 工作树里问"：已入库形态问父仓（rel 带检出名前缀），
+ * 独立检出问检出自己那个仓（rel 就是检出内路径）——两边的 .gitignore 规则各归各的。
  */
-function ignoredAmong(repoRoot, checkout, rels) {
+function ignoredAmong(cwd, rels) {
   if (rels.length === 0) return []
-  const paths = rels.map((rel) => `${checkout}/${rel}`)
-  const r = gitTry(['check-ignore', '--', ...paths], repoRoot)
+  const r = gitTry(['check-ignore', '--', ...rels], cwd)
   if (r.ok) return r.out.split('\n').filter(Boolean)
   // 退出码 1 是正常"空结果"：没有任何路径被 .gitignore 匹配上。
   // 不能拿 r.out 判断：失败时它是 "Command failed: …" 那段给人看的串，会被当成忽略名单。
@@ -363,12 +365,24 @@ export function attach(repoRoot, { force = false, rebaseline = false, log = cons
         `文件 新增/更新 ${written}，已就绪 ${kept}` +
         (plan.patches.length > 0 ? `，补丁 新打 ${patched}/${plan.patches.length}` : '，无补丁')
     )
-    if (plan.mode === 'embedded' && (written > 0 || patched > 0)) {
+    if (written > 0 || patched > 0) {
+      // 两种形态在"新文件"上会栽同一个跟头：落点在被 .gitignore 忽略的目录里时，新文件连
+      // git status 都不显示，不显式强加就会静默漏掉。区别只是"在哪个仓里加"——所以这条提醒
+      // 不能只给已入库形态：独立检出一样会漏，只是路径得按检出自己那个仓给（父仓根下的
+      // ComfyUI/... 在那边是无效 pathspec）。
+      const inCheckout = plan.mode === 'git'
+      const addCmd = inCheckout ? `git -C ${plan.side.checkout} add -f` : `git add -f`
       log(
-        `[!]    ${plan.side.checkout} 的内容由父仓跟踪：已跟踪文件那部分改动在仓库根用` +
-          ` git status -- ${plan.side.checkout} 能看到，确认无误就连同 studio/ 一起提交`
+        inCheckout
+          ? `[!]    ${plan.side.checkout} 是独立检出：改动在检出自己的 git 里，用` +
+            ` git -C ${plan.side.checkout} status 看，确认无误就提交`
+          : `[!]    ${plan.side.checkout} 的内容由父仓跟踪：已跟踪文件那部分改动在仓库根用` +
+            ` git status -- ${plan.side.checkout} 能看到，确认无误就连同 studio/ 一起提交`
       )
-      const ignored = ignoredAmong(repoRoot, plan.side.checkout, created)
+      const ignored = ignoredAmong(
+        inCheckout ? plan.checkoutDir : repoRoot,
+        inCheckout ? created : created.map((rel) => `${plan.side.checkout}/${rel}`)
+      )
       if (ignored === null) {
         // 这是装配完之后的提醒，不是装配本身：确认不了就明说，别让 attach 拿它假装成功，
         // 也别因为一句提醒失败就把已装好的结果否掉。真门禁在 npm run doctor（它按父仓
@@ -381,7 +395,7 @@ export function attach(repoRoot, { force = false, rebaseline = false, log = cons
         log(
           `[!]    另有 ${ignored.length} 个新文件落在上游 .gitignore 的忽略范围里 —— 那些连\n` +
             `      git status 都不显示，不显式强加就会静默漏掉（老问题会只在新文件上复发）。现在就加：\n` +
-            `      git add -f ${ignored.join(' ')}`
+            `      ${addCmd} ${ignored.join(' ')}`
         )
       }
     }
