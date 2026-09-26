@@ -12,6 +12,8 @@
     "setup:desktop": "pnpm --dir Comfy-Desktop install",
     "setup:all": "npm run setup && npm run setup:desktop",
     "seed": "node setup/seed-desktop.mjs",
+    "attach": "node setup/attach.mjs",
+    "detach": "node setup/detach.mjs",
     "dev": "npm run seed && pnpm --dir Comfy-Desktop dev",
     "engine": "node setup/run-engine.mjs",
     "engine:help": "node setup/run-engine.mjs --help",

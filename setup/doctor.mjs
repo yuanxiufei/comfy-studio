@@ -12,6 +12,7 @@ import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
+import { inspect } from './lib/overlay.mjs'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const repoRoot = path.dirname(here)
@@ -53,6 +54,38 @@ function venvSitePackages() {
   if (isWin) return path.join(base, 'site-packages')
   const py = fs.readdirSync(base).find((n) => n.startsWith('python'))
   return py ? path.join(base, py, 'site-packages') : null
+}
+
+// 自己方代码都住在 studio/（父仓库跟踪），靠覆盖层装进两份上游检出的扩展位。
+// 这里核对的是「装得对不对、上游有没有漂移」——没装的话后面那些检查会以一个
+// 更难懂的方式失败（引擎缺 custom node、桌面壳缺 lib/comfy_studio）。
+console.log('\n== 覆盖层：自己方代码 ==')
+try {
+  for (const side of inspect(repoRoot)) {
+    const drifted = side.drifted.length
+    const missing = side.filesTotal - side.installed - drifted
+    const ok = side.baselineOk && drifted === 0 && missing === 0 && side.pendingPatches.length === 0 && side.brokenPatches.length === 0
+    const detail =
+      (side.baselineOk ? '' : `基线漂移（记录 ${side.baselineCommit.slice(0, 7)}，检出 ${side.head.slice(0, 7)}）`) +
+      `文件 ${side.installed}/${side.filesTotal} 就位` +
+      (drifted > 0 ? `，${drifted} 个被就地改过` : '') +
+      (missing > 0 ? `，待装 ${missing}` : '') +
+      (side.droppedPatches.length + side.pendingPatches.length > 0
+        ? `，补丁 已打 ${side.droppedPatches.length} 待打 ${side.pendingPatches.length}`
+        : '')
+    const hint = !side.baselineOk
+      ? `上游动过了：核对那几处改动后跑 npm run attach -- --rebaseline`
+      : side.brokenPatches.length > 0
+        ? `补丁既打不上也退不掉：${side.brokenPatches.join(', ')}（先 git -C ${side.checkout} diff 看清去留）`
+        : drifted > 0
+          ? `被就地改过的是：${side.drifted.slice(0, 3).join(', ')}${drifted > 3 ? ' …' : ''} —— 搬回 studio/overlay，或用 npm run attach -- --force 顶掉（顶掉前会备份）`
+          : missing > 0 || side.pendingPatches.length > 0
+            ? '跑 npm run attach 把自己方代码装进检出'
+            : ''
+    check(`${side.checkout} 覆盖层`, ok, detail, hint)
+  }
+} catch (err) {
+  check('覆盖层可核对', false, String(err?.message ?? err), '先跑 npm run attach -- --check 看覆盖层清单')
 }
 
 console.log('\n== 后端：ComfyUI 引擎 ==')

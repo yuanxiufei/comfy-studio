@@ -1,0 +1,5 @@
+# 覆盖层源要求在任何平台上逐字节可重放：
+# - patches 被 git apply 用来匹配上游工作区的上下文，行尾一旦被转成 CRLF 就会整片失配；
+# - overlay 会被 attach 原样复制进两份检出，统一 LF 才能让 Windows / Linux 装出同一份结果。
+studio/overlay/** text eol=lf
+studio/patches/** text eol=lf

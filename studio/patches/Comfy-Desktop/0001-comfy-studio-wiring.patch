@@ -1,0 +1,222 @@
+diff --git a/packages/comfyui-desktop-bridge-types/comfyDesktopBridge.d.ts b/packages/comfyui-desktop-bridge-types/comfyDesktopBridge.d.ts
+index 64e8f5f..269c3b7 100644
+--- a/packages/comfyui-desktop-bridge-types/comfyDesktopBridge.d.ts
++++ b/packages/comfyui-desktop-bridge-types/comfyDesktopBridge.d.ts
+@@ -74,6 +74,46 @@ export interface ComfyDesktop2TelemetryBridge {
+   /** Report the hosted view's complete Firebase state for process-wide consensus. */
+   reportFirebaseAuthState?(state: ComfyDesktop2FirebaseAuthState): void
+ }
++/** Availability of the desktop-side comfy-studio host (MCP client + chat agent). */
++export interface ComfyStudioStatus {
++  installationId: string | null
++  /** False when this install has no usable python/ComfyUI checkout to host from. */
++  available: boolean
++  running: boolean
++  comfyuiDir?: string
++  error?: string
++}
++export type ComfyStudioRequestResult =
++  | {
++      ok: true
++      result: unknown
++    }
++  | {
++      ok: false
++      error: {
++        code?: number
++        message: string
++      }
++    }
++/** A notification pushed by the host, e.g. an `agent/event` during a chat turn. */
++export interface ComfyStudioEventMessage {
++  installationId: string
++  method: string
++  params: Record<string, unknown>
++}
++/** Desktop-side comfy-studio host: MCP hub + skill catalog + conversation agent.
++ *  `request` proxies the host's own JSON-RPC methods (see `lib/comfy_studio/server.py`). */
++export interface ComfyDesktop2ComfyStudioBridge {
++  status(installationId?: string): Promise<ComfyStudioStatus>
++  start(installationId?: string): Promise<ComfyStudioStatus>
++  stop(installationId?: string): Promise<ComfyStudioStatus>
++  request(
++    method: string,
++    params?: Record<string, unknown>,
++    installationId?: string
++  ): Promise<ComfyStudioRequestResult>
++  onEvent(callback: (message: ComfyStudioEventMessage) => void): () => void
++}
+ export interface ComfyDesktop2Bridge {
+   /** Reports whether the backend server is cloud/remote, not the user's location.
+    *  Optional: desktop builds predating it are still in the wild. */
+@@ -94,6 +134,7 @@ export interface ComfyDesktop2Bridge {
+   Terminal?: ComfyDesktop2TerminalBridge
+   Logs?: ComfyDesktop2LogsBridge
+   Telemetry?: ComfyDesktop2TelemetryBridge
++  ComfyStudio?: ComfyDesktop2ComfyStudioBridge
+ }
+ /**
+  * The `-?` mapper intentionally requires every top-level bridge member.
+diff --git a/src/main/host/attach.ts b/src/main/host/attach.ts
+index 71f07a8..6ea82d2 100644
+--- a/src/main/host/attach.ts
++++ b/src/main/host/attach.ts
+@@ -4,6 +4,7 @@ import { attachSessionDownloadHandler } from '../lib/comfyDownloadManager'
+ import { getModelDownloadContentScript } from '../lib/comfyContentScript'
+ import { getComfyTerminalContentScript } from '../lib/comfyTerminalContentScript'
+ import { getMcpSidebarContentScript } from '../lib/mcpSidebarContentScript'
++import { getComfyStudioChatContentScript } from '../lib/comfyStudioChatContentScript'
+ import { getFlagAsync, recordExposure } from '../lib/experiments'
+ import { closeInstallPopouts } from '../lib/popoutWindows'
+ import { _operationAborts, sourceMap } from '../lib/ipc/shared'
+@@ -440,6 +441,11 @@ export function attachInstall(entry: ComfyWindowEntry, opts: AttachInstallOpts):
+     // `comfyTerminalContentScript.ts` for the dedupe guard.
+     if (isLocal && TERMINAL_INJECTION_SOURCE_IDS.has(installation.sourceId)) {
+       comfyContents.executeJavaScript(getComfyTerminalContentScript()).catch(() => {})
++      // comfy-studio chat panel. Always-on for local managed installs, like the
++      // terminal above, and deliberately NOT flag-gated: the script bails out on
++      // its own when the desktop preload exposes no `ComfyStudio` bridge, so an
++      // older shell simply gets no button instead of a broken one.
++      comfyContents.executeJavaScript(getComfyStudioChatContentScript()).catch(() => {})
+       // Local MCP sidebar icon, flag-gated. `getFlagAsync` awaits the in-flight
+       // boot fetch so a cold start (empty cache) still resolves the flag before
+       // the gate decides; a sync read here would see the not-yet-populated cache
+diff --git a/src/main/lib/ipc/index.ts b/src/main/lib/ipc/index.ts
+index 6bd6f37..6c0927e 100644
+--- a/src/main/lib/ipc/index.ts
++++ b/src/main/lib/ipc/index.ts
+@@ -35,6 +35,7 @@ import { registerLogsHandlers } from './registerLogsHandlers'
+ import { registerCrashHandlers } from './registerCrashHandlers'
+ import { registerTelemetryHandlers } from './registerTelemetryHandlers'
+ import { registerDevPlatformHandlers } from './registerDevPlatformHandlers'
++import { registerComfyStudioHandlers } from './registerComfyStudioHandlers'
+ import { reconcileAdoptedSettings } from '../desktopAdopt'
+ import {
+   finalizeComfyBuilderRecovery,
+@@ -323,5 +324,6 @@ export function register(callbacks: RegisterCallbacks = {}): Promise<void> {
+   registerCrashHandlers()
+   registerTelemetryHandlers()
+   registerDevPlatformHandlers()
++  registerComfyStudioHandlers()
+   return startupRecovery.then(() => undefined)
+ }
+diff --git a/src/preload/comfyPreload.ts b/src/preload/comfyPreload.ts
+index f56727f..6f03dc6 100644
+--- a/src/preload/comfyPreload.ts
++++ b/src/preload/comfyPreload.ts
+@@ -2,10 +2,14 @@ import { contextBridge, ipcRenderer } from 'electron'
+ import type { IpcRendererEvent } from 'electron'
+ import type {
+   ComfyDesktop2BridgeImplementation,
++  ComfyDesktop2ComfyStudioBridge,
+   ComfyDesktop2LogsBridge,
+   ComfyDesktop2TelemetryBridge,
+   ComfyDesktop2TerminalBridge,
+   ComfyDownloadProgress,
++  ComfyStudioEventMessage,
++  ComfyStudioRequestResult,
++  ComfyStudioStatus,
+   LogsOutputMsg,
+   LogsRestore,
+   TerminalRestore
+@@ -84,6 +88,36 @@ const Logs: ComfyDesktop2LogsBridge = {
+   }
+ }
+ 
++/**
++ * Desktop-side comfy-studio host (MCP hub + skill catalog + conversation agent).
++ * The canvas chat calls `request(...)` with the host's own method names; host
++ * notifications (agent events) arrive on the `comfy-studio:event` channel.
++ */
++const ComfyStudio: ComfyDesktop2ComfyStudioBridge = {
++  status: (installationId?: string): Promise<ComfyStudioStatus> =>
++    ipcRenderer.invoke('comfy-studio:status', installationId ?? null),
++  start: (installationId?: string): Promise<ComfyStudioStatus> =>
++    ipcRenderer.invoke('comfy-studio:start', installationId ?? null),
++  stop: (installationId?: string): Promise<ComfyStudioStatus> =>
++    ipcRenderer.invoke('comfy-studio:stop', installationId ?? null),
++  request: (
++    method: string,
++    params?: Record<string, unknown>,
++    installationId?: string
++  ): Promise<ComfyStudioRequestResult> =>
++    ipcRenderer.invoke('comfy-studio:request', {
++      method,
++      params,
++      installationId: installationId ?? null
++    }),
++  onEvent: (callback: (message: ComfyStudioEventMessage) => void): (() => void) => {
++    const handler = (_event: IpcRendererEvent, payload: ComfyStudioEventMessage) =>
++      callback(payload)
++    ipcRenderer.on('comfy-studio:event', handler)
++    return () => ipcRenderer.removeListener('comfy-studio:event', handler)
++  }
++}
++
+ const reportFirebaseAuthState: NonNullable<
+   ComfyDesktop2TelemetryBridge['reportFirebaseAuthState']
+ > = (state): void => sendTelemetry('telemetry:firebaseAuthState', state)
+@@ -143,7 +177,8 @@ const bridge = {
+   openMcpSetup,
+   Terminal,
+   Logs,
+-  Telemetry
++  Telemetry,
++  ComfyStudio
+ } satisfies ComfyDesktop2BridgeImplementation
+ 
+ contextBridge.exposeInMainWorld('__comfyDesktop2', bridge)
+diff --git a/src/types/comfyDesktopBridge.ts b/src/types/comfyDesktopBridge.ts
+index 4af3833..a162207 100644
+--- a/src/types/comfyDesktopBridge.ts
++++ b/src/types/comfyDesktopBridge.ts
+@@ -74,6 +74,41 @@ export interface ComfyDesktop2TelemetryBridge {
+   reportFirebaseAuthState?(state: ComfyDesktop2FirebaseAuthState): void
+ }
+ 
++/** Availability of the desktop-side comfy-studio host (MCP client + chat agent). */
++export interface ComfyStudioStatus {
++  installationId: string | null
++  /** False when this install has no usable python/ComfyUI checkout to host from. */
++  available: boolean
++  running: boolean
++  comfyuiDir?: string
++  error?: string
++}
++
++export type ComfyStudioRequestResult =
++  | { ok: true; result: unknown }
++  | { ok: false; error: { code?: number; message: string } }
++
++/** A notification pushed by the host, e.g. an `agent/event` during a chat turn. */
++export interface ComfyStudioEventMessage {
++  installationId: string
++  method: string
++  params: Record<string, unknown>
++}
++
++/** Desktop-side comfy-studio host: MCP hub + skill catalog + conversation agent.
++ *  `request` proxies the host's own JSON-RPC methods (see `lib/comfy_studio/server.py`). */
++export interface ComfyDesktop2ComfyStudioBridge {
++  status(installationId?: string): Promise<ComfyStudioStatus>
++  start(installationId?: string): Promise<ComfyStudioStatus>
++  stop(installationId?: string): Promise<ComfyStudioStatus>
++  request(
++    method: string,
++    params?: Record<string, unknown>,
++    installationId?: string
++  ): Promise<ComfyStudioRequestResult>
++  onEvent(callback: (message: ComfyStudioEventMessage) => void): () => void
++}
++
+ export interface ComfyDesktop2Bridge {
+   /** Reports whether the backend server is cloud/remote, not the user's location.
+    *  Optional: desktop builds predating it are still in the wild. */
+@@ -94,6 +129,7 @@ export interface ComfyDesktop2Bridge {
+   Terminal?: ComfyDesktop2TerminalBridge
+   Logs?: ComfyDesktop2LogsBridge
+   Telemetry?: ComfyDesktop2TelemetryBridge
++  ComfyStudio?: ComfyDesktop2ComfyStudioBridge
+ }
+ 
+ /**

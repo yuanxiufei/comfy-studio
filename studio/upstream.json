@@ -1,0 +1,25 @@
+{
+  "note": "两上游检出的基线记录。attach / detach / doctor 都以 baselineCommit 核对检出，漂移就显式报错，不静默继续。上游升级后跑 npm run attach -- --rebaseline 重新对齐，并核对补丁是否还合得上。",
+  "sides": [
+    {
+      "checkout": "ComfyUI",
+      "upstream": "https://github.com/Comfy-Org/ComfyUI.git",
+      "upstreamVersion": "0.37.0",
+      "baselineCommit": "79be670e2d9be63e238785af307369d2b9039ed1",
+      "baselineSubject": "Mention some ComfyUI optimization details in README. (#16576)",
+      "overlay": "studio/overlay/ComfyUI",
+      "patches": null,
+      "what": "custom_nodes/comfy_studio/ —— skills / mcp / agent 与 /comfy-studio/* 路由（含 tests）。上游 .gitignore 第 8 行忽略 /custom_nodes/，所以这份代码只能靠覆盖层留住。"
+    },
+    {
+      "checkout": "Comfy-Desktop",
+      "upstream": "https://github.com/Comfy-Org/Comfy-Desktop.git",
+      "upstreamVersion": "1.1.3",
+      "baselineCommit": "0b7c4185609e270eeaeebf5bba63bc6d6d71feb5",
+      "baselineSubject": "Add Create Build help tooltip (#1588)",
+      "overlay": "studio/overlay/Comfy-Desktop",
+      "patches": "studio/patches/Comfy-Desktop",
+      "what": "lib/comfy_studio/（MCP 宿主 + skills + agent + 宿主进程接口）与 3 个新增主进程模块；另有 5 个上游文件的接线改动，以补丁形式记在 patches 里。"
+    }
+  ]
+}
