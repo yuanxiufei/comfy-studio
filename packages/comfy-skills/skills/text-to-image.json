@@ -1,0 +1,109 @@
+{
+  "id": "text-to-image",
+  "title": "文生图",
+  "description": "标准文生图：加载 checkpoint，正/负提示词条件化，KSampler 采样后 VAE 解码保存。参数注入到对应节点。",
+  "tags": ["image", "txt2img"],
+  "workflow": {
+    "4": {
+      "class_type": "CheckpointLoaderSimple",
+      "inputs": { "ckpt_name": "" }
+    },
+    "5": {
+      "class_type": "EmptyLatentImage",
+      "inputs": { "width": 1024, "height": 1024, "batch_size": 1 }
+    },
+    "6": {
+      "class_type": "CLIPTextEncode",
+      "inputs": { "text": "", "clip": ["4", 1] }
+    },
+    "7": {
+      "class_type": "CLIPTextEncode",
+      "inputs": { "text": "", "clip": ["4", 1] }
+    },
+    "3": {
+      "class_type": "KSampler",
+      "inputs": {
+        "seed": 0,
+        "steps": 25,
+        "cfg": 7,
+        "sampler_name": "euler",
+        "scheduler": "normal",
+        "denoise": 1,
+        "model": ["4", 0],
+        "positive": ["6", 0],
+        "negative": ["7", 0],
+        "latent_image": ["5", 0]
+      }
+    },
+    "8": {
+      "class_type": "VAEDecode",
+      "inputs": { "samples": ["3", 0], "vae": ["4", 2] }
+    },
+    "9": {
+      "class_type": "SaveImage",
+      "inputs": { "filename_prefix": "comfy-studio", "images": ["8", 0] }
+    }
+  },
+  "params": [
+    {
+      "name": "ckpt_name",
+      "type": "string",
+      "required": true,
+      "node": "4",
+      "field": "ckpt_name",
+      "description": "checkpoint 文件名，先用 list_models 查可用列表"
+    },
+    {
+      "name": "positive",
+      "type": "string",
+      "required": true,
+      "node": "6",
+      "field": "text",
+      "description": "正向提示词"
+    },
+    {
+      "name": "negative",
+      "type": "string",
+      "default": "bad quality, blurry",
+      "node": "7",
+      "field": "text",
+      "description": "负向提示词"
+    },
+    {
+      "name": "width",
+      "type": "integer",
+      "default": 1024,
+      "node": "5",
+      "field": "width"
+    },
+    {
+      "name": "height",
+      "type": "integer",
+      "default": 1024,
+      "node": "5",
+      "field": "height"
+    },
+    {
+      "name": "steps",
+      "type": "integer",
+      "default": 25,
+      "node": "3",
+      "field": "steps"
+    },
+    {
+      "name": "cfg",
+      "type": "number",
+      "default": 7,
+      "node": "3",
+      "field": "cfg"
+    },
+    {
+      "name": "seed",
+      "type": "integer",
+      "default": -1,
+      "node": "3",
+      "field": "seed",
+      "description": "-1 表示每次随机"
+    }
+  ]
+}

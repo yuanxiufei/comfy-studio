@@ -1,0 +1,22 @@
+{
+  "name": "comfy-studio",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ComfyUI 桌面工作台：画布 + Agent/Skill 双模式的本地整合方案",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w comfy-sdk && npm run build -w comfy-skills && npm run build -w comfy-mcp && npm run build -w @comfy-studio/desktop",
+    "app": "npm run build && npm run start --workspace @comfy-studio/desktop",
+    "mcp": "node packages/comfy-mcp/dist/index.js",
+    "typecheck": "npm run typecheck --workspaces"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=18.17.0"
+  }
+}

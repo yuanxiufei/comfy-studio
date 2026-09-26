@@ -1,0 +1,20 @@
+{
+  "name": "comfy-sdk",
+  "version": "0.1.0",
+  "private": true,
+  "description": "本地 ComfyUI 的 HTTP + WebSocket 客户端（对照 server.py 路由实现）",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/ws": "^8.5.0",
+    "typescript": "^5.6.0"
+  }
+}
