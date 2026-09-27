@@ -4,6 +4,10 @@
 （``agent/history`` 先看活会话再看存档、``agent/reset`` 连存档一起删、一轮跑完自动落盘、
 新会话把存档喂回去接着聊）。
 
+多段对话那两下也在这一份里：``agent/sessions`` 把活会话与存档里的会话合成一份清单（一段一行，
+标题取第一句用户话，坏存档如实报错但不清空清单），``agent/close`` 关掉一段 —— 腾出会话位、
+对话留在存档里，与"清对话"的 ``agent/reset`` 分工不同。
+
 另外验会话位满了怎么办（存档让"淘汰"变成无损操作，于是可以自动腾位子；没存档兜底就老实拒绝）。
 
 跑法（引擎 venv 的 python，cwd 在 Comfy-Desktop/lib）::
@@ -28,6 +32,7 @@ from comfy_studio.history import (
     MAX_CONTENT_CHARS,
     MAX_MESSAGES,
     SESSION_SUBDIR,
+    TITLE_CHARS,
     HistoryError,
     SessionHistoryStore,
     entries as history_entries,
@@ -399,6 +404,97 @@ class SessionHistoryStoreTests(unittest.TestCase):
         self.assertEqual(loaded.messages[0].tool_calls[0].arguments, {"n": 1})
         self.assertEqual(loaded.messages[1].name, "t")
 
+    # ---- 列目录（面板那份会话清单） -------------------------------------
+
+    def test_an_empty_directory_lists_nothing(self) -> None:
+        self.assertEqual(self.store.list(), [])
+
+    def test_each_conversation_shows_up_with_its_first_user_line_as_title(self) -> None:
+        # 标题取第一句用户话：那是用户自己给这段对话起的名，比时间戳好认。
+        self.store.save("s1", [ChatMessage(role="user", content="把这张图放大两倍")])
+        self.store.save(
+            "s2",
+            [
+                ChatMessage(role="user", content="赛博朋克海报"),
+                ChatMessage(role="assistant", content="好"),
+            ],
+        )
+        listed = {item.session_id: item for item in self.store.list()}
+        self.assertEqual(set(listed), {"s1", "s2"})
+        self.assertEqual(listed["s1"].title, "把这张图放大两倍")
+        self.assertEqual(listed["s1"].messages, 1)
+        self.assertEqual(listed["s2"].title, "赛博朋克海报")
+        self.assertEqual(listed["s2"].messages, 2)
+        self.assertTrue(listed["s1"].saved_at)
+        self.assertIsNone(listed["s1"].error)
+        # 文件名也报出来：面板要能指着"哪段对话是哪份文件"。
+        self.assertEqual(listed["s1"].file, self.store.path("s1").name)
+        self.assertEqual(listed["s1"].session_id, "s1")
+
+    def test_a_session_never_saved_does_not_show_up(self) -> None:
+        # 一段新对话在说出第一句话之前不占任何地方，清单里就不该出现它。
+        self.assertEqual(self.store.list(), [])
+
+    def test_the_newest_conversation_comes_first(self) -> None:
+        with mock.patch("comfy_studio.history._now", return_value="2026-01-01T00:00:00+00:00"):
+            self.store.save("old", [ChatMessage(role="user", content="早的")])
+        with mock.patch("comfy_studio.history._now", return_value="2026-02-02T00:00:00+00:00"):
+            self.store.save("new", [ChatMessage(role="user", content="近的")])
+        self.assertEqual([item.session_id for item in self.store.list()], ["new", "old"])
+
+    def test_the_title_is_squashed_to_one_line_and_cut(self) -> None:
+        long_line = "这是一句很长的话，" * 10
+        self.store.save("s1", [ChatMessage(role="user", content=f"第一行\n第二行{ long_line}")])
+        listed = self.store.list()[0]
+        self.assertNotIn("\n", listed.title)
+        self.assertTrue(listed.title.endswith("…"), listed.title)
+        self.assertEqual(len(listed.title), TITLE_CHARS + 1)
+        self.assertTrue(listed.title.startswith("第一行 第二行"))
+
+    def test_a_conversation_without_any_user_line_has_no_title(self) -> None:
+        # 理论上不会（一轮总是从用户那句开始），但标题宁可空着，也别拿助手的话冒充。
+        self.store.save("s1", [ChatMessage(role="assistant", content="我先说的")])
+        self.assertEqual(self.store.list()[0].title, "")
+
+    def test_a_broken_file_is_reported_without_emptying_the_list(self) -> None:
+        # 一个坏存档把所有对话从清单里抹掉，用户连"换一段接着聊"都做不到 —— 比多一行红字糟得多。
+        self.store.save("good", [ChatMessage(role="user", content="好好的那句")])
+        good_path = self.store.path("good")
+        junk = good_path.parent / "deadbeef.json"
+        junk.write_text("{ 这不是 JSON", encoding="utf-8")
+
+        listed = self.store.list()
+        self.assertEqual(len(listed), 2)
+        by_file = {item.file: item for item in listed}
+        # 读不了的那条排最后，只认得出文件名（session_id 空着），错误里带着文件在哪。
+        self.assertIsNotNone(listed[-1].error)
+        broke = by_file["deadbeef.json"]
+        self.assertEqual(broke.session_id, "")
+        self.assertEqual(broke.messages, 0)
+        self.assertIn("deadbeef.json", broke.error or "")
+        # 坏文件原样留着（不重建、不删），用户自己决定修还是删。
+        self.assertTrue(junk.exists())
+        self.assertEqual(by_file[good_path.name].title, "好好的那句")
+
+    def test_a_file_that_forgot_its_session_id_is_reported(self) -> None:
+        # 列目录时不知道是谁的、文件里也没自报：没法对到一段对话上，如实报出来。
+        path = self.store.path("s1")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"version": HISTORY_VERSION, "messages": []}), encoding="utf-8")
+        listed = self.store.list()
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0].session_id, "")
+        self.assertEqual(listed[0].file, path.name)
+        self.assertIn("session_id", listed[0].error or "")
+
+    def test_the_listing_is_stable(self) -> None:
+        # 同一份目录列两次不能给出两种顺序（面板上那串会跳）。
+        self.store.save("a", [ChatMessage(role="user", content="甲")])
+        self.store.save("b", [ChatMessage(role="user", content="乙")])
+        first = [item.session_id for item in self.store.list()]
+        second = [item.session_id for item in self.store.list()]
+        self.assertEqual(first, second)
+
 
 class HistoryEntriesTests(unittest.TestCase):
     """面板照着画的那套条目：与实时事件的字段保持一致。"""
@@ -668,6 +764,156 @@ class TurnPersistTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 [m.role for m in store.load(DEFAULT_SESSION).messages], ["user", "assistant", "user", "assistant"]
             )
+
+
+class SessionListAndCloseTests(unittest.IsolatedAsyncioTestCase):
+    """面板那两下：看清单（``agent/sessions``）、关掉一段（``agent/close``）。
+
+    分工：``agent/reset`` 是清对话（连存档一起删），``agent/close`` 只是关掉它 —— 对话留在
+    存档里，同一个 session_id 下次还会被喂回来接着聊。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="comfy-studio-history-")
+        self.dir = Path(self._tmp.name)
+        self.store = SessionHistoryStore(self.dir / SESSION_SUBDIR)
+        # "关掉之后同一个 id 再接回来"要真的建会话，而建会话得有一份能用的模型配置（不连网）。
+        env = mock.patch.dict(os.environ, {"COMFY_STUDIO_LLM_MODEL": "fake-model"})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _build(self, messages: list[ChatMessage]) -> AgentSession:
+        """一个手里已经有几句话说过的活会话（人设那条照旧留着，它不进清单的条数）。"""
+        session = AgentSession(_StubHub(), [_tool()], llm=_FakeLLM())  # type: ignore[arg-type]
+        session.messages = [*session.messages, *messages]
+        return session
+
+    # ---- 清单 -----------------------------------------------------------
+
+    def test_an_empty_host_lists_nothing(self) -> None:
+        result = _make_host(self.store).agent_sessions({}, None)  # type: ignore[arg-type]
+        self.assertEqual(result["sessions"], [])
+        self.assertEqual(result["live"], 0)
+        self.assertEqual(result["max_sessions"], MAX_SESSIONS)
+        self.assertIs(result["history"], True)
+
+    def test_a_live_conversation_shows_up_with_its_title_and_count(self) -> None:
+        host = _make_host(self.store)
+        host._sessions["s1"] = self._build(
+            [ChatMessage(role="user", content="帮我把这张图放大两倍"), ChatMessage(role="assistant", content="好了")]
+        )
+        row = host.agent_sessions({}, None)["sessions"][0]  # type: ignore[arg-type]
+        self.assertEqual(row["session_id"], "s1")
+        self.assertIs(row["live"], True)
+        self.assertIs(row["busy"], False)
+        self.assertEqual(row["title"], "帮我把这张图放大两倍")
+        # 条数不含 system：它是每轮重算的人设，不是对话。
+        self.assertEqual(row["messages"], 2)
+        self.assertIsNone(row["error"])
+
+    def test_the_archive_shows_up_as_a_conversation_that_is_not_live(self) -> None:
+        # 宿主重启后就是这个局面：盘上有对话，内存里什么都没有 —— 清单要能列出来，用户才换得回去。
+        self.store.save("s9", [ChatMessage(role="user", content="上次那句")])
+        row = _make_host(self.store).agent_sessions({}, None)["sessions"][0]  # type: ignore[arg-type]
+        self.assertEqual(row["session_id"], "s9")
+        self.assertIs(row["live"], False)
+        self.assertEqual(row["title"], "上次那句")
+        self.assertEqual(row["messages"], 1)
+
+    def test_the_live_conversation_wins_over_its_own_archive(self) -> None:
+        # 存档要到一轮末尾才写，活会话手里的更全：两边都在时以活的那份为准。
+        self.store.save("s1", [ChatMessage(role="user", content="旧的那句")])
+        host = _make_host(self.store)
+        host._sessions["s1"] = self._build(
+            [
+                ChatMessage(role="user", content="旧的那句"),
+                ChatMessage(role="assistant", content="答了"),
+                ChatMessage(role="user", content="这一轮刚说的"),
+            ]
+        )
+        rows = host.agent_sessions({}, None)["sessions"]  # type: ignore[arg-type]
+        self.assertEqual(len(rows), 1, "同一段对话不该列成两条")
+        self.assertEqual(rows[0]["messages"], 3)
+        self.assertIs(rows[0]["live"], True)
+
+    def test_a_conversation_in_the_middle_of_a_turn_is_marked_busy(self) -> None:
+        host = _make_host(self.store)
+        host._sessions["s1"] = self._build([ChatMessage(role="user", content="在跑的这句")])
+        host._turns["s1"] = CancelToken()
+        self.assertIs(host.agent_sessions({}, None)["sessions"][0]["busy"], True)  # type: ignore[arg-type]
+
+    def test_a_broken_archive_is_a_row_not_an_empty_list(self) -> None:
+        self.store.save("good", [ChatMessage(role="user", content="好好的那段")])
+        junk = self.store.path("good").parent / "deadbeef.json"
+        junk.write_text("{ 不是 JSON", encoding="utf-8")
+        rows = _make_host(self.store).agent_sessions({}, None)["sessions"]  # type: ignore[arg-type]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[-1]["session_id"], "")
+        self.assertEqual(rows[-1]["file"], "deadbeef.json")
+        self.assertIn("deadbeef.json", rows[-1]["error"])
+        self.assertEqual(rows[0]["title"], "好好的那段")
+
+    def test_without_the_archive_the_list_says_so(self) -> None:
+        result = _make_host(None).agent_sessions({}, None)  # type: ignore[arg-type]
+        self.assertEqual(result["sessions"], [])
+        self.assertIs(result["history"], False)
+
+    # ---- 关掉 -----------------------------------------------------------
+
+    async def test_closing_frees_the_slot_and_keeps_the_conversation(self) -> None:
+        self.store.save("s1", [ChatMessage(role="user", content="上次问的")])
+        host = _make_host(self.store)
+        host._sessions["s1"] = self._build([ChatMessage(role="user", content="活着的那句")])
+
+        result = await host.agent_close({"session_id": "s1"}, None)  # type: ignore[arg-type]
+        self.assertEqual(result, {"session_id": "s1", "closed": True, "history_kept": True, "live": 0})
+        self.assertEqual(list(host._sessions), [], "会话位该腾出来")
+        # 对话没丢：存档还在，同一个 id 再用会被喂回来接着聊。
+        self.assertTrue(self.store.path("s1").exists())
+        back = await host._session("s1")
+        self.assertEqual([m.content for m in back.messages if m.role != "system"], ["上次问的"])
+        await host.close()
+
+    async def test_closing_something_that_was_never_live_is_not_an_error(self) -> None:
+        # 幂等：用户连点两下"关掉"，第二下不该报错 —— 结果就是"它本来也没开着"。
+        host = _make_host(self.store)
+        result = await host.agent_close({"session_id": "ghost"}, None)  # type: ignore[arg-type]
+        self.assertEqual(result["closed"], False)
+        self.assertEqual(result["session_id"], "ghost")
+
+    async def test_closing_without_a_session_id_closes_the_default_one(self) -> None:
+        host = _make_host(self.store)
+        host._sessions[DEFAULT_SESSION] = self._build([ChatMessage(role="user", content="默认那段")])
+        result = await host.agent_close({}, None)  # type: ignore[arg-type]
+        self.assertEqual(result["session_id"], DEFAULT_SESSION)
+        self.assertEqual(result["closed"], True)
+
+    async def test_close_is_refused_while_a_turn_is_running(self) -> None:
+        # 那一轮还在往它的 messages 里写，关掉等于把活劈了（而且它收尾时会把存档写回去）。
+        host = _make_host(self.store)
+        host._sessions["s1"] = self._build([ChatMessage(role="user", content="在跑的这句")])
+        host._turns["s1"] = CancelToken()
+        with self.assertRaises(RpcError) as caught:
+            await host.agent_close({"session_id": "s1"}, None)  # type: ignore[arg-type]
+        self.assertEqual(caught.exception.code, INVALID_PARAMS)
+        self.assertIn("agent/cancel", caught.exception.message)
+        self.assertEqual(list(host._sessions), ["s1"], "被拒的关闭不该动会话")
+
+    async def test_closing_without_the_archive_says_the_conversation_is_gone(self) -> None:
+        # --no-history：关掉就等于丢掉那段 —— 这是用户自己点的，所以照办，但要说清。
+        host = _make_host(None)
+        host._sessions["s1"] = self._build([ChatMessage(role="user", content="只有内存里有")])
+        result = await host.agent_close({"session_id": "s1"}, None)  # type: ignore[arg-type]
+        self.assertIs(result["history_kept"], False)
+
+    async def test_a_session_id_that_is_not_a_string_is_refused(self) -> None:
+        host = _make_host(self.store)
+        with self.assertRaises(RpcError) as caught:
+            await host.agent_close({"session_id": 7}, None)  # type: ignore[arg-type]
+        self.assertEqual(caught.exception.code, INVALID_PARAMS)
 
 
 class SessionCapTests(unittest.IsolatedAsyncioTestCase):

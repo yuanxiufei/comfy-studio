@@ -26,6 +26,17 @@ let cachedScript: string | null = null
  * HTTP client behind each idle session, and doing that under a turn in flight
  * would cut it off.
  *
+ * Under it sits the session row: one conversation is one `session_id`, so the row
+ * offers the host's list (`agent/sessions`), switching to another one (repainted
+ * from that conversation's archive), starting a new one (the panel picks the id)
+ * and closing the current one (`agent/close` — frees the slot, keeps the archive,
+ * unlike `agent/reset`, which clears the conversation itself). Unreadable archives
+ * are listed as an unpickable row instead of being dropped, and with `--no-history`
+ * closing really does discard the conversation, so it takes a second click. All
+ * three controls are disabled while a turn is in flight: the answer is painted onto
+ * the conversation that asked, so moving away mid-turn would paint it onto another
+ * one. The only panel state that outlives a reload is which `session_id` it was on.
+ *
  * A turn in flight can be stopped from the composer (`agent/cancel`). Stopping is
  * not a failure: the host still answers `agent/chat` normally, with `cancelled:
  * true`, and the history stays paired so the next message just continues the
@@ -80,6 +91,9 @@ var INPUT_ID = 'comfy-desktop-studio-chat-input';
 var SEND_ID = 'comfy-desktop-studio-chat-send';
 var STOP_ID = 'comfy-desktop-studio-chat-stop';
 var MODEL_ID = 'comfy-desktop-studio-chat-model';
+var SESSION_ID = 'comfy-desktop-studio-chat-session';
+var SESSION_NEW_ID = 'comfy-desktop-studio-chat-session-new';
+var SESSION_CLOSE_ID = 'comfy-desktop-studio-chat-session-close';
 var STORAGE_ID = 'comfy-desktop-studio-chat-storage';
 
 var MUTED = 'var(--content-fg,#9b9b9b)';
@@ -274,6 +288,57 @@ function buildDrawer() {
   controls.appendChild(modelLabel);
   controls.appendChild(model);
 
+  // 会话那一行：一段对话 = 一个 session_id（宿主那边也这么认，见 lib/comfy_studio/server.py）。
+  // 换一段、新开一段、关掉一段都在这一行里，省得再去翻文件。
+  var sessions = document.createElement('div');
+  sessions.style.cssText = 'display:flex;align-items:center;gap:6px;padding:0 12px 8px;';
+
+  var sessionLabel = document.createElement('label');
+  sessionLabel.textContent = '会话';
+  sessionLabel.setAttribute('for', SESSION_ID);
+  sessionLabel.style.cssText = 'color:' + MUTED + ';font-size:11px;white-space:nowrap;';
+
+  var session = document.createElement('select');
+  session.id = SESSION_ID;
+  session.disabled = true;
+  session.title = '正在读宿主的会话清单…';
+  session.style.cssText =
+    'flex:1;min-width:0;box-sizing:border-box;padding:2px 4px;border-radius:4px;' +
+    'border:1px solid ' + BORDER + ';background:' + INPUT_BG + ';color:' + FG + ';' +
+    'font:inherit;font-size:11px;';
+  session.addEventListener('change', function () {
+    switchSession(session.value);
+  });
+
+  var sessionNew = document.createElement('button');
+  sessionNew.id = SESSION_NEW_ID;
+  sessionNew.type = 'button';
+  sessionNew.textContent = '＋';
+  sessionNew.title = '新开一段对话（当前这段留在这里，随时能选回来）';
+  sessionNew.style.cssText =
+    'border:1px solid ' + BORDER + ';border-radius:4px;background:transparent;color:' + MUTED + ';' +
+    'cursor:pointer;font-size:11px;padding:2px 6px;';
+  sessionNew.addEventListener('click', function () {
+    newSession();
+  });
+
+  var sessionClose = document.createElement('button');
+  sessionClose.id = SESSION_CLOSE_ID;
+  sessionClose.type = 'button';
+  sessionClose.textContent = '关掉';
+  sessionClose.title = '把这段对话从宿主里关掉，腾出会话位（对话留在存档里，随时能选回来）';
+  sessionClose.style.cssText =
+    'border:1px solid ' + BORDER + ';border-radius:4px;background:transparent;color:' + MUTED + ';' +
+    'cursor:pointer;font-size:11px;padding:2px 6px;';
+  sessionClose.addEventListener('click', function () {
+    closeSession();
+  });
+
+  sessions.appendChild(sessionLabel);
+  sessions.appendChild(session);
+  sessions.appendChild(sessionNew);
+  sessions.appendChild(sessionClose);
+
   var status = document.createElement('div');
   status.id = STATUS_ID;
   status.textContent = '正在查询宿主状态…';
@@ -336,6 +401,7 @@ function buildDrawer() {
   header.appendChild(close);
   drawer.appendChild(header);
   drawer.appendChild(controls);
+  drawer.appendChild(sessions);
   drawer.appendChild(status);
   drawer.appendChild(storage);
   drawer.appendChild(log);
@@ -382,6 +448,23 @@ function refreshModelEnabled() {
   var model = document.getElementById(MODEL_ID);
   if (!model) return;
   setModelEnabled(!STATE.busy && model.options.length > 0);
+}
+
+function setSessionEnabled(enabled) {
+  var ids = [SESSION_ID, SESSION_NEW_ID, SESSION_CLOSE_ID];
+  for (var i = 0; i < ids.length; i++) {
+    var el = document.getElementById(ids[i]);
+    if (!el) continue;
+    el.disabled = !enabled;
+    el.style.opacity = enabled ? '1' : '0.5';
+    el.style.cursor = enabled ? 'pointer' : 'not-allowed';
+  }
+}
+
+// 换/开/关会话都只在没轮次在飞时允许：一轮的回答是画在**当前这一段**上的，
+// 中途换走就成了"答到别人家去了"。
+function refreshSessionEnabled() {
+  setSessionEnabled(!STATE.busy);
 }
 
 // ---- 消息节点 ----------------------------------------------------------
@@ -652,10 +735,13 @@ function loadModels() {
 // 只在**空抽屉**里补：已经有内容说明这一屏正在画这一轮，再补一遍就成了同一段话
 // 说两遍。
 
-function loadHistory() {
+function loadHistory(sessionId, options) {
+  var id = sessionId || STATE.session;
+  var heading = (options && options.heading) || '上次的对话（存在这台机器上）';
+  var emptyNote = (options && options.emptyNote) || '';
   var log = document.getElementById(LOG_ID);
   if (!log || log.childNodes.length > 0 || STATE.busy) return null;
-  return Promise.resolve(bridge.request('agent/history', { session_id: STATE.session })).then(
+  return Promise.resolve(bridge.request('agent/history', { session_id: id })).then(
     function (response) {
       if (!response || response.ok !== true) {
         // 取不回来就说一句。不说的话用户只看到一段空白，会以为对话被吞了；
@@ -666,7 +752,15 @@ function loadHistory() {
         appendNode(line);
         return 0;
       }
-      return paintHistory(response.result || {});
+      // 换过来的这一段是空的时候也要把标题画上：用户刚点过来，得知道自己站在哪一段上。
+      var painted = paintHistory(response.result || {}, heading, emptyNote !== '');
+      if (painted === 0 && emptyNote !== '') {
+        // 换过来的这一段是空的：留一句话，好过让人对着空抽屉猜"是不是没取到"。
+        var note = makeRow('agent');
+        note.textContent = emptyNote;
+        appendNode(note);
+      }
+      return painted;
     },
     function () {
       // 传输层就没送到（宿主进程不在）：状态栏已经在报，这里不再多插一行。
@@ -675,13 +769,16 @@ function loadHistory() {
   );
 }
 
-function paintHistory(result) {
+function paintHistory(result, heading, forceHeading) {
   var entries = result.entries || [];
-  if (entries.length === 0) return 0;
+  // 开抽屉时（没人点名要标题）空档就留空，别拿一句"上次的对话"占着地方；
+  // 用户自己点过来换的那一段（forceHeading）则相反：标题得有，不然他不知道自己站在哪。
+  if (entries.length === 0 && forceHeading !== true) return 0;
 
   var head = makeRow('agent');
-  head.textContent = '上次的对话（存在这台机器上）';
+  head.textContent = heading || '上次的对话（存在这台机器上）';
   appendNode(head);
+  if (entries.length === 0) return 0;
 
   var dropped = Number(result.dropped) || 0;
   if (dropped > 0) {
@@ -701,6 +798,256 @@ function paintHistory(result) {
     painted++;
   }
   return painted;
+}
+
+// ---- 会话：换一段、新开一段、关掉一段 --------------------------------------
+//
+// 一段对话 = 一个 session_id（宿主那边也这么认：见 lib/comfy_studio/server.py）。宿主的会话位
+// 是有数的（默认 8 段），位子满了要么淘汰最久没用过的（有存档时无损），要么老实拒绝 ——
+// 这一行就是让用户自己管这段事的那只手：看清单（agent/sessions）、换一段（按存档重画）、
+// 新开一段（面板自己挑个新 id）、关掉一段（agent/close：腾位子，对话留在存档里）。
+//
+// 三处"看着像 bug、其实不是"的地方都直说：
+// ① 清单里"读不了"的行：存档坏了，只认得出文件名，点不动 —— 报出来让用户去修或删，
+//    而不是把那一行抹掉假装没有；
+// ② --no-history 那一档：关掉不是"留着下次接着聊"，而是真丢掉，所以要先点两下（第一次只警告）；
+// ③ 新开的一段在说出第一句话之前宿主里根本没有它，清单里也没有 —— 那很正常。
+//
+// 面板只记得"上次停在哪一段"（一个 id，存在浏览器存储里）。对话本身在宿主那儿，不在这：
+// 宿主重启、面板重载，都还能把那一段喂回来。
+
+var SESSION_KEY = 'comfyStudio.session';
+
+// 返回 '' = 没记过；返回 null = 读不到浏览器存储（隐私模式、被禁用）—— 两者不是一回事：
+// 前者是"第一次用"，后者是"这次记不住"，后者要说出来，别拿默认那段冒充上次那段。
+function readSavedSession() {
+  try {
+    var value = window.localStorage.getItem(SESSION_KEY);
+    return typeof value === 'string' ? value : '';
+  } catch (e) {
+    return null;
+  }
+}
+
+function rememberSession(id) {
+  try {
+    window.localStorage.setItem(SESSION_KEY, id);
+  } catch (e) {
+    STATE.remembered = null; // 记不住就如实记在面板自己的账上（会话提示里会说一句）
+  }
+}
+
+function restoreSession() {
+  var remembered = readSavedSession();
+  STATE.remembered = remembered;
+  if (typeof remembered === 'string' && remembered !== '') STATE.session = remembered;
+}
+
+function sessionSelect() {
+  return document.getElementById(SESSION_ID);
+}
+
+function sessionHint(text) {
+  var select = sessionSelect();
+  if (select) select.title = text;
+}
+
+// 会话这一行悬停时说的那句话。两处拼信息：宿主那份清单（条数上限、现在活着几段）与
+// host/info（开没开存档）—— 谁后知道谁重念一遍，所以两边都调这一个函数。
+function sessionHintText() {
+  // "关掉是什么后果"照实说：开着存档是"留着下次接着聊"，没开存档就是"真丢掉"。
+  var closing =
+    STATE.archive === false
+      ? '（这次没开存档：关掉一段就等于丢掉它，所以要点两下）'
+      : STATE.archive === true
+        ? '（关掉只是腾位子，对话留在存档里）'
+        : '（关掉会腾出位子）';
+  var text = '这里能换一段接着聊、新开一段、或者关掉这一段' + closing;
+  var result = STATE.sessions;
+  if (result && typeof result.max_sessions === 'number') {
+    text +=
+      '；它最多同时留 ' +
+      result.max_sessions +
+      ' 段，现在活着 ' +
+      (typeof result.live === 'number' ? result.live : '？') +
+      ' 段';
+  }
+  if (STATE.remembered === null) {
+    text += '；浏览器存储用不了，"上次停在哪一段"这一屏重载后会忘掉（对话本身在宿主那儿）';
+  }
+  return text;
+}
+
+// 清单里那一行的字：标题 + 条数，一眼分得清是哪一段。
+function sessionLabelOf(item) {
+  var title = item.title ? String(item.title) : '（还没说话）';
+  var count = typeof item.messages === 'number' ? item.messages : 0;
+  var mark = item.busy === true ? '在跑' : item.live === true ? '' : '存档里';
+  return title + ' · ' + count + ' 条' + (mark ? '（' + mark + '）' : '');
+}
+
+function fillSessions(list) {
+  var select = sessionSelect();
+  if (!select) return;
+  select.textContent = '';
+  var seen = false;
+  for (var i = 0; i < list.length; i++) {
+    var item = list[i] || {};
+    if (item.error) {
+      // 读不了的存档：只认得出文件名。列出来（用户得知道有这东西），但不给选。
+      var broken = document.createElement('option');
+      broken.value = '';
+      broken.disabled = true;
+      broken.textContent = '读不了：' + (item.file || '（它没报文件名）');
+      broken.title = String(item.error);
+      select.appendChild(broken);
+      continue;
+    }
+    var id = item.session_id ? String(item.session_id) : '';
+    if (id === '') continue;
+    var option = document.createElement('option');
+    option.value = id;
+    option.textContent = sessionLabelOf(item);
+    if (id === STATE.session) {
+      option.textContent += '（当前）';
+      seen = true;
+    }
+    select.appendChild(option);
+  }
+  if (!seen) {
+    // 当前这一段还没出现在宿主的清单里（刚开的新对话、或宿主刚重启还没问起它）：
+    // 补一行，别让下拉停在别的对话上 —— 那会让人以为自己在聊另一段。
+    var mine = document.createElement('option');
+    mine.value = STATE.session;
+    mine.textContent = '（当前）这一段还没跟宿主说过话';
+    select.appendChild(mine);
+  }
+  select.value = STATE.session;
+}
+
+function loadSessions() {
+  return Promise.resolve(bridge.request('agent/sessions')).then(
+    function (response) {
+      if (!response || response.ok !== true) {
+        var error = (response && response.error) || {};
+        STATE.sessions = null;
+        fillSessions([]);
+        sessionHint(
+          '读会话清单失败: ' + (error.message || '未知错误') + '；这一段还能接着聊'
+        );
+        refreshSessionEnabled();
+        return null;
+      }
+      var result = response.result || {};
+      if (!(result.sessions instanceof Array)) {
+        // 宿主的回话里没有清单（版本对不上之类）：别装作"你就这一段"，直说。
+        STATE.sessions = null;
+        fillSessions([]);
+        sessionHint('宿主没给会话清单：这一段还能接着聊，别处那几段看不到');
+        refreshSessionEnabled();
+        return null;
+      }
+      STATE.sessions = result;
+      fillSessions(result.sessions);
+      sessionHint(sessionHintText());
+      refreshSessionEnabled();
+      return result;
+    },
+    function () {
+      // 传输层就没送到（宿主进程不在）：状态栏已经在报同一件事，这里不抢话。
+      STATE.sessions = null;
+      fillSessions([]);
+      sessionHint('宿主不在，看不到别的对话');
+      refreshSessionEnabled();
+      return null;
+    }
+  );
+}
+
+// 清空消息区，准备画另一段对话（换段与关掉之后都要清，别把上一段的答案留在屏幕上）。
+function clearLog() {
+  var log = logEl();
+  if (log) log.textContent = '';
+  STATE.pending = null;
+  STATE.cards = {};
+  STATE.planCard = null;
+}
+
+// 新会话的 id 由面板挑：宿主只认"一个字符串"，没聊起来之前这一段在它那儿根本不存在
+// （也就不占会话位）。用时间戳生成，宿主那个目录里一眼看得出先后。
+function nextSessionId() {
+  return 'chat-' + Date.now().toString(36);
+}
+
+function newSession() {
+  if (STATE.busy) return;
+  STATE.closeArmed = false;
+  STATE.session = nextSessionId();
+  rememberSession(STATE.session);
+  clearLog();
+  loadSessions();
+  setStatus('新的一段对话；说一句它就开始了');
+  var input = document.getElementById(INPUT_ID);
+  if (input) input.focus();
+}
+
+function switchSession(id) {
+  if (STATE.busy || !id || id === STATE.session) return;
+  STATE.closeArmed = false;
+  STATE.session = id;
+  rememberSession(id);
+  clearLog();
+  setStatus('换到这一段了');
+  loadHistory(id, {
+    heading: '这一段对话（存在这台机器上）',
+    emptyNote: '这一段还没说过话'
+  });
+  loadSessions();
+}
+
+function closeSession() {
+  if (STATE.busy) return;
+  // 只有**确认**存档开着时，关掉才是"留着下次接着聊"这种可逆的事，点一下就够。
+  // 没开存档（--no-history）= 关掉就是真丢掉；连存不存都不知道（拿不到 host/info）时
+  // 也先按"可能要丢"对待 —— 丢掉一段对话只能由用户自己点两下，宁可多问一句。
+  if (STATE.archive !== true && STATE.closeArmed !== true) {
+    STATE.closeArmed = true;
+    setStatus(
+      STATE.archive === false
+        ? '这次没开对话存档（--no-history）：再点一下「关掉」就是真丢掉这一段'
+        : '还没问到宿主存不存对话：再点一下「关掉」就关掉它（有存档的话对话会留着）',
+      'error'
+    );
+    return;
+  }
+  STATE.closeArmed = false;
+  setSessionEnabled(false);
+  setStatus('正在关掉这一段…');
+  Promise.resolve(bridge.request('agent/close', { session_id: STATE.session })).then(
+    function (response) {
+      if (!response || response.ok !== true) {
+        var error = (response && response.error) || {};
+        addError('关掉这一段失败: ' + (error.message || '未知错误'), error.code);
+        setStatus('这一段还开着', 'error');
+        refreshSessionEnabled();
+        return;
+      }
+      var result = response.result || {};
+      // 关掉之后接着开一段新的：关掉的意思是"这一段我聊完了"，不是"我要看着它空着"。
+      // 上一段按宿主说的留没留住，由下面那句话交代（newSession 会先写自己那句状态）。
+      var kept = result.history_kept === true;
+      var missed = result.closed !== true;
+      newSession();
+      if (missed) setStatus('这一段本来就没在宿主里开着（没说过话）');
+      else if (kept) setStatus('已关掉这一段；对话留在存档里，选它就能接着说');
+      else setStatus('已关掉这一段；这次没开存档，那段对话就此没了', 'error');
+    },
+    function (err) {
+      addError('关掉这一段失败: ' + message(err));
+      setStatus('这一段还开着', 'error');
+      refreshSessionEnabled();
+    }
+  );
 }
 
 // ---- 它记在哪 ------------------------------------------------------------
@@ -751,6 +1098,12 @@ function paintStorage(info) {
   var where = [];
   if (info.memory_file) where.push('记忆：' + info.memory_file);
   if (info.history_dir) where.push('对话存档：' + info.history_dir);
+
+  // 开没开存档先记下来：面板的"关掉"要不要先警告一次，就看它（见 closeSession）。
+  // 就算记忆那一行报红先返回，这一条也得记 —— 它管的是会话那行，不是这一行。
+  STATE.archive = info.history === true ? true : info.history === false ? false : null;
+  // 会话那行的悬停提示里也有"关掉是什么后果"（它可能比这一行先拼好）：现在知道了就重念一遍。
+  sessionHint(sessionHintText());
 
   if (info.memory_error) {
     setStorage(
@@ -859,9 +1212,11 @@ function sendTurn() {
   if (text === '') return;
 
   STATE.busy = true;
+  STATE.closeArmed = false;
   setSendEnabled(false);
   setStopVisible(true);
-  refreshModelEnabled(); // 一轮在飞时不换模型，免得把这一轮打断
+  refreshModelEnabled(); // 一轮在飞时不换模型、不换会话，免得把这一轮打断或答到别的段上
+  refreshSessionEnabled();
   input.value = '';
   addUser(text);
   setStatus('agent 正在处理…');
@@ -880,11 +1235,15 @@ function sendTurn() {
     setSendEnabled(true);
     setStopVisible(false);
     refreshModelEnabled();
+    refreshSessionEnabled();
     // 这一轮可能刚记下一条事或刚把记忆文件弄坏：再看一眼，别让那一行停在旧话上。
     loadStorage();
+    // 这一轮过后这段对话的样子也变了（第一句话成了它的标题、条数加了）：
+    // 清单跟着刷新，用户才看得见"它现在叫什么"。
+    loadSessions();
   };
 
-  bridge.request('agent/chat', { text: text }).then(
+  bridge.request('agent/chat', { text: text, session_id: STATE.session }).then(
     function (response) {
       if (!response || response.ok !== true) {
         var error = (response && response.error) || {};
@@ -960,16 +1319,19 @@ function refreshStatus() {
         setStatus(status && status.error ? status.error : '宿主不可用', 'error');
         setSendEnabled(false);
         setModelEnabled(false);
+        setSessionEnabled(false);
         return status;
       }
       setStatus(status.running ? 'MCP 宿主运行中' : '宿主待启动（发消息时自动拉起）');
       setSendEnabled(true);
       refreshModelEnabled();
+      refreshSessionEnabled();
       return status;
     },
     function (err) {
       setStatus('查询宿主状态失败: ' + message(err), 'error');
       setSendEnabled(false);
+      setSessionEnabled(false);
       return null;
     }
   );
@@ -981,11 +1343,14 @@ function openDrawer() {
   if (!drawer) return;
   drawer.style.display = 'flex';
   STATE.open = true;
+  // 关抽屉就把"关掉"的第二次点击收回去：隔了半天再点一下不该把一段对话丢掉。
+  STATE.closeArmed = false;
   var input = document.getElementById(INPUT_ID);
   if (input) input.focus();
   refreshStatus();
   loadModels();
   loadHistory();
+  loadSessions();
   loadStorage();
 }
 
@@ -1058,6 +1423,9 @@ function inject() {
 function start() {
   if (STATE.started) return;
   STATE.started = true;
+  // 先认回"上次停在哪一段"：面板一重载（切画面、宿主重启）就只剩一个空抽屉，
+  // 而宿主那边那段对话还在 —— 不认回来，下一句就说到默认那段上去了。
+  restoreSession();
   STATE.unsubscribe = bridge.onEvent(onEvent);
 
   var injected = inject();
@@ -1500,7 +1868,8 @@ export function getComfyStudioChatContentScript(): string {
     `if (!window.__comfyDesktop2.ComfyStudio) return;\n` +
     `if (window.__comfyStudioChat) return;\n` +
     `window.__comfyStudioChat = { started: false, open: false, busy: false, turn: null, ` +
-    `model: '', session: 'default', pending: null, cards: {}, planCard: null };\n` +
+    `model: '', session: 'default', sessions: null, closeArmed: false, ` +
+    `remembered: '', archive: null, pending: null, cards: {}, planCard: null };\n` +
     STUDIO_CHAT_MAIN_JS +
     `})();\n`
   return cachedScript

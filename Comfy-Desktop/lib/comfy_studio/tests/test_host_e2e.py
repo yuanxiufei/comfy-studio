@@ -28,6 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from comfy_studio.history import SESSION_SUBDIR
+from comfy_studio.server import MAX_SESSIONS
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 COMFYUI_DIR = REPO_ROOT / "ComfyUI"
@@ -868,6 +869,62 @@ class StudioHostE2ETest(unittest.TestCase):
         self.assertEqual(entries[0].get("type"), "user")
         self.assertEqual(entries[-1].get("type"), "assistant")
         self.assertEqual([e["text"] for e in entries if e.get("type") == "user"][-1], ask)
+
+    def test_22_sessions_can_be_listed_and_closed(self) -> None:
+        """面板那两下：看清单（``agent/sessions``）、关掉一段（``agent/close``）。
+
+        关掉**不等于**清掉：对话留在盘上，同一个 id 再问一句会被喂回来接着聊 —— 这是它敢
+        在 ``--no-history`` 那一档之外当"腾位子"手段的前提。
+        """
+        session = "sessions-e2e"
+        asked = "先开一段自己的对话"
+        opened = self.call(42, "agent/chat", {"text": asked, "session_id": session}, timeout=SKILLS_TIMEOUT)
+        self.assertNotIn("error", opened, opened)
+
+        listing = self.call(43, "agent/sessions").get("result", {})
+        rows = {row.get("session_id"): row for row in listing.get("sessions", [])}
+        self.assertIn(session, rows, listing)
+        mine = rows[session]
+        self.assertIs(mine.get("live"), True)
+        self.assertIs(mine.get("busy"), False)
+        self.assertEqual(mine.get("title"), asked, mine)
+        self.assertGreater(mine.get("messages"), 1)
+        self.assertEqual(listing.get("max_sessions"), MAX_SESSIONS)
+        self.assertIs(listing.get("history"), True)
+
+        closed = self.call(44, "agent/close", {"session_id": session}).get("result", {})
+        self.assertIs(closed.get("closed"), True, closed)
+        self.assertIs(closed.get("history_kept"), True, closed)
+
+        # 位子真腾出来了：清单里那一段还在，但已经不活着了（下次会被从存档喂回来）。
+        rows = {
+            row.get("session_id"): row
+            for row in self.call(45, "agent/sessions").get("result", {}).get("sessions", [])
+        }
+        self.assertIs(rows[session].get("live"), False, "关掉之后不该还活着")
+
+        # 再关一次不是错误：结果就是"它本来也没开着"（用户连点两下不该吃个红字）。
+        again = self.call(46, "agent/close", {"session_id": session}).get("result", {})
+        self.assertIs(again.get("closed"), False, again)
+
+        # 对话没丢：接着说一句，宿主该把存档喂回来再答（这一轮照常走完工具再回话）。
+        back = self.call(
+            47,
+            "agent/chat",
+            {"text": "关掉之后还认得刚才那段吗？", "session_id": session},
+            timeout=SKILLS_TIMEOUT,
+        )
+        self.assertNotIn("error", back, back)
+        answer = back.get("result", {})
+        self.assertEqual(answer.get("session_id"), session)
+        self.assertTrue(answer.get("text"), answer)
+
+        # 又聊起来 = 又开了一段，位子重新占上。
+        rows = {
+            row.get("session_id"): row
+            for row in self.call(48, "agent/sessions").get("result", {}).get("sessions", [])
+        }
+        self.assertIs(rows[session].get("live"), True, "说话之后它又该活着")
 
 
 if __name__ == "__main__":

@@ -58,6 +58,9 @@ MAX_CONTENT_CHARS = 4000
 #: 截断标记里带的说明，模型与用户都能看见"这里不是原文"。
 TRUNCATED_MARK = "…（存档已截断 {dropped} 字符）"
 
+#: 会话清单里给标题留多少字符（标题取第一句用户话，面板那行放不下更长的）。
+TITLE_CHARS = 40
+
 
 class HistoryError(RuntimeError):
     """对话存档层面的错误：session_id 不合法、文件读不了、格式不认识、消息形状不对。"""
@@ -67,6 +70,8 @@ class HistoryError(RuntimeError):
 class SessionHistory:
     """一次读档的结果。"""
 
+    #: 这份存档是哪个会话的（文件里自报的那个 —— 读的时候已经与问过的 id 核对过）。
+    session_id: str
     #: 可以直接喂回会话的消息（不含 system —— 它每轮重算）。
     messages: tuple[ChatMessage, ...]
     #: 因为超过 :data:`MAX_MESSAGES` 而被丢掉的消息条数（手工改过或旧版本写的文件才会 > 0）。
@@ -75,8 +80,48 @@ class SessionHistory:
     saved_at: str
 
 
+@dataclass(frozen=True)
+class SessionSummary:
+    """一段对话的摘要 —— 面板那份"你有几段对话"的清单就照它画。
+
+    它**不是**一次读档的结果（不带着整段对话），只够画一行：标题、条数、上次落盘时间。
+    """
+
+    #: 文件里自报的会话 id；文件读不出来时是空串（那就只认得出 ``file``）。
+    session_id: str
+    #: 存档文件名（读不出来时，这是唯一能指给用户看的东西）。
+    file: str
+    #: 存下来的消息条数（读不出来时是 0）。
+    messages: int
+    #: 上次落盘时间（ISO 8601，UTC）；读不出来时是空串。
+    saved_at: str
+    #: 标题：第一句用户话，压成一行、按 :data:`TITLE_CHARS` 截断；一句用户话都没有就是空串。
+    title: str
+    #: 这个文件读不了的原因（原样给用户看）；读得了就是 None。
+    error: str | None = None
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _one_line(text: str) -> str:
+    """压成一行并按 :data:`TITLE_CHARS` 截断 —— 标题要能在下拉里一行放得下。"""
+    flat = " ".join(text.split())
+    if len(flat) <= TITLE_CHARS:
+        return flat
+    return flat[:TITLE_CHARS] + "…"
+
+
+def title_of(messages: Sequence[ChatMessage]) -> str:
+    """标题取**第一句用户话**：那是用户自己给这段对话起的名，比时间戳好认。
+
+    给会话清单用；活会话读内存里的那份、存档会话读盘上那份，两边同一套算法。
+    """
+    for message in messages:
+        if message.role == "user" and message.content.strip():
+            return _one_line(message.content)
+    return ""
 
 
 def _clean_session_id(value: Any) -> str:
@@ -291,7 +336,54 @@ class SessionHistoryStore:
         session_id = _clean_session_id(session_id)
         path = self.path(session_id)
         if not path.exists():
-            return SessionHistory(messages=(), dropped=0, saved_at="")
+            return SessionHistory(session_id=session_id, messages=(), dropped=0, saved_at="")
+        return self._read(path, expected=session_id)
+
+    def list(self) -> list[SessionSummary]:
+        """列出目录里所有聊过的对话（面板那份会话清单就照它画）。
+
+        一个文件读不了**不让整份清单失败**：那一段如实带上 ``error``（此时只认得出文件名，
+        session_id 是空的），别的照旧列出来 —— 一个坏存档把所有对话都从清单里抹掉，用户连
+        "换一段接着聊"都做不到，比多一行红字糟得多。读不了的文件一律原样留着，不重建。
+
+        排序按上次落盘时间倒序（最近的排前面），没写时间的排最后、按 id 兜底 —— 清单要稳定，
+        同一份目录列两次不能给出两种顺序。
+        """
+        if not self.directory.is_dir():
+            return []
+        out: list[SessionSummary] = []
+        for path in sorted(self.directory.glob("*.json")):
+            try:
+                loaded = self._read(path, expected=None)
+            except HistoryError as err:
+                out.append(
+                    SessionSummary(
+                        session_id="",
+                        file=path.name,
+                        messages=0,
+                        saved_at="",
+                        title="",
+                        error=str(err),
+                    )
+                )
+                continue
+            out.append(
+                SessionSummary(
+                    session_id=loaded.session_id,
+                    file=path.name,
+                    messages=len(loaded.messages),
+                    saved_at=loaded.saved_at,
+                    title=title_of(loaded.messages),
+                )
+            )
+        out.sort(key=lambda item: (item.saved_at, item.session_id), reverse=True)
+        return out
+
+    def _read(self, path: Path, expected: str | None) -> SessionHistory:
+        """读一份存档文件。``expected`` 给 None 表示"不知道是谁的，以文件里自报的为准"（列目录用）。
+
+        除了这一处核对，两条路要挑的刺完全一样 —— 所以只有这一份实现，别在两边各写一遍。
+        """
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as err:
@@ -307,9 +399,13 @@ class SessionHistoryStore:
                 f"对话存档的版本不认（{path}）：文件里是 {version!r}，"
                 f"这个版本只认 {HISTORY_VERSION}。旧版本的存档读不了，删掉它就能重新开始"
             )
-        if raw.get("session_id") != session_id:
+        declared = raw.get("session_id")
+        if expected is None:
+            if not isinstance(declared, str) or declared.strip() == "":
+                raise HistoryError(f"对话存档里没写 session_id（{path}）：不知道这是哪段对话")
+        elif declared != expected:
             raise HistoryError(
-                f"对话存档对不上会话（{path}）：文件里记的是 {raw.get('session_id')!r}，"
+                f"对话存档对不上会话（{path}）：文件里记的是 {declared!r}，"
                 "问的是别的会话。多半是文件被挪过或改过，删掉它就能重新开始"
             )
         raw_messages = raw.get("messages")
@@ -320,6 +416,7 @@ class SessionHistoryStore:
         kept, dropped = _trim(messages)
         saved_at = raw.get("saved_at")
         return SessionHistory(
+            session_id=declared if isinstance(declared, str) else "",
             messages=tuple(kept),
             dropped=dropped,
             saved_at=saved_at if isinstance(saved_at, str) else "",
@@ -386,8 +483,11 @@ __all__ = [
     "MAX_CONTENT_CHARS",
     "MAX_MESSAGES",
     "SESSION_SUBDIR",
+    "TITLE_CHARS",
     "HistoryError",
     "SessionHistory",
     "SessionHistoryStore",
+    "SessionSummary",
     "entries",
+    "title_of",
 ]

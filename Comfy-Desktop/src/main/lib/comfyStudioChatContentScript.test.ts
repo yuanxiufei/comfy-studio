@@ -9,6 +9,9 @@ const INPUT_ID = 'comfy-desktop-studio-chat-input'
 const SEND_ID = 'comfy-desktop-studio-chat-send'
 const STOP_ID = 'comfy-desktop-studio-chat-stop'
 const MODEL_ID = 'comfy-desktop-studio-chat-model'
+const SESSION_ID = 'comfy-desktop-studio-chat-session'
+const SESSION_NEW_ID = 'comfy-desktop-studio-chat-session-new'
+const SESSION_CLOSE_ID = 'comfy-desktop-studio-chat-session-close'
 const STORAGE_ID = 'comfy-desktop-studio-chat-storage'
 
 interface StudioBridge {
@@ -103,6 +106,8 @@ describe('getComfyStudioChatContentScript', () => {
     vi.clearAllTimers()
     vi.useRealTimers()
     document.body.innerHTML = ''
+    // 面板只往浏览器存储里记一件事："上次停在哪一段"。别让上一个用例的那一段漏进下一个。
+    window.localStorage.clear()
     Reflect.deleteProperty(window, '__comfyDesktop2')
     Reflect.deleteProperty(window, '__comfyStudioChat')
     Reflect.deleteProperty(window, 'comfyAPI')
@@ -188,7 +193,11 @@ describe('getComfyStudioChatContentScript', () => {
 
     await send('帮我把这张图放大两倍')
 
-    expect(bridge.request).toHaveBeenCalledWith('agent/chat', { text: '帮我把这张图放大两倍' })
+    // 一段对话 = 一个 session_id：这一轮要说到**当前这一段**上（面板默认是 default）。
+    expect(bridge.request).toHaveBeenCalledWith('agent/chat', {
+      text: '帮我把这张图放大两倍',
+      session_id: 'default'
+    })
     expect(rows('user').map((r) => r.textContent)).toEqual(['帮我把这张图放大两倍'])
     expect(rows('assistant').map((r) => r.textContent)).toEqual(['答案在此'])
     const input = document.getElementById(INPUT_ID) as HTMLTextAreaElement
@@ -324,6 +333,273 @@ describe('getComfyStudioChatContentScript', () => {
       const asked = bridge.request.mock.calls.filter((call) => call[0] === 'agent/history')
       expect(asked, 'history is only worth asking for an empty drawer').toHaveLength(1)
       expect(rows('user').map((r) => r.textContent)).toEqual(['上次问的', '这一轮问的'])
+    })
+  })
+
+  describe('many conversations side by side', () => {
+    /**
+     * 只有会话那两件事走自己的桩：开抽屉时面板还会问模型目录与 host/info，那些保持默认。
+     * `row` 就是宿主 agent/sessions 给的一行（见 lib/comfy_studio/server.py）。
+     */
+    const row = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+      session_id: 'default',
+      live: true,
+      busy: false,
+      messages: 2,
+      saved_at: '2026-09-27T10:00:00+00:00',
+      title: '帮我把这张图放大两倍',
+      file: 'aaaa.json',
+      error: null,
+      ...over
+    })
+
+    const host = (
+      sessions: unknown,
+      over: { history?: unknown } = {}
+    ): RequestStub => (method: string) => {
+      if (method === 'agent/sessions') return { ok: true, result: { sessions, live: 1, max_sessions: 8 } }
+      if (method === 'agent/history') return over.history ?? { ok: true, result: { entries: [] } }
+      return { ok: true, result: { text: '答案在此' } }
+    }
+
+    const picker = (): HTMLSelectElement =>
+      document.getElementById(SESSION_ID) as HTMLSelectElement
+    const state = (): { session?: string } =>
+      Reflect.get(window, '__comfyStudioChat') as { session?: string }
+
+    it('opens on the conversation it was last on, and says when it cannot remember', async () => {
+      window.localStorage.setItem('comfyStudio.session', 'chat-xyz')
+      const bridge = installBridge({ request: host([]) })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      // 面板只记得"停在哪一段"；那一段的话由宿主喂回来（面板这屏重载过也一样接着聊）。
+      expect(bridge.request).toHaveBeenCalledWith('agent/history', { session_id: 'chat-xyz' })
+      expect(picker().value).toBe('chat-xyz')
+      expect(picker().options).toHaveLength(1)
+      expect(picker().options[0]?.textContent).toContain('（当前）')
+    })
+
+    it('lists the conversations the host knows, current one included', async () => {
+      installBridge({
+        request: host([
+          row(),
+          row({ session_id: 'chat-2', live: false, title: '赛博朋克海报', messages: 6 }),
+          row({ session_id: 'chat-3', live: true, busy: true, title: '', messages: 0 })
+        ])
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      expect(Array.from(picker().options).map((o) => o.value)).toEqual([
+        'default',
+        'chat-2',
+        'chat-3'
+      ])
+      const labels = Array.from(picker().options).map((o) => o.textContent ?? '')
+      expect(labels[0]).toBe('帮我把这张图放大两倍 · 2 条（当前）')
+      expect(labels[1], '只在存档里的一段也说清它不占位子').toBe('赛博朋克海报 · 6 条（存档里）')
+      expect(labels[2], '在跑的那段标出来，也说明它还没说过话').toBe('（还没说话） · 0 条（在跑）')
+    })
+
+    it('switching repaints the drawer from that conversation archive', async () => {
+      const bridge = installBridge({
+        request: (method: string, params: unknown): unknown => {
+          if (method === 'agent/sessions') {
+            return {
+              ok: true,
+              result: {
+                sessions: [row(), row({ session_id: 'chat-2', title: '赛博朋克海报' })],
+                max_sessions: 8
+              }
+            }
+          }
+          if (method === 'agent/history') {
+            const asked = (params as { session_id?: string } | null)?.session_id
+            return asked === 'chat-2'
+              ? { ok: true, result: { entries: [{ type: 'user', text: '赛博朋克海报' }] } }
+              : { ok: true, result: { entries: [{ type: 'user', text: '这张图放大两倍' }] } }
+          }
+          return { ok: true, result: { text: '答案在此' } }
+        }
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      expect(rows('user').map((r) => r.textContent)).toEqual(['这张图放大两倍'])
+
+      picker().value = 'chat-2'
+      picker().dispatchEvent(new Event('change'))
+      await flush()
+
+      expect(state().session).toBe('chat-2')
+      const asked = bridge.request.mock.calls.filter((call) => call[0] === 'agent/history')
+      expect(asked[asked.length - 1]).toEqual(['agent/history', { session_id: 'chat-2' }])
+      expect(rows('user').map((r) => r.textContent)).toEqual(['赛博朋克海报'])
+      // 换过来画的是**这一段**，不是"上次的"：标签得跟着变，别让人以为串了。
+      expect(rows('agent')[0]?.textContent).toBe('这一段对话（存在这台机器上）')
+    })
+
+    it('says a switched-to conversation has nothing in it yet', async () => {
+      installBridge({
+        request: host([row(), row({ session_id: 'chat-2', title: '空的那段', messages: 0 })])
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      picker().value = 'chat-2'
+      picker().dispatchEvent(new Event('change'))
+      await flush()
+
+      expect(rows('agent').map((r) => r.textContent)).toEqual([
+        '这一段对话（存在这台机器上）',
+        '这一段还没说过话'
+      ])
+    })
+
+    it('keeps a broken archive visible but not pickable', async () => {
+      installBridge({
+        request: host([
+          row(),
+          { session_id: '', file: 'deadbeef.json', error: '对话存档读不了（…deadbeef.json）：坏了' }
+        ])
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      const broken = picker().options[1]
+      expect(broken?.textContent).toBe('读不了：deadbeef.json')
+      expect(broken?.disabled).toBe(true)
+      expect(broken?.title).toContain('deadbeef.json')
+    })
+
+    it('starts a new conversation with an id of its own and says so', async () => {
+      const bridge = installBridge({ request: host([row()]) })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      document.getElementById(SESSION_NEW_ID)?.click()
+      await flush()
+
+      const fresh = state().session
+      expect(fresh, '新的一段要换个 id，不能还写在 default 上').not.toBe('default')
+      expect(fresh).toMatch(/^chat-/)
+      expect(document.getElementById(LOG_ID)?.childNodes).toHaveLength(0)
+      expect(picker().value).toBe(fresh)
+      expect(document.getElementById(STATUS_ID)?.textContent).toContain('新的一段对话')
+
+      // 下一句要落到新那一段上。
+      await send('新的一段第一句')
+      expect(bridge.request).toHaveBeenCalledWith('agent/chat', {
+        text: '新的一段第一句',
+        session_id: fresh
+      })
+    })
+
+    it('closing hands the conversation back and moves on to a new one', async () => {
+      const bridge = installBridge({
+        request: (method: string): unknown => {
+          if (method === 'host/info') {
+            return { ok: true, result: { history: true, memory: true, memory_entries: 0 } }
+          }
+          if (method === 'agent/sessions') {
+            return { ok: true, result: { sessions: [row()], max_sessions: 8 } }
+          }
+          if (method === 'agent/close') {
+            return { ok: true, result: { session_id: 'default', closed: true, history_kept: true } }
+          }
+          return { ok: true, result: { text: '答案在此' } }
+        }
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      document.getElementById(SESSION_CLOSE_ID)?.click()
+      await flush()
+
+      expect(bridge.request).toHaveBeenCalledWith('agent/close', { session_id: 'default' })
+      // 关掉 = 腾位子，对话留在存档里：这话得说出来，用户才敢关。
+      expect(document.getElementById(STATUS_ID)?.textContent).toBe(
+        '已关掉这一段；对话留在存档里，选它就能接着说'
+      )
+      expect(state().session).not.toBe('default')
+      expect(rows('error')).toHaveLength(0)
+    })
+
+    it('asks again before dropping a conversation when there is no archive', async () => {
+      const bridge = installBridge({
+        request: (method: string): unknown => {
+          if (method === 'host/info') {
+            return { ok: true, result: { history: false, memory: true, memory_entries: 0 } }
+          }
+          if (method === 'agent/sessions') return { ok: true, result: { sessions: [row()] } }
+          return { ok: true, result: { text: '答案在此' } }
+        }
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      document.getElementById(SESSION_CLOSE_ID)?.click()
+      await flush()
+
+      const closed = bridge.request.mock.calls.filter((call) => call[0] === 'agent/close')
+      expect(closed, '这一档下关掉就是丢掉，得先问一句').toHaveLength(0)
+      expect(document.getElementById(STATUS_ID)?.textContent).toContain('--no-history')
+      expect(state().session, '还没关，这一段还在').toBe('default')
+
+      document.getElementById(SESSION_CLOSE_ID)?.click()
+      await flush()
+
+      expect(bridge.request).toHaveBeenCalledWith('agent/close', { session_id: 'default' })
+    })
+
+    it('asks again when the host never said whether there is an archive', async () => {
+      // 拿不到 host/info 就是"存不存不知道"：那时也先当成可能会丢，多问一句——
+      // 宁可多点一下，也别在一次点击里丢掉一段可能没有存档的对话。
+      const bridge = installBridge({
+        request: (method: string): unknown =>
+          method === 'agent/sessions' ? { ok: true, result: { sessions: [row()] } } : { ok: true, result: { text: '答案在此' } }
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      document.getElementById(SESSION_CLOSE_ID)?.click()
+      await flush()
+
+      expect(bridge.request.mock.calls.filter((call) => call[0] === 'agent/close')).toHaveLength(0)
+      expect(document.getElementById(STATUS_ID)?.textContent).toContain('还没问到')
+    })
+
+    it('locks the session row while a turn is in flight', async () => {
+      installBridge({
+        request: (method: string): unknown =>
+          method === 'agent/chat' ? new Promise(() => {}) : host([row()])(method, null)
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      const select = picker()
+      const add = document.getElementById(SESSION_NEW_ID) as HTMLButtonElement
+      const close = document.getElementById(SESSION_CLOSE_ID) as HTMLButtonElement
+      expect(select.disabled).toBe(false)
+
+      const input = document.getElementById(INPUT_ID) as HTMLTextAreaElement
+      input.value = '跑个 skill'
+      document.getElementById(SEND_ID)?.click() // 不 await：让这一轮停在飞行中
+
+      // 换走会把这一轮的回答画到别的对话上；关掉会把活劈了（宿主那边也会拒）。
+      expect(select.disabled).toBe(true)
+      expect(add.disabled).toBe(true)
+      expect(close.disabled).toBe(true)
     })
   })
 

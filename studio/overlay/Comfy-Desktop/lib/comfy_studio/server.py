@@ -22,6 +22,8 @@
 ``agent/answer``         审核通道的回程：``{call_id, answer}`` → 唤醒等着的提问
 ``agent/plan_result``    计划通道的回程：``{call_id, approved, feedback?}`` → 唤醒等着的确认
 ``agent/history``        ``{session_id?}`` → 这个会话说过的话（面板重开时照着重画）
+``agent/sessions``       面板那份会话清单：活着的 + 存档里的，一行一段（含标题、条数、在跑）
+``agent/close``          ``{session_id?}`` → 关掉一段对话（腾出会话位，对话留在存档里）
 ``agent/reset``          清空某个会话的历史与它的存档（这一轮在跑就拒绝，免得被收尾写回来）
 ======================  ==============================================
 
@@ -56,7 +58,13 @@ from .agent import (
 from .canvas import CanvasChannel, CanvasClient
 from .cancel import CancelToken, Cancelled
 from .channel import bind_emit, unbind_emit
-from .history import SESSION_SUBDIR, HistoryError, SessionHistoryStore, entries as history_entries
+from .history import (
+    SESSION_SUBDIR,
+    HistoryError,
+    SessionHistoryStore,
+    entries as history_entries,
+    title_of,
+)
 from .localfiles import LocalFiles, LocalFilesClient
 from .memory import MemoryClient, MemoryStore, MemoryStoreError, memory_home
 from .mcp import McpHub, McpServerConfig
@@ -159,6 +167,8 @@ class StudioHost:
         self.server.on("agent/answer", self.agent_answer)
         self.server.on("agent/plan_result", self.agent_plan_result)
         self.server.on("agent/history", self.agent_history)
+        self.server.on("agent/sessions", self.agent_sessions)
+        self.server.on("agent/close", self.agent_close)
         self.server.on("agent/reset", self.agent_reset)
 
     # ---- 方法 -----------------------------------------------------------
@@ -459,6 +469,121 @@ class StudioHost:
             "saved_at": loaded.saved_at,
         }
 
+    def agent_sessions(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
+        """面板那份"你有几段对话"的清单：活着的会话与存档里的会话合成一行一段。
+
+        同一段对话可能两边都在（活着、盘上也有存档）：那就以**活着的那份**为准（它手里的
+        条数更全，存档要到一轮末尾才写），并标上 ``live`` / ``busy``。只有存档里有、内存里
+        没有的，标 ``live: false`` —— 它下次被用时会从存档喂回来（见 :meth:`_session`）。
+
+        坏存档**不让整份清单失败**：它作为一条带 ``error`` 的行报出来（``session_id`` 是空的，
+        只认得出 ``file``），别的照旧列出来。一个坏文件把清单清空的话，用户连"换一段接着聊"
+        都做不到，比多一行红字糟得多。
+
+        只报**盘上有的**：一段新对话在说出第一句话之前不占任何地方，清单里就不该出现它。
+        顺序按上次落盘时间倒序（活得久的、没时间的凭 live 排在前面），读不了的排最后。
+        """
+        _object(params, "agent/sessions")
+        rows: list[dict[str, Any]] = []
+        archived: dict[str, Any] = {}
+        if self.history is not None:
+            for item in self.history.list():
+                if item.session_id == "":
+                    rows.append(
+                        {
+                            "session_id": "",
+                            "live": False,
+                            "busy": False,
+                            "messages": 0,
+                            "saved_at": "",
+                            "title": "",
+                            "file": item.file,
+                            "error": item.error,
+                        }
+                    )
+                    continue
+                archived[item.session_id] = item
+
+        # 活会话在最前头（最近用过的排前面，见 _sessions 的顺序），标题与条数先取它手里的那份。
+        for session_id, session in self._sessions.items():
+            item = archived.pop(session_id, None)
+            messages = [message for message in session.messages if message.role != "system"]
+            title = item.title if item is not None and item.title else title_of(messages)
+            rows.append(
+                {
+                    "session_id": session_id,
+                    "live": True,
+                    "busy": session_id in self._turns,
+                    "messages": len(messages),
+                    "saved_at": item.saved_at if item is not None else "",
+                    "title": title,
+                    "file": item.file if item is not None else "",
+                    "error": None,
+                }
+            )
+        for session_id, item in archived.items():
+            rows.append(
+                {
+                    "session_id": session_id,
+                    "live": False,
+                    "busy": False,
+                    "messages": item.messages,
+                    "saved_at": item.saved_at,
+                    "title": item.title,
+                    "file": item.file,
+                    "error": None,
+                }
+            )
+        # 正常的一段排在前（落盘时间越新越前；活着的、还没落过盘的在同一时间档里排前面），
+        # 读不了的排最后 —— 它们是"要你去修的文件"，不是能换过去聊的对话。
+        rows.sort(
+            key=lambda row: (
+                row["error"] is None,
+                row["saved_at"] or "",
+                bool(row["live"]),
+            ),
+            reverse=True,
+        )
+        return {
+            "sessions": rows,
+            "live": len(self._sessions),
+            "max_sessions": self.max_sessions,
+            "history": self.history is not None,
+            "saved_at_order": "desc",
+        }
+
+    async def agent_close(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
+        """关掉一段对话：把它从内存里请出去、放掉它手里的连接（会话位腾出来）。
+
+        与 ``agent/reset`` 的分工要分清：reset 是**清对话**（连存档一起删），close 只是**关掉
+        它** —— 对话留在存档里，下次用同一个 session_id 还会被原样喂回来接着聊（见
+        :meth:`_session`）。会话位是有数的（见 :meth:`_make_room`），关掉一段就能多留一段。
+
+        有一轮在跑就先别关：那一轮还在往它的 messages 里写，关掉等于把活劈了（而且它收尾时
+        会把存档写回去）。想让那一轮现在停，先 ``agent/cancel`` 掉它。
+
+        ``closed`` 说明内存里真的有这段（没有就是"本来也没活着"，不是错误）；``history_kept``
+        说明关掉之后还能不能接回来 —— ``--no-history`` 时不能，那关掉就等于丢掉那段对话
+        （这是用户自己点的，所以照办，但要如实说清）。
+        """
+        args = _object(params, "agent/close")
+        session_id = args.get("session_id") or DEFAULT_SESSION
+        if not isinstance(session_id, str):
+            raise RpcError(INVALID_PARAMS, "session_id 必须是字符串")
+        if session_id in self._turns:
+            raise RpcError(
+                INVALID_PARAMS,
+                f"会话 {session_id} 有一轮在跑；先 agent/cancel 掉它或等它结束再关",
+            )
+        closed = session_id in self._sessions
+        await self._retire(session_id)
+        return {
+            "session_id": session_id,
+            "closed": closed,
+            "history_kept": self.history is not None,
+            "live": len(self._sessions),
+        }
+
     def agent_reset(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
         args = _object(params, "agent/reset")
         session_id = args.get("session_id") or DEFAULT_SESSION
@@ -566,7 +691,9 @@ class StudioHost:
 
         因此只有**开着存档**时才敢这样淘汰。``--no-history`` 时没有这份兜底，淘汰就是真把
         对话丢了 —— 宁可拒绝，也不偷偷丢：如实说明原因，并把真能做的（复用 session_id、
-        重启宿主）讲清。别写成"先 agent/reset 掉不用的"：reset 只清对话，不腾会话位。
+        自己点 agent/close 关掉一段、重启宿主）讲清。别写成"先 agent/reset 掉不用的"：
+        reset 只清对话，不腾会话位；真能腾位子的是 agent/close（那一档下它等于丢掉那段，
+        所以只能由用户自己点，不能替用户点）。
 
         正在跑一轮的会话一律不动：那一轮还在往它的 messages 里写，关掉它等于把活劈了。
         挑不出空闲的就照旧拒绝，并报出卡在哪儿。
@@ -575,9 +702,9 @@ class StudioHost:
             raise RpcError(
                 INVALID_PARAMS,
                 f"会话数已达上限 {self.max_sessions}；这次启动没开对话存档（--no-history），"
-                "淘汰一个会话就等于把它的对话丢掉，所以不自动淘汰。这一档下会话位也不会再释放"
-                "（agent/reset 只清对话、不腾位子）：复用已有的 session_id，或重启宿主"
-                "（关掉桌面壳再开）",
+                "淘汰一个会话就等于把它的对话丢掉，所以不自动淘汰。这一档下想腾位子只有两条路："
+                "复用已有的 session_id，或者你自己点面板上的“关掉”（agent/close —— 这一档下"
+                "关掉就等于丢掉那段对话，所以要你亲自点），也可以重启宿主（关掉桌面壳再开）",
             )
         victim = next((sid for sid in self._sessions if sid not in self._turns), None)
         if victim is None:
