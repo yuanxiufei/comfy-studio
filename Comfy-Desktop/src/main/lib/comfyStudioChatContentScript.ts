@@ -41,6 +41,14 @@ let cachedScript: string | null = null
  * use, so resuming looks exactly like never having left. Only an empty drawer is
  * filled: anything already painted came from this screen's own turn.
  *
+ * Where it keeps things: opening the drawer also asks `host/info` for one line under
+ * the status — the memory file and the archive directory, spelled out in its tooltip.
+ * It is also where the states that look like bugs but are not get said out loud: a
+ * host started with `--no-memory` / `--no-history`, and a memory file that cannot be
+ * read (`memory_error`), which fails *every* turn because the persona is rebuilt from
+ * memory each time. Nothing is guessed — a field the host did not report is reported
+ * as unknown.
+ *
  * Canvas: the host's `canvas__*` tools need the live graph, which only this page
  * has, so the shell reaches back with `executeJavaScript` and calls
  * `window.__comfyStudioChat.canvasCall(op, args)` here. Every op is a thin wrapper
@@ -72,6 +80,7 @@ var INPUT_ID = 'comfy-desktop-studio-chat-input';
 var SEND_ID = 'comfy-desktop-studio-chat-send';
 var STOP_ID = 'comfy-desktop-studio-chat-stop';
 var MODEL_ID = 'comfy-desktop-studio-chat-model';
+var STORAGE_ID = 'comfy-desktop-studio-chat-storage';
 
 var MUTED = 'var(--content-fg,#9b9b9b)';
 var FG = 'var(--fg-color,#e5e5e5)';
@@ -270,6 +279,11 @@ function buildDrawer() {
   status.textContent = '正在查询宿主状态…';
   status.style.cssText = 'padding:0 12px 8px;color:' + MUTED + ';font-size:11px;';
 
+  var storage = document.createElement('div');
+  storage.id = STORAGE_ID;
+  storage.textContent = '正在看它把记忆和对话存在哪…';
+  storage.style.cssText = 'padding:0 12px 8px;color:' + MUTED + ';font-size:11px;';
+
   var log = document.createElement('div');
   log.id = LOG_ID;
   log.style.cssText = 'flex:1;overflow-y:auto;padding:8px 12px;display:flex;flex-direction:column;gap:6px;';
@@ -323,6 +337,7 @@ function buildDrawer() {
   drawer.appendChild(header);
   drawer.appendChild(controls);
   drawer.appendChild(status);
+  drawer.appendChild(storage);
   drawer.appendChild(log);
   drawer.appendChild(composer);
   document.body.appendChild(drawer);
@@ -688,6 +703,78 @@ function paintHistory(result) {
   return painted;
 }
 
+// ---- 它记在哪 ------------------------------------------------------------
+//
+// 记忆和对话都落在用户级数据目录里（见 lib/comfy_studio/memory.py / history.py），面板得让
+// 人看得见：出了事要能去找那个文件，平时也该知道"它记的东西留在这台机器上"。三种"看着像
+// bug、其实不是"的情况更要直说：
+// ① 记忆文件读不了（宿主在 host/info 的 memory_error 里如实报了）：这一档下**每问一句都会
+//    报错**，因为人设每轮都要拿记忆重算（server.py 的 _prompt_source），修好或删掉它才能
+//    接着聊 —— 所以这一行报红，且写明是哪个文件；
+// ② 宿主是 --no-memory 起的：它这一档不记事，别把"没记住"当成坏了；
+// ③ 宿主是 --no-history 起的：这段对话面板一关就没了，别指望下次还接得上。
+// 正常时就是一行小字（记着几条 + 都在这台机器上），完整路径放悬停提示里：那串路径铺在
+// 界面上要占掉半个抽屉。宿主没报的字段不替它编，就报"没说"。
+// 一轮结束后再看一眼条数：它刚记下的事，用户应该当场看得见。
+
+function setStorage(text, tone, hint) {
+  var line = document.getElementById(STORAGE_ID);
+  if (!line) return;
+  line.textContent = text;
+  line.setAttribute('data-tone', tone === 'error' ? 'error' : 'ok');
+  line.style.color = tone === 'error' ? '#ff8080' : MUTED;
+  line.title = hint || '';
+  line.style.cursor = hint ? 'help' : 'default';
+}
+
+function loadStorage() {
+  return Promise.resolve(bridge.request('host/info')).then(
+    function (response) {
+      if (!response || response.ok !== true) {
+        var error = (response && response.error) || {};
+        setStorage('看不清它把记忆和对话存在哪: ' + (error.message || '未知错误'), 'error', '');
+        return null;
+      }
+      var info = response.result || {};
+      paintStorage(info);
+      return info;
+    },
+    function () {
+      // 传输层就没送到（宿主进程不在）：状态栏已经在报同一件事，这里不抢话。
+      setStorage('宿主不在，看不到它把记忆和对话存在哪', '', '');
+      return null;
+    }
+  );
+}
+
+function paintStorage(info) {
+  var where = [];
+  if (info.memory_file) where.push('记忆：' + info.memory_file);
+  if (info.history_dir) where.push('对话存档：' + info.history_dir);
+
+  if (info.memory_error) {
+    setStorage(
+      '记忆读不了（' + (info.memory_file || '记忆文件') + '）：修好或删掉它，助手才能接着聊',
+      'error',
+      String(info.memory_error)
+    );
+    return;
+  }
+
+  var parts = [];
+  if (info.memory === false) parts.push('这次没开记忆（--no-memory），你说过的事它不会记住');
+  else if (info.memory !== true) parts.push('记忆开没开它没说');
+  else if (info.memory_entries === 0) parts.push('还没记住什么');
+  else if (typeof info.memory_entries === 'number') parts.push('它记着 ' + info.memory_entries + ' 条事');
+  else parts.push('记忆开着');
+
+  if (info.history === false) parts.push('这次没开对话存档（--no-history），面板一关这段对话就没了');
+  else if (info.history === true) parts.push('对话存在这台机器上');
+  else parts.push('对话存不存它没说');
+
+  setStorage(parts.join('；'), '', where.join(' ｜ '));
+}
+
 function switchModel(name) {
   var model = document.getElementById(MODEL_ID);
   if (!model || STATE.busy || name === '' || name === STATE.model) return;
@@ -793,6 +880,8 @@ function sendTurn() {
     setSendEnabled(true);
     setStopVisible(false);
     refreshModelEnabled();
+    // 这一轮可能刚记下一条事或刚把记忆文件弄坏：再看一眼，别让那一行停在旧话上。
+    loadStorage();
   };
 
   bridge.request('agent/chat', { text: text }).then(
@@ -897,6 +986,7 @@ function openDrawer() {
   refreshStatus();
   loadModels();
   loadHistory();
+  loadStorage();
 }
 
 function closeDrawer() {

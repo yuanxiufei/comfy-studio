@@ -9,6 +9,7 @@ const INPUT_ID = 'comfy-desktop-studio-chat-input'
 const SEND_ID = 'comfy-desktop-studio-chat-send'
 const STOP_ID = 'comfy-desktop-studio-chat-stop'
 const MODEL_ID = 'comfy-desktop-studio-chat-model'
+const STORAGE_ID = 'comfy-desktop-studio-chat-storage'
 
 interface StudioBridge {
   status: ReturnType<typeof vi.fn>
@@ -323,6 +324,109 @@ describe('getComfyStudioChatContentScript', () => {
       const asked = bridge.request.mock.calls.filter((call) => call[0] === 'agent/history')
       expect(asked, 'history is only worth asking for an empty drawer').toHaveLength(1)
       expect(rows('user').map((r) => r.textContent)).toEqual(['上次问的', '这一轮问的'])
+    })
+  })
+
+  describe('where it keeps things on this machine', () => {
+    /** 开抽屉时面板会问几件事（模型目录、上次的对话、host/info）；只有 host/info 走自己的桩。 */
+    const hostInfo = (result: Record<string, unknown> | null): RequestStub => (method) =>
+      method === 'host/info'
+        ? result === null
+          ? { ok: false, error: { message: '宿主没起来' } }
+          : { ok: true, result }
+        : { ok: true, result: { text: '答案在此' } }
+
+    const line = (): HTMLElement | null => document.getElementById(STORAGE_ID)
+
+    const paths = {
+      memory_file: 'C:\\Users\\me\\AppData\\Roaming\\comfy-studio\\memory.json',
+      history_dir: 'C:\\Users\\me\\AppData\\Roaming\\comfy-studio\\sessions'
+    }
+
+    it('says how much it remembers and that it all stays on this machine', async () => {
+      installBridge({
+        request: hostInfo({ ...paths, memory: true, memory_entries: 3, history: true })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      expect(line()?.textContent).toBe('它记着 3 条事；对话存在这台机器上')
+      // 路径太长，铺在界面上要占掉半个抽屉：放悬停提示里
+      expect(line()?.title).toContain('memory.json')
+      expect(line()?.title).toContain('sessions')
+    })
+
+    it('puts an unreadable memory file in front, since every turn fails on it', async () => {
+      const broken = '记忆文件读不了（' + paths.memory_file + '）：Expecting value: line 1 column 1'
+      installBridge({
+        request: hostInfo({
+          ...paths,
+          memory: true,
+          memory_entries: null,
+          history: true,
+          memory_error: broken
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      expect(line()?.textContent).toContain('记忆读不了')
+      expect(line()?.textContent, '写出是哪个文件，用户才能去修它').toContain('memory.json')
+      expect(line()?.getAttribute('data-tone'), '这不是小事，要报红').toBe('error')
+      expect(line()?.title, '原文里连怎么办都写着').toBe(broken)
+    })
+
+    it('says out loud when the host was started without memory or the archive', async () => {
+      installBridge({ request: hostInfo({ memory: false, history: false }) })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      expect(line()?.textContent).toBe(
+        '这次没开记忆（--no-memory），你说过的事它不会记住；' +
+          '这次没开对话存档（--no-history），面板一关这段对话就没了'
+      )
+    })
+
+    it('does not guess at fields the host did not report', async () => {
+      installBridge({ request: hostInfo({}) })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      expect(line()?.textContent).toBe('记忆开没开它没说；对话存不存它没说')
+    })
+
+    it('says so when the host cannot be asked at all', async () => {
+      installBridge({ request: hostInfo(null) })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      expect(line()?.textContent).toBe('看不清它把记忆和对话存在哪: 宿主没起来')
+      expect(line()?.getAttribute('data-tone')).toBe('error')
+    })
+
+    it('re-reads the memory count once a turn settles', async () => {
+      let entries = 0
+      installBridge({
+        request: (method: string) =>
+          method === 'host/info'
+            ? { ok: true, result: { memory: true, memory_entries: entries, history: true } }
+            : { ok: true, result: { text: '答案在此' } }
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      expect(line()?.textContent).toBe('还没记住什么；对话存在这台机器上')
+
+      entries = 1 // 这一轮里它记下了一条
+      await send('记住我喜欢方形构图')
+      await flush() // 这一问是收尾时才发的，多让一拍
+
+      expect(line()?.textContent).toBe('它记着 1 条事；对话存在这台机器上')
     })
   })
 
