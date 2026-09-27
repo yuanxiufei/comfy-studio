@@ -1,0 +1,43 @@
+# CHANGELOG.yaml — 版本控制与修改记录
+# 对应规格 §17｜版本控制
+
+# ── 资产版本序列（§17）──
+# Character_001_v1 → Character_001_v2 → Character_001_v3
+# 规则：每次"重大修改"递增版本；仅重新采样（重新生成）不递增。
+
+CHANGELOG:
+
+  - version: "v1"
+    asset: "CHR_001"
+    changed: ["初次生成"]
+    unchanged: []
+    reason: "项目启动，建立 Character DNA"
+
+  - version: "v2"
+    asset: "CHR_001"
+    changed: ["COSTUME"]           # 仅服装变化
+    unchanged: ["FACE", "HAIR", "BODY", "AGE", "COLOR"]
+    reason: "用户要求「人物不变，只换衣服」"
+
+  - version: "v3"
+    asset: "CHR_001"
+    changed: ["EXPRESSION"]
+    unchanged: ["FACE", "HAIR", "BODY", "COSTUME", "ENVIRONMENT"]
+    reason: "用户要求「全部保持，只改变表情」"
+
+# ── 字段说明 ──
+# version   : 版本号
+# asset     : 受影响资产 ID
+# changed   : 本次变更项（必须显式列出，便于回溯）
+# unchanged : 本次锁定未变项（对应 §15 MODIFICATION ENGINE 的自动解释结果）
+# reason    : 变更原因（引用用户原话或剧情需求）
+
+# ── 回滚支持（§33「恢复」命令）──
+# 用户说「恢复上一版」→ 读取上一条记录，将 changed 项回退，unchanged 项保持
+# 用户说「恢复原版」→ 回退到 v1
+# 用户说「取消这次修改」→ 删除最后一条记录并回退
+
+# ── 项目管理 ──
+# [ ] 每次修改后必须追加记录
+# [ ] changed / unchanged 必须完整，不得省略
+# [ ] 状态派生（State_A/B/C）单独记录，注明 parent

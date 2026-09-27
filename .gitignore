@@ -20,3 +20,12 @@ __pycache__/
 
 # ---- 脚本临时产物（过滤后的依赖清单、自检输出、安装日志）----
 .cache/
+
+# ---- CodeBuddy 项目级子智能体（交付物，必须入库）----
+# 13 个漫剧 agent + 生成器/安装器（`.codebuddy/agents/manju-*.md`、`_build.py`、`_install_user.py`）。
+# ⚠️ 用 `.codebuddy/*` 而不是 `.codebuddy/`：后者会把**整个目录**排除，于是下面的 `!`
+#    例外**不可能生效**（git 规定：父目录被排除时，无法再放行其子项）。
+# ⚠️ 它们必须住 **workspace 根** —— CodeBuddy 只认这里的 `.codebuddy/agents/`。
+#    漫剧业务数据另在 ComfyUI/custom_nodes/comfy_studio/manju/ 下（由本仓强制跟踪）。
+.codebuddy/*
+!.codebuddy/agents/

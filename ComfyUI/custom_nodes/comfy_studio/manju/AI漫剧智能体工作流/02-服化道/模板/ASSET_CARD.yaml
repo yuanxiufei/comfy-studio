@@ -1,0 +1,168 @@
+# ASSET_CARD.yaml — 资产卡
+# 对应规格 §39｜资产卡 Asset Card
+# 每生成一个资产（角色/服装/道具/场景/表情/动作/分镜）就建立一张卡。
+# 命名：<TYPE>_<序号>_<状态>_v<版本>  例：CHR_001_State_A_v2
+
+ASSET:
+  # ── 标识 ──
+  id: "CHR_001"                  # CHR_/CST_/PRP_/ENV_/EXP_/POS_/SHT_/AUD_/VID_
+                                 # 命名规范权威：00-总控路由.md §四
+                                 # ⚠️ 分镜是 SHT_ 不是 SHOT_；场景是 ENV_ 不是 SCN_
+  type: ""                       # character | costume | prop | environment | expression | pose | shot
+  name: ""
+  version: "v1"
+  source: ""                     # 来自哪个剧本/小说/章节
+  reference: []                  # 参考图路径
+
+  # ── ID 注册状态（跨模块共享）──
+  id_status: "DRAFT"             # RESERVED | DRAFT | LOCKED | DEPRECATED
+                                 # RESERVED  = 05 建纲已留号，资产尚未生成（不可出图）
+                                 # DRAFT     = 本卡已建，未过一致性 Gate（不可投产）
+                                 # LOCKED    = 已过 Gate，全链路可引用 ← 仅 02 可升到此状态
+                                 # DEPRECATED= 已废弃，号位永久保留不复用
+  id_registry: "00_PROJECT/ID-REGISTRY.md"   # 本 ID 的登记处
+  id_registered: true            # 必须为 true；false 说明该 ID 未登记，属违规
+
+  # ── 【核心】终身固定核心识别特征库 ──
+  # 来源：源skill库/服/character-lifecycle-designer.md
+  # 规则：本区块内容 100% 不可改动，是所有状态派生（_State_A/B/C）的唯一铁则。
+  #       修改本区块 = 重新设计角色，必须递增主版本号并通知全项目。
+  fixed_features:
+    core_bone_structure: ""      # 核心骨相
+    facial_contour: ""           # 五官轮廓
+    iris_color: ""               # 瞳色
+    permanent_marks: []          # 标志性永久识别点（胎记/疤痕/齿型/痣…）
+    signature_micro_expressions: []  # 终身不变的微表情习惯
+    # 建议同时收录（影响跨镜识别）：
+    voice:                       # 【规格未覆盖，本项目补充】音色，对接 05-音乐音频
+      base_timbre: ""            # 全生命周期基础音色
+      speed: ""                  # 语速
+      verbal_tics: []            # 语癖 / 口头禅
+      accent: ""                 # 口音
+    body_language:               # 【规格未覆盖，本项目补充】肢体语言
+      fixed_habit_moves: []      # 终身固定习惯动作（如"左手拇指按压物件"）
+      micro_expression_notes: "" # 微表情特点
+
+  # ── 剧情适配变量项（各状态卡之间可不同）──
+  stage_variables:
+    skin_state: ""               # 皮肤状态
+    aging_marks: ""              # 皱纹 / 老化痕迹
+    hair_color_change: ""        # 发色变化
+    facial_hair: ""              # 胡须 / 毛发变化
+    injury_marks: ""             # 伤病痕迹
+    body_shape: ""               # 身形变化
+    physique_vibe: ""            # 体态气质
+    hairstyle_change: ""         # 发型变化
+    makeup: ""                   # 妆容
+    full_outfit: ""              # 全套穿搭
+    core_accessories: ""         # 核心配饰
+
+  # ── 视觉 DNA（按 type 填写对应块）──
+  # 说明：本区块是 fixed_features + stage_variables 的展开明细（便于生图直接取用）。
+  #       若与本卡 fixed_features 冲突，以 fixed_features 为准。
+  visual_dna:
+    # FACE DNA（角色）
+    face_shape: ""
+    jaw: ""
+    cheekbone: ""
+    brow_ridge: ""
+    eye_distance: ""
+    eye_shape: ""
+    eye_color: ""
+    nose_bridge: ""
+    lips: ""
+    # HAIR DNA
+    hair_color: ""
+    hair_length: ""
+    hair_volume: ""
+    hair_style: ""
+    hair_parting: ""
+    bangs: ""
+    hair_accessory: ""
+    # BODY DNA
+    height: ""
+    shoulder_width: ""
+    waist_hip_ratio: ""
+    limb_proportion: ""
+    body_type: ""
+    # COSTUME DNA
+    silhouette: ""
+    primary_color: ""
+    material: ""
+    layers: ""
+    signature_accessory: ""
+    # SIGNATURE DNA（3~7 个不可轻易改变的识别点）
+    signature_points: []
+    # 其他类型资产（道具/场景）改为填下列字段
+    structure: ""
+    craft: ""
+    surface_texture: ""
+    wear: ""
+    scale_reference: ""
+
+  # ── 锁定状态 ──
+  locked: []                     # 例：["FACE", "HAIR", "BODY"] → 转成 LOCK_FACE / LOCK_HAIR / LOCK_BODY
+  editable: []                   # 例：["COSTUME", "EXPRESSION"]
+
+  # ── 继承关系 ──
+  parent_asset: ""               # 例：CHR_001_State_B 的 parent 是 CHR_001
+  related_assets: []             # 例：道具归属角色、服装配套道具
+
+  # ── 提示词 ──
+  prompt_cn: ""
+  prompt_en: ""
+  negative_prompt: ""
+
+  # ── 一致性参数 ──
+  color: {}
+  lighting: {}
+  camera: {}
+
+  notes: ""
+
+# ── 状态派生规则（规格 §29 §30）──
+# 角色成长/受伤/换装 → 新建状态卡，不覆盖原卡：
+#   CHR_001_State_A / CHR_001_State_B / CHR_001_State_C
+# 服装状态派生：
+#   CST_001_Normal / CST_001_Wet / CST_001_Dirty / CST_001_Damaged
+# 道具损伤状态：
+#   PRP_001_Intact / PRP_001_Damaged
+
+# ── HAIR DNA 字段可选值（来源：源skill库/服/quick-hairstylist.md 理发术语库）──
+# 填写 visual_dna 的 hair_* 字段时从此处选取，避免用词随意导致跨镜不一致。
+#
+# hair_length（长度）   ：寸头 / 短发 / 中短发 / 中长发 / 长发 / 及腰发
+# hair_volume（发量层次）：高层次(蓬松动感) / 低层次(整齐厚重) / 碎层次(随性时尚)
+# hair_style（卷度）    ：微卷 / 自然卷 / 中卷 / 大卷 / 小卷
+#                         法式卷(慵懒) / 韩式卷(空气感) / 羊毛卷(密集) / 蛋卷头(规律) / 水波纹 / 大波浪
+# hair_parting（分线）  ：中分 / 三七分 / 二八分 / 侧分 / 偏左 / 偏右
+# bangs（刘海）         ：空气刘海 / 法式刘海 / 八字刘海 / 齐刘海 / 侧分刘海 /
+#                         龙须刘海 / 眉上刘海 / 无刘海
+# 剪裁专项              ：公主切 / 狼尾 / 蘑菇头 / 波波头 / 精灵短发 / 锁骨发 / Lob头
+# 男士专项              ：寸头 / 背头 / 龙须背头 / 两侧剪短 / 两侧服帖 / 飞机头 /
+#                         油头 / 纹理短发 / undercut(侧削) / 侧分油头 / 蓬巴杜 / 莫西干
+# 染发                  ：全头染 / 挑染 / 挂耳染 / 发尾染 / 渐变染 / 对比染
+# 造型质感              ：内扣 / 外翻 / 蓬松 / 服帖 / 凌乱感 / 光泽感 / 哑光感
+# 脸型修饰              ：拉长(圆/方脸) / 缩短(长脸) / 收窄(宽脸) / 扩宽(窄脸) /
+#                         柔化(方脸) / 修饰颧骨 / 修饰下颌
+#
+# 英文提示词示例：
+#   女士："锁骨长度的中长发，自然法式卷，搭配空气刘海，暖棕发色，自然光泽感"
+#         → shoulder-length medium hair, natural French wave, air bangs, warm brown, natural luster
+#   男士："两侧剪短，顶部留长向后梳成背头，自然黑，整齐服帖"
+#         → short sides, longer top combed back, natural black, neat and flat
+#
+# ⚠️ 湿发状态（淋雨/出水）属 stage_variables.hairstyle_change，不写进 HAIR DNA 固定项。
+
+# ── 状态派生的生成顺序（来源：源skill库/服/character-lifecycle-designer.md）──
+# 严禁各阶段同时生成（必然漂移）。必须严格按序：
+#   ① 先生成「基准状态」（剧本开篇初始状态）的套图
+#   ② 用户确认基准 → 才能生成各阶段套图
+#   ③ 每个阶段图生成后单独确认，再进入下一阶段
+# 铁则：所有套图的「光影风格 / 渲染质感 / 画幅比例」完全统一。
+
+# ── 跨阶段一致性铁则 ──
+# 1. fixed_features 100% 沿用，一字不改
+# 2. 仅调整 stage_variables 中的项
+# 3. 生图 prompt 中 fixed_features 必须完整写出（不可省略、不可简化）
+# 4. 出现核心特征偏差 → 以已确认的基准图为准重新生成，不得擅自调整人设
