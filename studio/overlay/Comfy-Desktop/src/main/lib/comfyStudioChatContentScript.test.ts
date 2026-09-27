@@ -219,6 +219,113 @@ describe('getComfyStudioChatContentScript', () => {
     expect(rows('assistant')[1]?.getAttribute('data-variant')).toBe('final')
   })
 
+  describe('coming back to an older conversation', () => {
+    /** 只有 `agent/history` 走自己的桩：开抽屉时面板还会问模型目录，那些保持默认。 */
+    const archive = (result: unknown): RequestStub => (method) =>
+      method === 'agent/history' ? result : { ok: true, result: { text: '答案在此' } }
+
+    const archived = (result: Record<string, unknown>): unknown => ({
+      ok: true,
+      result: {
+        session_id: 'default',
+        source: 'store',
+        messages: 0,
+        dropped: 0,
+        saved_at: '2026-09-26T10:00:00+00:00',
+        entries: [],
+        ...result
+      }
+    })
+
+    it('an empty drawer repaints the archived conversation when it opens', async () => {
+      const bridge = installBridge({
+        request: archive(
+          archived({
+            messages: 4,
+            entries: [
+              { type: 'user', text: '帮我把这张图放大两倍' },
+              { type: 'assistant', text: '先查一下可用的 skill', variant: 'intermediate' },
+              { type: 'tool_call', id: 'call_1', name: 'fake__do_it', arguments: { scale: 2 } },
+              { type: 'tool_result', id: 'call_1', name: 'fake__do_it', text: '{"ok": true}' },
+              { type: 'assistant', text: '已经好了', variant: 'final' }
+            ]
+          })
+        )
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      expect(bridge.request).toHaveBeenCalledWith('agent/history', { session_id: 'default' })
+      const log = document.getElementById(LOG_ID)
+      expect(log?.firstElementChild?.textContent).toBe('上次的对话（存在这台机器上）')
+      expect(rows('user').map((r) => r.textContent)).toEqual(['帮我把这张图放大两倍'])
+      expect(rows('assistant').map((r) => r.textContent)).toEqual(['先查一下可用的 skill', '已经好了'])
+      expect(rows('assistant')[0]?.getAttribute('data-variant')).toBe('intermediate')
+      expect(rows('assistant')[1]?.getAttribute('data-variant')).toBe('final')
+      // 工具卡是同一套画法：结果按 id 配回调用那张，不另起一行
+      expect(rows('tool')).toHaveLength(1)
+      expect(rows('tool')[0]?.getAttribute('data-tool')).toBe('fake__do_it')
+      expect(rows('tool')[0]?.getAttribute('data-state')).toBe('done')
+    })
+
+    it('says how many older messages the archive could not keep', async () => {
+      installBridge({
+        request: archive(archived({ dropped: 12, entries: [{ type: 'user', text: '很久以前问的' }] }))
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      expect(rows('agent').map((r) => r.textContent)).toEqual([
+        '上次的对话（存在这台机器上）',
+        '更早的 12 条超出存档上限，没留下来'
+      ])
+    })
+
+    it('an archive that cannot be read is one line, not a silent blank', async () => {
+      installBridge({
+        request: archive({ ok: false, error: { code: -32603, message: '对话存档读不了（x.json）：坏了' } })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      expect(rows('agent').map((r) => r.textContent)).toEqual([
+        '取不回上次的对话: 对话存档读不了（x.json）：坏了'
+      ])
+      // 这是"上次的对话取不回来"，不是"这一轮失败了"：不该混进错误行。
+      expect(rows('error')).toHaveLength(0)
+    })
+
+    it('an empty archive leaves the drawer blank', async () => {
+      installBridge({ request: archive(archived({})) })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      expect(rows('agent')).toHaveLength(0)
+      expect(document.getElementById(LOG_ID)?.childNodes).toHaveLength(0)
+    })
+
+    it('does not refill a drawer that is already showing this screen conversation', async () => {
+      const bridge = installBridge({
+        request: archive(archived({ entries: [{ type: 'user', text: '上次问的' }] }))
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await send('这一轮问的')
+
+      document.getElementById(BTN_ID)?.click() // 关掉再开一遍
+      await openPanel()
+
+      const asked = bridge.request.mock.calls.filter((call) => call[0] === 'agent/history')
+      expect(asked, 'history is only worth asking for an empty drawer').toHaveLength(1)
+      expect(rows('user').map((r) => r.textContent)).toEqual(['上次问的', '这一轮问的'])
+    })
+  })
+
   it('pairs a tool result with the card its call opened', async () => {
     installBridge()
     setupDom()

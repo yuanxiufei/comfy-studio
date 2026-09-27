@@ -33,6 +33,14 @@ let cachedScript: string | null = null
  * error, and why the transport-level rejection path below stays for real failures
  * only.
  *
+ * Coming back: this surface and the host have separate lifetimes, so a reload here
+ * (new canvas, reloaded page) would show an empty drawer even though the host still
+ * holds the conversation — and a host restart would lose it entirely if not for the
+ * on-disk archive (`lib/comfy_studio/history.py`). Opening the drawer therefore asks
+ * `agent/history` once and repaints itself with the same painters the live events
+ * use, so resuming looks exactly like never having left. Only an empty drawer is
+ * filled: anything already painted came from this screen's own turn.
+ *
  * Canvas: the host's `canvas__*` tools need the live graph, which only this page
  * has, so the shell reaches back with `executeJavaScript` and calls
  * `window.__comfyStudioChat.canvasCall(op, args)` here. Every op is a thin wrapper
@@ -620,6 +628,66 @@ function loadModels() {
   );
 }
 
+// ---- 上次的对话 ----------------------------------------------------------
+//
+// 面板和宿主是两份生命周期：这一屏一重载（切个画面、宿主重启过），抽屉里就空了，
+// 可那段对话其实还在——宿主手里活着就还在内存里，宿主也重启过就还在 sessions/ 的
+// 存档里（见 lib/comfy_studio/history.py）。所以开抽屉时问一次 agent/history，
+// 用与实时事件同一套画法把自己补回来：用户看到的是"接着上次聊"，而不是一段空白。
+// 只在**空抽屉**里补：已经有内容说明这一屏正在画这一轮，再补一遍就成了同一段话
+// 说两遍。
+
+function loadHistory() {
+  var log = document.getElementById(LOG_ID);
+  if (!log || log.childNodes.length > 0 || STATE.busy) return null;
+  return Promise.resolve(bridge.request('agent/history', { session_id: STATE.session })).then(
+    function (response) {
+      if (!response || response.ok !== true) {
+        // 取不回来就说一句。不说的话用户只看到一段空白，会以为对话被吞了；
+        // 宿主没在运行时状态栏也在报同一件事，两处并不矛盾。
+        var error = (response && response.error) || {};
+        var line = makeRow('agent');
+        line.textContent = '取不回上次的对话: ' + (error.message || '未知错误');
+        appendNode(line);
+        return 0;
+      }
+      return paintHistory(response.result || {});
+    },
+    function () {
+      // 传输层就没送到（宿主进程不在）：状态栏已经在报，这里不再多插一行。
+      return 0;
+    }
+  );
+}
+
+function paintHistory(result) {
+  var entries = result.entries || [];
+  if (entries.length === 0) return 0;
+
+  var head = makeRow('agent');
+  head.textContent = '上次的对话（存在这台机器上）';
+  appendNode(head);
+
+  var dropped = Number(result.dropped) || 0;
+  if (dropped > 0) {
+    var note = makeRow('agent');
+    note.textContent = '更早的 ' + dropped + ' 条超出存档上限，没留下来';
+    appendNode(note);
+  }
+
+  var painted = 0;
+  for (var i = 0; i < entries.length; i++) {
+    var entry = entries[i] || {};
+    if (entry.type === 'user') addUser(String(entry.text || ''));
+    else if (entry.type === 'assistant') addAssistant(String(entry.text || ''), entry.variant);
+    else if (entry.type === 'tool_call') addToolCall(entry);
+    else if (entry.type === 'tool_result') addToolResult(entry);
+    else continue; // 不认识的条目跳过就好，别让一条把后面整段历史截断
+    painted++;
+  }
+  return painted;
+}
+
 function switchModel(name) {
   var model = document.getElementById(MODEL_ID);
   if (!model || STATE.busy || name === '' || name === STATE.model) return;
@@ -828,6 +896,7 @@ function openDrawer() {
   if (input) input.focus();
   refreshStatus();
   loadModels();
+  loadHistory();
 }
 
 function closeDrawer() {

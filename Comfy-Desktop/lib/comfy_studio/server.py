@@ -21,7 +21,8 @@
 ``agent/canvas_result``   画布通道的回程：桌面壳把页面执行画布动作的结果送回来
 ``agent/answer``         审核通道的回程：``{call_id, answer}`` → 唤醒等着的提问
 ``agent/plan_result``    计划通道的回程：``{call_id, approved, feedback?}`` → 唤醒等着的确认
-``agent/reset``          清空某个会话的历史
+``agent/history``        ``{session_id?}`` → 这个会话说过的话（面板重开时照着重画）
+``agent/reset``          清空某个会话的历史与它的存档
 ======================  ==============================================
 
 ``agent/canvas_result`` / ``agent/answer`` / ``agent/plan_result`` 是三条「回程」：桌面壳要
@@ -37,12 +38,14 @@ from __future__ import annotations
 
 import sys
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, Callable
 
 from .agent import (
     DEFAULT_SYSTEM_PROMPT,
     AgentError,
     AgentSession,
+    ChatMessage,
     LLMConfig,
     LLMError,
     OpenAIChatClient,
@@ -52,6 +55,7 @@ from .agent import (
 from .canvas import CanvasChannel, CanvasClient
 from .cancel import CancelToken, Cancelled
 from .channel import bind_emit, unbind_emit
+from .history import SESSION_SUBDIR, HistoryError, SessionHistoryStore, entries as history_entries
 from .localfiles import LocalFiles, LocalFilesClient
 from .memory import MemoryClient, MemoryStore, MemoryStoreError, memory_home
 from .mcp import McpHub, McpServerConfig
@@ -103,6 +107,7 @@ class StudioHost:
         plan: PlanChannel | None = None,
         local_files: LocalFilesClient | None = None,
         memory: MemoryClient | None = None,
+        history: SessionHistoryStore | None = None,
     ) -> None:
         self.hub = hub
         self.catalog = catalog
@@ -120,6 +125,9 @@ class StudioHost:
         #: 跨会话的长期记忆（默认就有，`--no-memory` 关掉）；None 时工具表里不会有 memory__*，
         #: 系统提示词里也不会带"你记得什么"那一段。
         self.memory = memory
+        #: 对话存档（默认就有，`--no-history` 关掉）；None 时会话只活在内存里：宿主一退、
+        #: 面板一重载，整段对话就没了。
+        self.history = history
         #: 面板里切过的模型；None = 用环境变量里那个（进程内有效，不落盘）。
         self.default_model: str | None = None
         self._sessions: dict[str, AgentSession] = {}
@@ -146,6 +154,7 @@ class StudioHost:
         self.server.on("agent/canvas_result", self.agent_canvas_result)
         self.server.on("agent/answer", self.agent_answer)
         self.server.on("agent/plan_result", self.agent_plan_result)
+        self.server.on("agent/history", self.agent_history)
         self.server.on("agent/reset", self.agent_reset)
 
     # ---- 方法 -----------------------------------------------------------
@@ -172,6 +181,8 @@ class StudioHost:
             "memory_file": str(self.memory.store.path) if self.memory is not None else None,
             "memory_entries": memory_entries,
             "memory_error": memory_error,
+            "history": self.history is not None,
+            "history_dir": str(self.history.directory) if self.history is not None else None,
         }
 
     def mcp_servers(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
@@ -314,6 +325,11 @@ class StudioHost:
         finally:
             unbind_emit(token)
             self._turns.pop(session_id, None)
+            # 一轮收尾就落一次盘（被取消的那一轮也落）。放在 finally 里的理由：不管这一轮是
+            # 怎么结束的，历史都已经补齐成"完整的一轮"了（见 agent/loop.py 的取消路径），
+            # 存进去的存档喂回来不会半截。写失败只记一行 stderr：答案已经算出来交给用户了，
+            # 不该因为存档写不进去就把这一轮判成失败。
+            self._save_history(session_id, session)
         return {"session_id": session_id, "text": answer, "cancelled": False}
 
     def agent_cancel(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
@@ -391,16 +407,66 @@ class StudioHost:
         )
         return {"call_id": call_id, "delivered": delivered}
 
+    def agent_history(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
+        """这个会话说过的话，按面板那套画法给（面板重开时照着重画）。
+
+        先看**活着的会话**：它手里的历史最全（存档要到一轮末尾才写）。会话不在内存里
+        （宿主重启过、面板刚打开）才去读存档。两边都没有就是一段空对话 —— 还没聊过不是错误。
+
+        ``source`` 说明这份是从哪拿的；``dropped`` 只在读存档时有意义（存档被裁掉、没画出来
+        的条数），从内存里拿时一律是 0 —— 因为内存里的会话就是全长，裁只可能发生在读存档那一步。
+        """
+        args = _object(params, "agent/history")
+        session_id = args.get("session_id") or DEFAULT_SESSION
+        if not isinstance(session_id, str):
+            raise RpcError(INVALID_PARAMS, "session_id 必须是字符串")
+        session = self._sessions.get(session_id)
+        if session is not None:
+            messages = [message for message in session.messages if message.role != "system"]
+            return {
+                "session_id": session_id,
+                "source": "session",
+                "entries": history_entries(messages),
+                "messages": len(messages),
+                "dropped": 0,
+                "saved_at": "",
+            }
+        if self.history is None:
+            return {
+                "session_id": session_id,
+                "source": "store",
+                "entries": [],
+                "messages": 0,
+                "dropped": 0,
+                "saved_at": "",
+            }
+        try:
+            loaded = self.history.load(session_id)
+        except HistoryError as err:
+            # 坏存档如实报出来（面板画成一行错误，里面写着文件在哪、怎么重来）。
+            # 假装"还没聊过"会让用户以为对话被吞了。
+            raise RpcError(INTERNAL_ERROR, str(err)) from err
+        return {
+            "session_id": session_id,
+            "source": "store",
+            "entries": history_entries(loaded.messages),
+            "messages": len(loaded.messages),
+            "dropped": loaded.dropped,
+            "saved_at": loaded.saved_at,
+        }
+
     def agent_reset(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
         args = _object(params, "agent/reset")
         session_id = args.get("session_id") or DEFAULT_SESSION
         if not isinstance(session_id, str):
             raise RpcError(INVALID_PARAMS, "session_id 必须是字符串")
+        # 存档也要删。只清内存的话，下次重启会被存档原样复活 —— 用户看到的是"清了个寂寞"。
+        cleared = self._clear_history(session_id)
         session = self._sessions.get(session_id)
         if session is None:
-            return {"session_id": session_id, "reset": False}
+            return {"session_id": session_id, "reset": False, "history_cleared": cleared}
         session.reset()
-        return {"session_id": session_id, "reset": True}
+        return {"session_id": session_id, "reset": True, "history_cleared": cleared}
 
     # ---- 生命周期 -------------------------------------------------------
 
@@ -432,6 +498,41 @@ class StudioHost:
         except MemoryStoreError as err:
             return None, str(err)
 
+    def _load_history(self, session_id: str) -> list[ChatMessage]:
+        """把这个会话上次的对话读回来 —— 宿主重启之后还接得上，就靠这一步。
+
+        存档坏了就把错误原样交给调用方（面板画成一行错误，写着文件在哪、怎么重来）：
+        悄悄当成"还没聊过"会让用户以为对话被吞了。
+        """
+        if self.history is None:
+            return []
+        try:
+            return list(self.history.load(session_id).messages)
+        except HistoryError as err:
+            raise RpcError(INTERNAL_ERROR, str(err)) from err
+
+    def _save_history(self, session_id: str, session: AgentSession) -> None:
+        """把会话历史落进存档。失败只记 stderr，不往上抛（见 :meth:`agent_chat` 的说明）。"""
+        if self.history is None:
+            return
+        try:
+            self.history.save(session_id, session.messages)
+        except HistoryError as err:
+            print(
+                f"[{SERVER_NAME}] 对话存档没写成（{session_id}）：{err}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    def _clear_history(self, session_id: str) -> bool:
+        """删掉一个会话的存档，返回是否真的删了文件（没开存档时恒为 False）。"""
+        if self.history is None:
+            return False
+        try:
+            return self.history.clear(session_id)
+        except HistoryError as err:
+            raise RpcError(INTERNAL_ERROR, str(err)) from err
+
     def _prompt_source(self) -> str | Callable[[], str]:
         """会话的人设来源。
 
@@ -453,9 +554,13 @@ class StudioHost:
                 INVALID_PARAMS,
                 f"会话数已达上限 {self.max_sessions}；先 agent/reset 掉不用的，或复用已有 session_id",
             )
+        history = self._load_history(session_id)
         try:
             session = create_session(
-                self.hub, system_prompt=self._prompt_source(), config=self._session_config()
+                self.hub,
+                system_prompt=self._prompt_source(),
+                history=history,
+                config=self._session_config(),
             )
         except (LLMError, AgentError) as err:
             raise RpcError(INTERNAL_ERROR, str(err)) from err
@@ -491,6 +596,7 @@ async def serve_stdio(
     output_dir: str | None = None,
     memory: bool = True,
     memory_dir: str | None = None,
+    history: bool = True,
 ) -> None:
     """拉起全部 MCP server，然后在 stdin/stdout 上服务到 EOF。
 
@@ -505,6 +611,10 @@ async def serve_stdio(
     长期记忆（:mod:`comfy_studio.memory`）同样不需要谁接话，而且它是这个工作台该有的
     记性，所以**默认开着**：一份落在用户数据目录的 JSON，``memory_dir`` 换地方，
     ``memory=False`` 整个关掉（工具表里就没有 memory__* 了）。
+    对话存档（:mod:`comfy_studio.history`）也默认开着，落在同一个数据目录的 ``sessions/``
+    下（``memory_dir`` 一并管着这两个落点 —— 它们是同一份"工作台在你用户目录里的数据"）：
+    有了它，宿主重启 / 面板重载之后 ``agent/history`` 还能把上次的对话拉回来，接着聊。
+    ``history=False`` 就退回内存里的会话，一退就没。它不影响工具表，只影响记忆。
     """
     canvas_channel = CanvasChannel() if canvas else None
     review_channel = ReviewChannel() if review else None
@@ -517,6 +627,10 @@ async def serve_stdio(
     memory_client = (
         MemoryClient(MemoryStore(memory_dir or memory_home())) if memory else None
     )
+    # 对话存档与记忆共用同一个数据目录（--memory-dir / COMFY_STUDIO_MEMORY_DIR 管着它俩）：
+    # 记忆是平铺的 memory.json，对话按会话分文件放在 sessions/ 下。
+    data_root = memory_home() if memory_dir is None else Path(memory_dir).expanduser()
+    history_store = SessionHistoryStore(data_root / SESSION_SUBDIR) if history else None
     extra: list[Any] = []
     if canvas_channel is not None:
         extra.append(CanvasClient(canvas_channel))
@@ -542,6 +656,7 @@ async def serve_stdio(
             plan=plan_channel,
             local_files=local_files,
             memory=memory_client,
+            history=history_store,
         )
         # stdin 一关（面板退出）就先叫停在飞的轮次，别让退出卡在长任务上。
         host.server.on_close = lambda: host.cancel_turns("宿主退出")

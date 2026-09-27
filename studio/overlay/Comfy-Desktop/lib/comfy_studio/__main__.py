@@ -106,12 +106,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--no-history",
+        action="store_true",
+        help=(
+            "关掉对话存档：会话只活在内存里，宿主一退、面板一重载，这段对话就没了。"
+            "默认是开的（存在 --memory-dir 那份数据目录的 sessions/ 下）"
+        ),
+    )
+    parser.add_argument(
         "--memory-dir",
         default=None,
         help=(
-            "长期记忆的存放目录（memory.json 落在里面）；"
+            "工作台在你用户目录下的数据目录，记忆与对话存档都落在里面"
+            "（memory.json 与 sessions/）；"
             "默认按操作系统惯例取用户数据目录（也可用 COMFY_STUDIO_MEMORY_DIR）。"
-            "记忆是**用户级**的：放在这里而不是 ComfyUI 检出里，换个检出也还认得你"
+            "放在这里而不是 ComfyUI 检出里是有意的：检出可以随便删掉重建，"
+            "你的记性和聊过的内容不该跟着一起没"
         ),
     )
     return parser
@@ -144,6 +154,7 @@ def main(argv: list[str] | None = None) -> int:
                 output_dir=args.output_dir or os.environ.get("COMFY_OUTPUT_DIR"),
                 memory=not args.no_memory,
                 memory_dir=args.memory_dir or os.environ.get("COMFY_STUDIO_MEMORY_DIR"),
+                history=not args.no_history,
             )
         )
     except KeyboardInterrupt:  # 桌面壳正常退出时是关掉 stdin，这条只为手动 Ctrl+C

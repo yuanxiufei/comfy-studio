@@ -106,8 +106,9 @@ agent / skill / mcp 三件能力**前后端各有一份**，按各自项目里�
   filename）、`localfiles__read_text` 读本机文本。它不推事件、不等谁回话，只要
   `--comfyui-dir` 给了就挂上；换过引擎的 `--input-directory` / `--output-directory` 时
   用 `--input-dir` / `--output-dir`（或 `COMFY_INPUT_DIR` / `COMFY_OUTPUT_DIR`）跟着指。
-* `memory.py` —— 跨会话的长期记忆：会话历史只活在宿主进程里，宿主一退出就没了，于是
-  "我喜欢方形构图"、"这台是 24G 的 4090"这类话每次都得重说。这里用三张工具把它记下来：
+* `memory.py` —— 跨会话的长期记忆：对话正文会存盘（见下面的 `history.py`），但"我喜欢方形
+  构图"、"这台是 24G 的 4090"这类**事实**不该指望别人去翻上一段对话，它们得是随叫随到的。
+  这里用三张工具把它记下来：
   `memory__remember`（一条只说一件事，内容重复不会记两条）、`memory__recall`（不给关键词就
   列最近的，给了就只回匹配的）、`memory__forget`（删记错/过时的，id 从 recall 拿）。
   除了工具，它还会把 :meth:`MemoryStore.digest` 拼进**系统提示词**，而且
@@ -120,6 +121,17 @@ agent / skill / mcp 三件能力**前后端各有一份**，按各自项目里�
   文件坏了（不是 JSON / 版本不认识 / 形状不对）会**报错而不是静默重建** —— 悄悄从空开始
   会变成"助手莫名其妙把记性丢了"，比报错难查；`host/info` 里会如实报出 `memory_file`、
   `memory_entries` 与 `memory_error`（记忆坏了也不挡握手，否则连"记忆坏了"这句话都传不到面板上）。
+* `history.py` —— 对话正文的存档，与 `memory.py` 分工明确：记忆记**事实**（跨会话共享），
+  这里记**对话**（按 session 分开）。一轮跑完就把整段对话写成一份 JSON（落在记忆目录下的
+  `sessions/`，所以 `--memory-dir` 一换它跟着走），宿主下次起来建会话时把它喂回
+  `AgentSession` 接着聊，面板重开时用 `agent/history` 拿回同一套条目重画。存的是用户话 /
+  助手话 / 工具调用与结果，**人设（system）不存** —— 它每轮重算（记忆、在挂的通道都会变），
+  存下来就是一份过期人设。写盘是原子的（临时文件 + `os.replace`），文件名取 session_id 的
+  sha1 前 16 位（外面给的 id 拼不出 `../`）；读回来时只留**整轮**（第一条必须是用户话，不会
+  出现"结果还在、调用被裁掉"）、超长内容截断并写明截了多少、工具调用与结果必须成对 ——
+  对不上就整份拒绝并如实报错（假装"还没聊过"会让用户以为对话被吞了）。`agent/reset` 连存档
+  一起删（只清内存的话，下次重启会被原样复活），`--no-history` 整个关掉，`host/info` 里
+  报出 `history` 与 `history_dir`。
 
 对话要模型，配在环境变量里（不落盘、不进仓库）：`COMFY_STUDIO_LLM_MODEL`（必填）、
 `COMFY_STUDIO_LLM_BASE_URL`、`COMFY_STUDIO_LLM_API_KEY`。没配的话 `agent/config` 会明确
@@ -141,6 +153,12 @@ agent / skill / mcp 三件能力**前后端各有一份**，按各自项目里�
 一轮在跑时它是禁用的；旁边那个「停止」按钮走 `agent/cancel`——宿主立刻不再等模型与引擎，
 这一轮回的是**正常结果**（`cancelled: true`）而不是错误，面板把它画成"已停止"，
 历史配对完整，接着聊下一句就行。
+
+这个抽屉和宿主是两套生命周期：页面刷新、换个画布、宿主进程退出又起来，对话都不该凭空消失。
+所以打开抽屉（且里面还是空的）时，面板会问一次 `agent/history`：会话还活着就从它手里拿，
+没有就读盘上那份存档，拿到的条目走的是**和实时事件同一套画法** —— 重开面板看到的是上次那段
+对话，顶上那行小字写明"上次的对话（存在这台机器上）"，被裁掉的部分会标出"更早的 N 条没留下来"。
+存档读不了（文件坏了 / 版本不认识）就画一行说明并写出文件在哪，而不是让用户对着空白猜。
 
 画布那两个工具既是给模型用的也是给用户用的：问"我这张图里有什么"，它会先
 `canvas__snapshot` 看清再答；说"把这份工作流放到画布上"，就落到
@@ -236,8 +254,8 @@ cd ComfyUI/custom_nodes
 ```powershell
 cd Comfy-Desktop/lib
 ..\..\ComfyUI\.venv\Scripts\python.exe -m unittest comfy_studio.tests.test_host_e2e -v
-# 纯逻辑用例（本机文件 / 计划通道 / 长期记忆，不拉子进程）：
-# test_local_files.py、test_plan_tools.py、test_memory_tools.py
+# 纯逻辑用例（本机文件 / 计划通道 / 长期记忆 / 对话存档，不拉子进程）：
+# test_local_files.py、test_plan_tools.py、test_memory_tools.py、test_history.py
 ..\..\ComfyUI\.venv\Scripts\python.exe -m unittest discover -s comfy_studio/tests
 ```
 
@@ -254,8 +272,15 @@ e2e 壳启动宿主时给记忆目录一个临时目录（`--memory-dir`），�
 `test_memory_tools.py` 另外把存储层的硬约束钉住：重复内容不记两条、条数上限满了明确拒绝、
 `recall` 只读不写盘、坏文件报错且原样留着不重建、提示词那段的条数与字数上限、以及
 `compose_system_prompt` 里收尾要求永远在最后一条。
+对话存档也一样有端到端的那一半：一轮跑完后断言盘上真的多了一份这个会话的存档（人设不在里面）、
+`agent/history` 拿回的条目首尾对得上；`test_history.py` 再把存档自己的硬约束钉住 ——
+换个进程也读得到、`../` 拼不出目录、只留整轮、超长内容截断并写明、工具调用与结果必须成对、
+坏文件/旧版本/别的会话的档一律报错且原样留着、`agent/reset` 连存档一起清、写盘失败只 warning
+（答案已经给用户了，不该因为存档写不进去把这一轮判成失败）。
 桌面壳自己的 TypeScript 侧测试走 `pnpm test`（新增面板脚本的用例在
 `src/main/lib/comfyStudioChatContentScript.test.ts`，含模型下拉：填充、切换、
-被拒时回滚、一轮在飞时禁用；以及审核卡与计划清单卡：画清单、点头/要改、进度打勾。
+被拒时回滚、一轮在飞时禁用；以及审核卡与计划清单卡：画清单、点头/要改、进度打勾；
+还有"回到上次的对话"：开抽屉时照存档重画、被裁条数的提示、档读不了画一行说明、抽屉里
+已经有内容就不再补一遍；
 长期记忆没加面板代码：`memory__remember` / `__recall` / `__forget` 就是普通工具调用，
 抽屉里那套工具卡本来就会把参数与返回的 id 画出来 —— 另起一条提示条是同一份信息的重复）。

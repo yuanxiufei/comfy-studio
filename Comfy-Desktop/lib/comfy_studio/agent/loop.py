@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field, replace
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Sequence
 
 from ..cancel import CancelToken, Cancelled
 from ..mcp import McpError, McpHub, McpTool, tool_text
@@ -117,6 +117,7 @@ class AgentSession:
         system_prompt: str | Callable[[], str] = DEFAULT_SYSTEM_PROMPT,
         max_steps: int = DEFAULT_MAX_STEPS,
         max_parallel_tools: int = DEFAULT_MAX_PARALLEL_TOOLS,
+        history: Sequence[ChatMessage] | None = None,
     ) -> None:
         if not tools:
             raise AgentError("一个工具都没有：MCP server 还没 start()，或工具表是空的")
@@ -130,7 +131,28 @@ class AgentSession:
         #: 人设文本，或者一个**每次重算**它的零参函数（记忆那种每轮都在变的补充段要用它）。
         self.system_prompt = system_prompt
         self._schemas = tool_schemas(tools)
-        self.messages: list[ChatMessage] = [system_message(self._system_text())]
+        self.messages: list[ChatMessage] = [system_message(self._system_text()), *self._restore(history)]
+
+    @staticmethod
+    def _restore(history: Sequence[ChatMessage] | None) -> list[ChatMessage]:
+        """上次的对话（见 :mod:`comfy_studio.history`），直接排在系统提示词后面接着聊。
+
+        只挡一种情况：里面混进了 system。人设是每轮重算的，如果存档里也留了一条，
+        就会变成"系统提示词有两条、其中一条还是过期的"，模型到底听谁的说不准 ——
+        与其猜，不如当场报错（写存档那边本来就把 system 剔掉了，能混进来就是有人手改过）。
+        """
+        if not history:
+            return []
+        restored: list[ChatMessage] = []
+        for index, message in enumerate(history):
+            if not isinstance(message, ChatMessage):
+                raise AgentError(f"history 第 {index} 条不是 ChatMessage：{type(message).__name__}")
+            if message.role == "system":
+                raise AgentError(
+                    f"history 第 {index} 条是 system：人设每轮重算，不该从历史里来"
+                )
+            restored.append(message)
+        return restored
 
     def _system_text(self) -> str:
         """当前的人设文本。是可调用对象时现算一次 —— 于是这一轮刚记住的事，下一轮就在提示词里。"""
@@ -328,12 +350,14 @@ def create_session(
     max_steps: int = DEFAULT_MAX_STEPS,
     max_parallel_tools: int = DEFAULT_MAX_PARALLEL_TOOLS,
     config: LLMConfig | None = None,
+    history: Sequence[ChatMessage] | None = None,
 ) -> AgentSession:
     """按 MCP hub 汇出来的工具表组装一个会话。
 
     不给 ``config`` 就读环境变量（默认模型）；调用方想在 env 之外再指定模型
     （面板里切过的那种）就自己传一份 ``LLMConfig`` 进来。
     ``system_prompt`` 也可以给一个零参函数（每轮重算，见 :meth:`AgentSession._system_text`）。
+    ``history`` 是上次的对话（来自 :mod:`comfy_studio.history` 的存档），接着聊用。
     """
     return AgentSession(
         hub,
@@ -342,6 +366,7 @@ def create_session(
         system_prompt=system_prompt,
         max_steps=max_steps,
         max_parallel_tools=max_parallel_tools,
+        history=history,
     )
 
 

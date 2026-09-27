@@ -27,6 +27,8 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from comfy_studio.history import SESSION_SUBDIR
+
 REPO_ROOT = Path(__file__).resolve().parents[4]
 COMFYUI_DIR = REPO_ROOT / "ComfyUI"
 LIB_DIR = REPO_ROOT / "Comfy-Desktop" / "lib"
@@ -487,6 +489,9 @@ class StudioHostE2ETest(unittest.TestCase):
         self.assertIs(info.get("plan"), True)
         # 本机文件那几张不用谁接话，只要 --comfyui-dir 给了就挂上。
         self.assertIs(info.get("local_files"), True)
+        # 对话存档默认开着，且跟记忆落在同一个（这里是临时）数据目录下。
+        self.assertIs(info.get("history"), True)
+        self.assertEqual(info.get("history_dir"), str(self.memory_dir / SESSION_SUBDIR))
 
     def test_02_tools_are_namespaced_by_server(self) -> None:
         tools = self.call(2, "mcp/tools").get("result", {}).get("tools", [])
@@ -830,6 +835,39 @@ class StudioHostE2ETest(unittest.TestCase):
             if e["params"].get("type") == "tool_call"
         ]
         self.assertEqual(calls, [], "这一轮不该有任何工具调用：记忆是从提示词里知道的")
+
+    def test_21_the_conversation_survives_on_disk(self) -> None:
+        """对话存档：一轮跑完就落盘，面板什么时候来问都能拿回同一套条目。"""
+        # 同时只有 8 个会话槽，所以这里接着用上一个用例的会话 —— 对存档来说一轮就是一轮。
+        session = "memory-e2e"
+        ask = "帮我把这张图放大两倍"
+        self.send(40, "agent/chat", {"text": ask, "session_id": session})
+        reply = self.wait(40, SKILLS_TIMEOUT)
+        self.assertNotIn("error", reply, reply)
+
+        # 盘上真的留下了这个会话的对话（不是只在那个进程的内存里）。
+        archive_dir = self.memory_dir / SESSION_SUBDIR
+        bodies = [json.loads(path.read_text(encoding="utf-8")) for path in archive_dir.glob("*.json")]
+        mine = [body for body in bodies if body.get("session_id") == session]
+        self.assertEqual(len(mine), 1, f"没写出这个会话的存档：{bodies}")
+        roles = [m["role"] for m in mine[0]["messages"]]
+        self.assertEqual(roles[0], "user")
+        self.assertEqual(roles[-1], "assistant")
+        self.assertNotIn("system", roles, "人设每轮重算，不该进存档")
+        # 这一轮的问话在存档里（前后几轮的也在，只失一条就说明写盘丢了尾巴）。
+        asked = [m["content"] for m in mine[0]["messages"] if m["role"] == "user"]
+        self.assertEqual(asked[-1], ask)
+
+        # 面板要的那些条目由宿主现算，形状与实时事件一套，拿到就能画。
+        history = self.call(41, "agent/history", {"session_id": session}).get("result", {})
+        self.assertEqual(history.get("session_id"), session)
+        # 会话还活着就先用它手里的那份，且内存里的是全长、没有裁过。
+        self.assertEqual(history.get("source"), "session")
+        self.assertEqual(history.get("dropped"), 0)
+        entries = history.get("entries", [])
+        self.assertEqual(entries[0].get("type"), "user")
+        self.assertEqual(entries[-1].get("type"), "assistant")
+        self.assertEqual([e["text"] for e in entries if e.get("type") == "user"][-1], ask)
 
 
 if __name__ == "__main__":
