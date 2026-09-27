@@ -14,6 +14,15 @@ const SESSION_ID = 'comfy-desktop-studio-chat-session'
 const SESSION_NEW_ID = 'comfy-desktop-studio-chat-session-new'
 const SESSION_CLOSE_ID = 'comfy-desktop-studio-chat-session-close'
 const STORAGE_ID = 'comfy-desktop-studio-chat-storage'
+const TABS_ID = 'comfy-desktop-studio-chat-tabs'
+const CHAT_VIEW_ID = 'comfy-desktop-studio-chat-view'
+const NOVEL_VIEW_ID = 'comfy-desktop-studio-novel-view'
+const NOVEL_LIST_ID = 'comfy-desktop-studio-novel-list'
+const NOVEL_HINT_ID = 'comfy-desktop-studio-novel-hint'
+const NOVEL_FORM_ID = 'comfy-desktop-studio-novel-form'
+const NOVEL_PATH_ID = 'comfy-desktop-studio-novel-path'
+const NOVEL_READER_ID = 'comfy-desktop-studio-novel-reader'
+const NOVEL_PAGER_ID = 'comfy-desktop-studio-novel-pager'
 
 interface StudioBridge {
   status: ReturnType<typeof vi.fn>
@@ -1892,5 +1901,398 @@ describe('getComfyStudioChatContentScript', () => {
     planEvent()
 
     expect(planCards()).toHaveLength(0)
+  })
+
+  describe('管理小说', () => {
+    /** 原文目录是宿主给的（见 lib/comfy_studio/novels.py）：面板一个路径都不拼，只照着用。 */
+    const novelDir = 'D:/comfy/custom_nodes/comfy_studio/manju/novel'
+
+    /** 宿主 novels/list 里的一行。 */
+    const novelRow = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+      name: '长夜.txt',
+      bytes: 2048,
+      mtime: 1758900000,
+      text: true,
+      ...over
+    })
+
+    const listing = (novels: unknown[], over: Record<string, unknown> = {}): unknown => ({
+      ok: true,
+      result: {
+        dir: novelDir,
+        exists: true,
+        matched: novels.length,
+        returned: novels.length,
+        truncated: false,
+        limit: 200,
+        novels,
+        ...over
+      }
+    })
+
+    /** 只有 novels/* 那几件事走自己的桩；开抽屉时要问的那些保持默认。 */
+    const host = (handlers: Record<string, unknown>): RequestStub => (method, params) =>
+      method in handlers
+        ? typeof handlers[method] === 'function'
+          ? (handlers[method] as RequestStub)(method, params)
+          : handlers[method]
+        : { ok: true, result: { text: '答案在此' } }
+
+    const view = (id: string): HTMLElement => document.getElementById(id) as HTMLElement
+    const hintLine = (): HTMLElement => view(NOVEL_HINT_ID)
+    const tab = (label: string): HTMLButtonElement | undefined =>
+      Array.from(document.querySelectorAll<HTMLButtonElement>(`#${TABS_ID} .cs-tab`)).find(
+        (b) => b.textContent === label
+      )
+    const button = (scopeId: string, text: string): HTMLButtonElement | null =>
+      Array.from(document.querySelectorAll<HTMLButtonElement>(`#${scopeId} button`)).find(
+        (b) => b.textContent === text
+      ) ?? null
+    const lineButton = (name: string, text: string): HTMLButtonElement | null => {
+      const line = document.querySelector(`#${NOVEL_LIST_ID} .cs-novel-row[data-name="${name}"]`)
+      const buttons = Array.from(line?.querySelectorAll('button') ?? [])
+      return buttons.find((b) => b.textContent === text) ?? null
+    }
+    const novelLine = (name: string): Element | null =>
+      document.querySelector(`#${NOVEL_LIST_ID} .cs-novel-row[data-name="${name}"]`)
+    const pathInput = (): HTMLInputElement =>
+      document.getElementById(NOVEL_PATH_ID) as HTMLInputElement
+    const novelCalls = (bridge: StudioBridge, method: string): unknown[][] =>
+      bridge.request.mock.calls.filter((call: unknown[]) => call[0] === method)
+
+    const openNovels = async (): Promise<void> => {
+      tab('管理小说')?.click()
+      await flush()
+    }
+
+    it('only asks the host for novels once that page is opened', async () => {
+      const bridge = installBridge({ request: host({ 'novels/list': listing([]) }) })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      expect(view(CHAT_VIEW_ID).style.display).toBe('flex')
+      expect(view(NOVEL_VIEW_ID).style.display).toBe('none')
+      expect(novelCalls(bridge, 'novels/list'), '没打开这一页就别去动人家的书库').toHaveLength(0)
+
+      await openNovels()
+
+      expect(view(CHAT_VIEW_ID).style.display).toBe('none')
+      expect(view(NOVEL_VIEW_ID).style.display).toBe('flex')
+      expect(tab('管理小说')?.dataset.active).toBe('true')
+      expect(tab('对话')?.dataset.active).toBe('false')
+      // 目录是宿主的事：面板连 limit 都不自己定，全按宿主的默认来。
+      expect(bridge.request).toHaveBeenCalledWith('novels/list', {})
+    })
+
+    it('says the directory is not there yet instead of painting a failure', async () => {
+      installBridge({
+        request: host({
+          'novels/list': {
+            ok: true,
+            result: {
+              dir: novelDir,
+              exists: false,
+              matched: 0,
+              returned: 0,
+              truncated: false,
+              novels: []
+            }
+          }
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openNovels()
+
+      expect(hintLine().textContent).toContain('还没有原文目录')
+      expect(hintLine().textContent).toContain(novelDir)
+      expect(hintLine().getAttribute('data-tone'), '目录没建不是出错').toBe('info')
+      expect(document.getElementById(NOVEL_LIST_ID)?.textContent).toContain('还没有原文')
+    })
+
+    it('lists the directory and pages through one novel by character offset', async () => {
+      const bridge = installBridge({
+        request: host({
+          'novels/list': listing([
+            novelRow(),
+            novelRow({ name: '封面.png', bytes: 900, text: false })
+          ]),
+          'novels/read': (_method: string, params: unknown) =>
+            (params as { offset: number }).offset === 0
+              ? {
+                  ok: true,
+                  result: {
+                    name: '长夜.txt',
+                    offset: 0,
+                    chars: 4000,
+                    requested_chars: 4000,
+                    total_chars: 9000,
+                    at_end: false,
+                    bytes: 2048,
+                    mtime: 1758900000,
+                    encoding: 'utf-8',
+                    text: '第一章 雪'
+                  }
+                }
+              : {
+                  ok: true,
+                  result: {
+                    name: '长夜.txt',
+                    offset: 4000,
+                    chars: 4000,
+                    requested_chars: 4000,
+                    total_chars: 9000,
+                    at_end: true,
+                    bytes: 2048,
+                    mtime: 1758900000,
+                    encoding: 'gb18030',
+                    text: '第二章 火'
+                  }
+                }
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openNovels()
+
+      expect(document.querySelectorAll(`#${NOVEL_LIST_ID} .cs-novel-row`)).toHaveLength(2)
+      expect(lineButton('封面.png', '读')?.disabled, '不是 txt/md：照列，但读不了').toBe(true)
+
+      lineButton('长夜.txt', '读')?.click()
+      await flush()
+
+      // 分页按**字符**，一页多少字由宿主定：面板不传 chars（宿主的 DEFAULT_READ_CHARS 说了算），
+      // 也不去猜宿主的一页是多大 —— 猜了就得靠两边对齐，而那种错是静默的。
+      expect(bridge.request).toHaveBeenCalledWith('novels/read', {
+        name: '长夜.txt',
+        offset: 0
+      })
+      expect(view(NOVEL_READER_ID).textContent).toBe('第一章 雪')
+      expect(button(NOVEL_PAGER_ID, '上一页')?.disabled, '第一页没有上一页').toBe(true)
+      expect(view(NOVEL_PAGER_ID).textContent).toContain('第 0–4000 字 / 共 9000 字')
+      expect(hintLine().textContent, 'UTF-8 是默认档，不用挂在脸上').not.toContain('utf-8')
+      expect(novelLine('长夜.txt')?.getAttribute('data-open'), '在读的那一行要看得出来').toBe('true')
+
+      button(NOVEL_PAGER_ID, '下一页')?.click()
+      await flush()
+
+      expect(bridge.request).toHaveBeenCalledWith('novels/read', {
+        name: '长夜.txt',
+        offset: 4000
+      })
+      expect(view(NOVEL_READER_ID).textContent).toBe('第二章 火')
+      expect(hintLine().textContent, '宿主替你认了 GB18030，这件事要写在脸上').toContain('gb18030')
+      expect(hintLine().textContent).toContain('已到末尾')
+      expect(button(NOVEL_PAGER_ID, '下一页')?.disabled, '到头了就别再给一个能点的下一页').toBe(
+        true
+      )
+      expect(novelCalls(bridge, 'novels/read'), '禁用的按钮点不动，别再问一遍宿主').toHaveLength(2)
+
+      // 上一页要按**页长**退（宿主的 requested_chars），不是按这一页的正文长度：末页比一页短，
+      // 拿正文长度退回去会退不够，"上一页"就落在半中间。
+      button(NOVEL_PAGER_ID, '上一页')?.click()
+      await flush()
+
+      expect(bridge.request).toHaveBeenCalledWith('novels/read', {
+        name: '长夜.txt',
+        offset: 0
+      })
+      expect(view(NOVEL_READER_ID).textContent).toBe('第一章 雪')
+    })
+
+    it('puts the host reason where it can be read, and keeps the file listed', async () => {
+      const bridge = installBridge({
+        request: host({
+          'novels/list': listing([novelRow()]),
+          'novels/read': {
+            ok: false,
+            error: {
+              code: -32603,
+              message: '长夜.txt 认不出编码：试过 utf-8（第 12 字节起）与 gb18030 都不成'
+            }
+          }
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openNovels()
+
+      lineButton('长夜.txt', '读')?.click()
+      await flush()
+
+      // 原因（一整段）放正文区；状态行只说是哪一篇 —— 一行里塞一整段谁也读不完。
+      expect(view(NOVEL_READER_ID).textContent).toContain('认不出编码')
+      expect(hintLine().textContent).toContain('读不了 长夜.txt')
+      expect(hintLine().getAttribute('data-tone')).toBe('error')
+      expect(
+        document.querySelectorAll(`#${NOVEL_LIST_ID} .cs-novel-row`),
+        '读不了不是"这一篇不在"，列表照旧'
+      ).toHaveLength(1)
+      expect(novelCalls(bridge, 'novels/list')).toHaveLength(1)
+    })
+
+    it('asks before replacing a novel that is already in the directory', async () => {
+      const bridge = installBridge({
+        request: host({
+          'novels/list': listing([]),
+          'novels/import': (_method: string, params: unknown) =>
+            (params as { overwrite: boolean }).overwrite
+              ? {
+                  ok: true,
+                  result: {
+                    imported: true,
+                    overwritten: true,
+                    name: '长夜.txt',
+                    bytes: 4096,
+                    created_dir: false
+                  }
+                }
+              : {
+                  ok: true,
+                  result: {
+                    imported: false,
+                    reason: 'exists',
+                    name: '长夜.txt',
+                    bytes: 2048,
+                    message: '原文目录里已经有 长夜.txt 了（2048 字节）：要换成你这份就带 overwrite 再来一次'
+                  }
+                }
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openNovels()
+
+      button(NOVEL_VIEW_ID, '导入…')?.click()
+      pathInput().value = 'D:/books/长夜.txt'
+      button(NOVEL_FORM_ID, '导入')?.click()
+      await flush()
+
+      expect(bridge.request).toHaveBeenCalledWith('novels/import', {
+        path: 'D:/books/长夜.txt',
+        overwrite: false
+      })
+      expect(hintLine().textContent, '同名不是出错，是要你确认一下').toContain('已经有')
+      expect(hintLine().getAttribute('data-tone')).toBe('info')
+      expect(button(NOVEL_FORM_ID, '覆盖导入')?.style.display, '这时候才把它露出来').not.toBe(
+        'none'
+      )
+
+      // 换了路径就把那一下收回去：它只该对着刚问过的那份文件。
+      pathInput().value = 'D:/books/另一本.txt'
+      pathInput().dispatchEvent(new Event('input'))
+      expect(button(NOVEL_FORM_ID, '覆盖导入')?.style.display).toBe('none')
+    })
+
+    it('replaces it once the user says so, and says which one changed', async () => {
+      const bridge = installBridge({
+        request: host({
+          'novels/list': listing([novelRow()]),
+          'novels/read': {
+            ok: true,
+            result: {
+              name: '长夜.txt',
+              offset: 0,
+              chars: 4000,
+              requested_chars: 4000,
+              total_chars: 20,
+              at_end: true,
+              bytes: 2048,
+              mtime: 1758900000,
+              text: '旧的那一章'
+            }
+          },
+          'novels/import': {
+            ok: true,
+            result: {
+              imported: true,
+              overwritten: true,
+              name: '长夜.txt',
+              bytes: 4096,
+              created_dir: true
+            }
+          }
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openNovels()
+
+      // 先把要覆盖的那篇打开：覆盖之后正文区必须收掉，不能留着旧的字。
+      lineButton('长夜.txt', '读')?.click()
+      await flush()
+      expect(view(NOVEL_READER_ID).textContent).toBe('旧的那一章')
+
+      button(NOVEL_VIEW_ID, '导入…')?.click()
+      pathInput().value = 'D:/books/长夜.txt'
+      button(NOVEL_FORM_ID, '覆盖导入')?.click()
+      await flush()
+
+      expect(bridge.request).toHaveBeenCalledWith('novels/import', {
+        path: 'D:/books/长夜.txt',
+        overwrite: true
+      })
+      expect(hintLine().textContent).toContain('换成了 长夜.txt')
+      expect(hintLine().textContent, '顺手把目录建出来这件事也要说出口').toContain(
+        '原文目录是这一下建出来的'
+      )
+      expect(pathInput().value, '导完就清空，免得手一抖再点一次').toBe('')
+      expect(novelCalls(bridge, 'novels/list'), '导进来一本，列表要重新列一遍').toHaveLength(2)
+      expect(
+        view(NOVEL_READER_ID).textContent,
+        '正文被换掉了，旧的字不能还挂在屏幕上'
+      ).toBe('选中上面一篇，正文显示在这里。')
+      expect(novelLine('长夜.txt')?.getAttribute('data-open')).toBeNull()
+    })
+
+    it('deletes only on a second click, and only that row', async () => {
+      const bridge = installBridge({
+        request: host({
+          'novels/list': listing([novelRow(), novelRow({ name: '另一本.md', bytes: 1024 })]),
+          'novels/delete': { ok: true, result: { name: '长夜.txt', bytes: 2048, deleted: true } }
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openNovels()
+
+      lineButton('长夜.txt', '删除')?.click()
+
+      expect(novelCalls(bridge, 'novels/delete'), '第一下只是把它武装起来').toHaveLength(0)
+      expect(lineButton('长夜.txt', '确认删除')).not.toBeNull()
+      expect(lineButton('另一本.md', '删除'), '这一下只对着刚点的那一行').not.toBeNull()
+
+      lineButton('长夜.txt', '确认删除')?.click()
+      await flush()
+
+      expect(bridge.request).toHaveBeenCalledWith('novels/delete', { name: '长夜.txt' })
+      expect(hintLine().textContent).toContain('删掉了 长夜.txt')
+      expect(novelCalls(bridge, 'novels/list'), '删完要重新列，别让人对着已经不存在的名字点').toHaveLength(
+        2
+      )
+    })
+
+    it('hands a novel to the conversation without sending it for the user', async () => {
+      const bridge = installBridge({ request: host({ 'novels/list': listing([novelRow()]) }) })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openNovels()
+
+      lineButton('长夜.txt', '拿去对话')?.click()
+
+      expect(view(CHAT_VIEW_ID).style.display).toBe('flex')
+      expect(view(NOVEL_VIEW_ID).style.display).toBe('none')
+      const input = document.getElementById(INPUT_ID) as HTMLTextAreaElement
+      expect(input.value).toBe('用原文「长夜.txt」开工')
+      expect(novelCalls(bridge, 'agent/chat'), '发不发由用户自己按').toHaveLength(0)
+    })
   })
 })

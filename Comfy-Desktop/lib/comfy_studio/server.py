@@ -27,6 +27,10 @@
 ``agent/sessions``       面板那份会话清单：活着的 + 存档里的，一行一段（含标题、条数、在跑）
 ``agent/close``          ``{session_id?}`` → 关掉一段对话（腾出会话位，对话留在存档里）
 ``agent/reset``          清空某个会话的历史与它的存档（这一轮在跑就拒绝，免得被收尾写回来）
+``novels/list``          面板「管理小说」用：漫剧原文目录里有哪些小说
+``novels/read``          ``{name, offset?, chars?}`` → 一篇原文的一页（按字符分页）
+``novels/import``        ``{path, name?, overwrite?}`` → 把本机一份 txt/md 接进原文目录
+``novels/delete``        ``{name}`` → 删掉一篇原文（面板先问一次再调它）
 ======================  ==============================================
 
 ``agent/canvas_result`` / ``agent/answer`` / ``agent/plan_result`` 是三条「回程」：桌面壳要
@@ -75,6 +79,16 @@ from .history import (
 from .localfiles import LocalFiles, LocalFilesClient
 from .memory import MemoryClient, MemoryStore, MemoryStoreError, memory_home
 from .mcp import McpHub, McpServerConfig
+from .novels import (
+    DEFAULT_LIST_LIMIT,
+    DEFAULT_READ_CHARS,
+    MAX_LIST_LIMIT,
+    MAX_READ_CHARS,
+    MAX_TEXT_BYTES,
+    NovelLibrary,
+    NovelsError,
+    default_novel_dir,
+)
 from .plan import PlanChannel, PlanClient
 from .review import ReviewChannel, ReviewClient
 from .rpc import INTERNAL_ERROR, INVALID_PARAMS, RpcContext, RpcError, StdioRpcServer
@@ -109,6 +123,30 @@ def _text(params: dict[str, Any], key: str) -> str:
     return value
 
 
+def _int_param(
+    params: dict[str, Any],
+    key: str,
+    default: int,
+    *,
+    low: int,
+    high: int,
+    method: str,
+) -> int:
+    """取一个整数参数：没给就用默认值，给了就必须在这个范围内（``bool`` 不算整数）。
+
+    参数形状的问题一律在 RPC 这一层挡掉：面板那边收到的是"参数不对"，而不是下层某处的
+    ``TypeError`` —— 后者会把 -32603 和一句 Python 报错丢到界面上。
+    """
+    raw = params.get(key)
+    if raw is None:
+        return default
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise RpcError(INVALID_PARAMS, f"{method} 的 {key} 必须是整数")
+    if raw < low or raw > high:
+        raise RpcError(INVALID_PARAMS, f"{method} 的 {key} 要在 {low}~{high} 之间，给的是 {raw}")
+    return raw
+
+
 def _agent_json(profile: AgentProfile) -> dict[str, Any]:
     """智能体清单里给面板看的那几个字段。
 
@@ -141,6 +179,7 @@ class StudioHost:
         memory: MemoryClient | None = None,
         history: SessionHistoryStore | None = None,
         agents: AgentCatalog | None = None,
+        novels: NovelLibrary | None = None,
     ) -> None:
         self.hub = hub
         self.catalog = catalog
@@ -163,6 +202,9 @@ class StudioHost:
         self.history = history
         #: 智能体目录：内置那几项 + 用户目录里的 md（没配目录就只有内置那几项）。
         self.agents = agents if agents is not None else AgentCatalog()
+        #: 漫剧原文目录（``--novel-dir``，或由 ``--comfyui-dir`` 推出默认落点）；None 时
+        #: ``novels/*`` 会明确说"宿主没挂原文目录"，而不是回一个空的列表让人以为书没了。
+        self.novels = novels
         #: 面板里切过的模型；None = 用环境变量里那个（进程内有效，不落盘）。
         self.default_model: str | None = None
         #: 面板里切过的智能体；None = 用内置的通用助手（同样只在进程内有效）。
@@ -199,6 +241,10 @@ class StudioHost:
         self.server.on("agent/sessions", self.agent_sessions)
         self.server.on("agent/close", self.agent_close)
         self.server.on("agent/reset", self.agent_reset)
+        self.server.on("novels/list", self.novels_list)
+        self.server.on("novels/read", self.novels_read)
+        self.server.on("novels/import", self.novels_import)
+        self.server.on("novels/delete", self.novels_delete)
 
     # ---- 方法 -----------------------------------------------------------
 
@@ -237,6 +283,11 @@ class StudioHost:
             "output_dir": str(self.local_files.files.output_dir)
             if self.local_files is not None
             else None,
+            # 漫剧原文目录：面板「管理小说」那一页读的就是它。目录**不存在**也算挂上了
+            # （还没导过原文，或这个检出里没有漫剧数据）—— 那种情况由 novels/list 的
+            # exists 字段如实说，不在这里当错误报。
+            "novels": self.novels is not None,
+            "novel_dir": str(self.novels.directory) if self.novels is not None else None,
             "memory": self.memory is not None,
             "memory_file": str(self.memory.store.path) if self.memory is not None else None,
             "memory_entries": memory_entries,
@@ -712,6 +763,80 @@ class StudioHost:
         session.reset()
         return {"session_id": session_id, "reset": True, "history_cleared": cleared}
 
+    # ---- 管理小说 -------------------------------------------------------
+    #
+    # 面板「管理小说」那一页的四件事，活都在 :mod:`comfy_studio.novels` 里。这一层只管参数
+    # 形状（越界的一律 INVALID_PARAMS，别把 Python 报错丢到界面上）和把领域错误翻成错误码。
+    # 只有一种是**不抛**的：同名已存在（见 :meth:`novels_import`）—— 那是请用户确认，不是出错。
+
+    def _novels(self) -> NovelLibrary:
+        if self.novels is None:
+            raise RpcError(
+                INTERNAL_ERROR,
+                "这个宿主没挂原文目录（既没 --comfyui-dir 也没 --novel-dir）：管理小说这一页用不了",
+            )
+        return self.novels
+
+    def novels_list(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
+        """原文目录里有哪些小说；``exists: false`` 表示目录还没建出来或这个检出里没有漫剧数据（不是错误）。"""
+        args = _object(params, "novels/list")
+        name = args.get("name")
+        if name is not None and not isinstance(name, str):
+            raise RpcError(INVALID_PARAMS, "name 必须是字符串")
+        limit = _int_param(
+            args, "limit", DEFAULT_LIST_LIMIT, low=1, high=MAX_LIST_LIMIT, method="novels/list"
+        )
+        try:
+            return self._novels().list(name, limit)
+        except NovelsError as err:
+            raise RpcError(INTERNAL_ERROR, str(err)) from err
+
+    def novels_read(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
+        """读一篇原文的一页；按字符分页，回来的 ``next_offset`` 直接当下一次的 ``offset``。
+
+        ``offset`` 的上限取 :data:`comfy_studio.novels.MAX_TEXT_BYTES`：汉字在 UTF-8 里至少
+        占一个字节，所以字数不可能超过字节上限 —— 比这个还大的 offset 一定是调用方算错了。
+        """
+        args = _object(params, "novels/read")
+        name = _text(args, "name")
+        offset = _int_param(args, "offset", 0, low=0, high=MAX_TEXT_BYTES, method="novels/read")
+        chars = _int_param(
+            args, "chars", DEFAULT_READ_CHARS, low=1, high=MAX_READ_CHARS, method="novels/read"
+        )
+        try:
+            return self._novels().read(name, offset, chars)
+        except NovelsError as err:
+            raise RpcError(INTERNAL_ERROR, str(err)) from err
+
+    def novels_import(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
+        """把本机一份 txt/md 接进原文目录。
+
+        ``overwrite`` 默认关：同名时**不抛异常**，回一条 ``{imported: false, reason: "exists"}``，
+        面板据此把「覆盖导入」露出来问一次 —— 悄悄换掉用户原来那本是最不该干的事。
+        其余不成立的情况都是调用方给的路径/后缀不对，按参数问题回。
+        """
+        args = _object(params, "novels/import")
+        path = _text(args, "path")
+        name = args.get("name")
+        if name is not None and not isinstance(name, str):
+            raise RpcError(INVALID_PARAMS, "name 必须是字符串")
+        overwrite = args.get("overwrite")
+        if overwrite is not None and not isinstance(overwrite, bool):
+            raise RpcError(INVALID_PARAMS, "overwrite 必须是布尔值")
+        try:
+            return self._novels().import_file(path, name, bool(overwrite))
+        except NovelsError as err:
+            raise RpcError(INVALID_PARAMS, str(err)) from err
+
+    def novels_delete(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
+        """删掉一篇原文（面板那边是点了两下才走到这儿，见 ``comfyStudioChatContentScript.ts``）。"""
+        args = _object(params, "novels/delete")
+        name = _text(args, "name")
+        try:
+            return self._novels().delete(name)
+        except NovelsError as err:
+            raise RpcError(INTERNAL_ERROR, str(err)) from err
+
     # ---- 生命周期 -------------------------------------------------------
 
     def _llm_config(self) -> LLMConfig:
@@ -923,6 +1048,7 @@ async def serve_stdio(
     plan: bool = False,
     input_dir: str | None = None,
     output_dir: str | None = None,
+    novel_dir: str | None = None,
     memory: bool = True,
     memory_dir: str | None = None,
     agents_dir: str | None = None,
@@ -938,6 +1064,11 @@ async def serve_stdio(
     本机文件那几张（:mod:`comfy_studio.localfiles`）不需要谁接话，只要 ``comfyui_dir``
     给了就挂上；``input_dir`` / ``output_dir`` 用来对应引擎启动参数
     ``--input-directory`` / ``--output-directory``（默认就是 comfyui_dir 下的同名目录）。
+    漫剧原文（:mod:`comfy_studio.novels`，面板「管理小说」那一页的活）同理，但它不吃引擎的
+    启动参数：``novel_dir`` 直接给，否则由 ``comfyui_dir`` 推出默认落点 —— 业务数据住在引擎
+    检出的 ``custom_nodes/comfy_studio/manju/`` 下，原文在它的 ``novel/`` 里
+    （:func:`comfy_studio.novels.default_novel_dir`）。两个都没给就挂不上，``novels/*`` 会
+    照实说 —— 那比回一个空书库好："目录还没建"和"没挂上"在面板上是两句不同的话。
     长期记忆（:mod:`comfy_studio.memory`）同样不需要谁接话，而且它是这个工作台该有的
     记性，所以**默认开着**：一份落在用户数据目录的 JSON，``memory_dir`` 换地方，
     ``memory=False`` 整个关掉（工具表里就没有 memory__* 了）。
@@ -957,6 +1088,14 @@ async def serve_stdio(
         if comfyui_dir
         else None
     )
+    # 漫剧原文目录：面板「管理小说」那一页读写的就是它。这两种给法都算数，
+    # 都没给就挂不上（那几张 RPC 会照实说，而不是回一个空书库）。
+    novel_root = (
+        Path(novel_dir).expanduser()
+        if novel_dir
+        else (default_novel_dir(comfyui_dir) if comfyui_dir else None)
+    )
+    novels = NovelLibrary(novel_root) if novel_root is not None else None
     memory_client = (
         MemoryClient(MemoryStore(memory_dir or memory_home())) if memory else None
     )
@@ -993,6 +1132,7 @@ async def serve_stdio(
             memory=memory_client,
             history=history_store,
             agents=agent_catalog,
+            novels=novels,
         )
         # stdin 一关（面板退出）就先叫停在飞的轮次，别让退出卡在长任务上。
         host.server.on_close = lambda: host.cancel_turns("宿主退出")

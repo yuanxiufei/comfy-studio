@@ -104,6 +104,15 @@ var SESSION_ID = 'comfy-desktop-studio-chat-session';
 var SESSION_NEW_ID = 'comfy-desktop-studio-chat-session-new';
 var SESSION_CLOSE_ID = 'comfy-desktop-studio-chat-session-close';
 var STORAGE_ID = 'comfy-desktop-studio-chat-storage';
+var TABS_ID = 'comfy-desktop-studio-chat-tabs';
+var CHAT_VIEW_ID = 'comfy-desktop-studio-chat-view';
+var NOVEL_VIEW_ID = 'comfy-desktop-studio-novel-view';
+var NOVEL_LIST_ID = 'comfy-desktop-studio-novel-list';
+var NOVEL_HINT_ID = 'comfy-desktop-studio-novel-hint';
+var NOVEL_FORM_ID = 'comfy-desktop-studio-novel-form';
+var NOVEL_PATH_ID = 'comfy-desktop-studio-novel-path';
+var NOVEL_READER_ID = 'comfy-desktop-studio-novel-reader';
+var NOVEL_PAGER_ID = 'comfy-desktop-studio-novel-pager';
 
 var MUTED = 'var(--content-fg,#9b9b9b)';
 var FG = 'var(--fg-color,#e5e5e5)';
@@ -210,7 +219,43 @@ var CHAT_CSS =
   '#' + DRAWER_ID + ' .cs-plan[data-state="stale"]{border-color:' + BORDER + ';background:transparent;}' +
   // 态度送出去之后就把按钮和表单收起来：留着会让人以为还能再表一次态
   '#' + DRAWER_ID + ' .cs-plan:not([data-state="waiting"]):not([data-state="editing"]) .cs-plan-actions,' +
-  '#' + DRAWER_ID + ' .cs-plan:not([data-state="waiting"]):not([data-state="editing"]) .cs-plan-feedback{display:none;}';
+  '#' + DRAWER_ID + ' .cs-plan:not([data-state="waiting"]):not([data-state="editing"]) .cs-plan-feedback{display:none;}' +
+  // 页签：抽屉就这么大地方，索性把"对话"和"管理小说"摆成两页，各占满剩下的高度。
+  // 当前是哪一页交给 data-active，别用内联样式写死（跟上面 data-state 那套一个约定）。
+  '#' + DRAWER_ID + ' .cs-tabs{display:flex;gap:6px;padding:0 12px 8px;}' +
+  '#' + DRAWER_ID + ' .cs-tab{border:1px solid ' + BORDER + ';border-radius:4px;background:transparent;' +
+  'color:' + MUTED + ';cursor:pointer;font:inherit;font-size:12px;padding:3px 10px;}' +
+  '#' + DRAWER_ID + ' .cs-tab[data-active="true"]{color:' + FG + ';background:' + INPUT_BG + ';}' +
+  // 书库那一页：一行一排按钮，列表和正文各滚各的 —— 挤进一个滚动区里，翻正文就会把
+  // 列表顶出屏幕，回头还得先滚回去才知道自己在读哪一本。
+  '#' + DRAWER_ID + ' .cs-novel-bar{display:flex;align-items:center;gap:6px;padding:0 12px 8px;}' +
+  '#' + DRAWER_ID + ' .cs-novel-btn{border:1px solid ' + BORDER + ';border-radius:4px;' +
+  'background:transparent;color:inherit;cursor:pointer;font:inherit;font-size:12px;padding:3px 8px;}' +
+  '#' + DRAWER_ID + ' .cs-novel-btn:hover{background:' + INPUT_BG + ';}' +
+  '#' + DRAWER_ID + ' .cs-novel-btn[data-tone="danger"]{color:' + MUTED + ';}' +
+  // "删到第二步"是真的会删文件，所以那一下给红边：按钮长什么样就说明这一下有多重。
+  '#' + DRAWER_ID + ' .cs-novel-btn[data-armed="true"]{border-color:#d9534f;color:#ff8080;}' +
+  '#' + DRAWER_ID + ' .cs-novel-btn:disabled{color:' + MUTED + ';cursor:not-allowed;}' +
+  '#' + DRAWER_ID + ' .cs-novel-hint{padding:0 12px 8px;color:' + MUTED + ';font-size:11px;}' +
+  '#' + DRAWER_ID + ' .cs-novel-hint[data-tone="error"]{color:#ff8080;}' +
+  '#' + DRAWER_ID + ' .cs-novel-form{display:none;flex-wrap:wrap;gap:6px;padding:0 12px 8px;}' +
+  '#' + DRAWER_ID + ' .cs-novel-form[data-open="1"]{display:flex;}' +
+  '#' + DRAWER_ID + ' .cs-novel-path{flex:1;min-width:0;box-sizing:border-box;border:1px solid ' + BORDER + ';' +
+  'border-radius:4px;background:' + INPUT_BG + ';color:inherit;font:inherit;font-size:12px;padding:4px 6px;}' +
+  '#' + DRAWER_ID + ' .cs-novel-list{max-height:38%;overflow-y:auto;padding:0 12px 8px;' +
+  'display:flex;flex-direction:column;}' +
+  '#' + DRAWER_ID + ' .cs-novel-row{display:flex;flex-direction:column;gap:4px;' +
+  'border-bottom:1px solid ' + BORDER + ';padding:6px 0;}' +
+  '#' + DRAWER_ID + ' .cs-novel-name{word-break:break-all;}' +
+  '#' + DRAWER_ID + ' .cs-novel-row[data-open="true"] .cs-novel-name{font-weight:600;}' +
+  '#' + DRAWER_ID + ' .cs-novel-meta{color:' + MUTED + ';font-size:11px;}' +
+  '#' + DRAWER_ID + ' .cs-novel-actions{display:flex;gap:6px;}' +
+  '#' + DRAWER_ID + ' .cs-novel-empty{color:' + MUTED + ';font-size:12px;padding:6px 0;}' +
+  '#' + DRAWER_ID + ' .cs-novel-reader{flex:1;min-height:0;overflow:auto;margin:0 12px;padding:8px;' +
+  'border:1px solid ' + BORDER + ';border-radius:4px;font-size:12px;white-space:pre-wrap;word-break:break-word;}' +
+  '#' + DRAWER_ID + ' .cs-novel-pager{display:flex;align-items:center;gap:6px;padding:8px 12px;' +
+  'color:' + MUTED + ';font-size:11px;}' +
+  '#' + DRAWER_ID + ' .cs-novel-pager .cs-novel-pos{margin-left:auto;white-space:nowrap;}';
 
 function ensureStyle() {
   if (document.getElementById(STYLE_ID)) return;
@@ -428,18 +473,30 @@ function buildDrawer() {
   composer.appendChild(input);
   composer.appendChild(stopTurn);
   composer.appendChild(send);
+  // 对话那一整套（模型/智能体/会话/状态/日志/输入）收进一页里，好跟"管理小说"那页互相
+  // 让位。收进容器不影响下面按 id 取元素的写法：id 还是全局唯一的。
+  var chatView = document.createElement('div');
+  chatView.id = CHAT_VIEW_ID;
+  chatView.style.cssText = 'flex:1;min-height:0;display:none;flex-direction:column;';
+
   header.appendChild(title);
   header.appendChild(stop);
   header.appendChild(close);
+  chatView.appendChild(controls);
+  chatView.appendChild(agents);
+  chatView.appendChild(sessions);
+  chatView.appendChild(status);
+  chatView.appendChild(storage);
+  chatView.appendChild(log);
+  chatView.appendChild(composer);
   drawer.appendChild(header);
-  drawer.appendChild(controls);
-  drawer.appendChild(agents);
-  drawer.appendChild(sessions);
-  drawer.appendChild(status);
-  drawer.appendChild(storage);
-  drawer.appendChild(log);
-  drawer.appendChild(composer);
+  drawer.appendChild(buildTabs());
+  drawer.appendChild(chatView);
+  drawer.appendChild(buildNovelView());
   document.body.appendChild(drawer);
+  // 抽屉一建出来就按 STATE.view 摆好（默认「对话」）。这一页不落盘：刷新页面回到对话，
+  // 是件正常的事 —— 而"上次我在改小说"并不像"上次聊到哪一段"那样值得跨重载记住。
+  switchView(STATE.view);
   return drawer;
 }
 
@@ -1542,6 +1599,536 @@ function closeDrawer() {
   STATE.open = false;
 }
 
+// ---- 管理小说 ----------------------------------------------------------
+//
+// 漫剧那套流程的入口是**原文**：manju/novel/ 下躺着小说 txt，拆章、写剧本、出分镜都从它
+// 出发。这一页就是那座书库的前台：列出来、翻一翻、把本机的一份接进来、看不顺眼的删掉；
+// 选中一篇还能直接把"用这篇开工"送进对话输入框（人改完自己发，面板不替人按发送）。
+//
+// 路径一个都不拼：目录由宿主给（host/info 的 novel_dir，默认
+// <comfyui-dir>/custom_nodes/comfy_studio/manju/novel，见 lib/comfy_studio/novels.py）。
+// 面板这边自己拼路径，迟早会和宿主说的不是同一个地方。四个动作全走 novels/* RPC，
+// 这一页自己只留两样东西：读到的第几页、和"删到第二步了没"。
+
+// 一页多少字**不问面板**：请求时不带 chars，按宿主的 DEFAULT_READ_CHARS 来（见
+// lib/comfy_studio/novels.py），翻页要用的页长从回话里的 requested_chars 拿。
+// 曾在这里手抄过一份 4000 —— 两份数对不上时是**静默**的：翻页会跳字或原地打转，
+// 而面板和宿主谁都不会报错，正是最该避开的那类错。
+
+function buildTabs() {
+  var tabs = document.createElement('div');
+  tabs.id = TABS_ID;
+  tabs.className = 'cs-tabs';
+  [['chat', '对话'], ['novel', '管理小说']].forEach(function (pair) {
+    var tab = document.createElement('button');
+    tab.type = 'button';
+    tab.className = 'cs-tab';
+    tab.dataset.view = pair[0];
+    tab.textContent = pair[1];
+    tab.addEventListener('click', function () {
+      switchView(pair[0]);
+    });
+    tabs.appendChild(tab);
+  });
+  return tabs;
+}
+
+function switchView(view) {
+  STATE.view = view === 'novel' ? 'novel' : 'chat';
+  var chat = document.getElementById(CHAT_VIEW_ID);
+  var novel = document.getElementById(NOVEL_VIEW_ID);
+  if (chat) chat.style.display = STATE.view === 'chat' ? 'flex' : 'none';
+  if (novel) novel.style.display = STATE.view === 'novel' ? 'flex' : 'none';
+  var tabs = document.querySelectorAll('#' + DRAWER_ID + ' .cs-tab');
+  for (var index = 0; index < tabs.length; index += 1) {
+    tabs[index].dataset.active = tabs[index].dataset.view === STATE.view ? 'true' : 'false';
+  }
+  // 每次切到这一页都重新列一遍：原文是别的程序（编辑器、git、别的工具）也会动的东西，
+  // 拿上回那份列表当准数，就会出现"点了半天打开的是个已经不存在的文件"。
+  if (STATE.view === 'novel') loadNovels();
+}
+
+function buildNovelView() {
+  var view = document.createElement('div');
+  view.id = NOVEL_VIEW_ID;
+  view.style.cssText = 'flex:1;min-height:0;display:none;flex-direction:column;';
+
+  var bar = document.createElement('div');
+  bar.className = 'cs-novel-bar';
+  bar.appendChild(novelButton('刷新', '重新列一遍原文目录', function () {
+    loadNovels();
+  }));
+  bar.appendChild(novelButton('导入…', '把本机的一份 txt/md 接进原文目录（粘贴它的绝对路径）', function () {
+    var form = document.getElementById(NOVEL_FORM_ID);
+    if (!form) return;
+    var opening = form.dataset.open !== '1';
+    form.dataset.open = opening ? '1' : '0';
+    if (opening) {
+      var path = document.getElementById(NOVEL_PATH_ID);
+      if (path) path.focus();
+    }
+  }));
+  bar.appendChild(novelButton('去对话', '回到对话那一页', function () {
+    switchView('chat');
+  }));
+
+  // 导入表单单独一行：路径是长文本，挤在按钮那行里会窄到看不见自己粘了什么。
+  var form = document.createElement('div');
+  form.id = NOVEL_FORM_ID;
+  form.className = 'cs-novel-form';
+  form.dataset.open = '0';
+
+  var path = document.createElement('input');
+  path.id = NOVEL_PATH_ID;
+  path.type = 'text';
+  path.className = 'cs-novel-path';
+  // 例子里用正斜杠：这段 JS 住在一个模板字符串里，反斜杠要先过一层转义，
+  // 写出来是给人看的话就别给自己埋雷（Windows 上路径两种斜杠两边都认）。
+  path.placeholder = '本机原文的绝对路径，例如 D:/books/某小说.txt';
+  path.addEventListener('keydown', function (event) {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      importNovel(false);
+    }
+  });
+  // 换了路径就把"覆盖导入"收回去：那一下会替换掉目录里同名那本，只该对着刚问过的那个
+  // 路径点，不能留在屏幕上等着被下一个路径误用。
+  path.addEventListener('input', function () {
+    showOverwrite(false);
+  });
+
+  var go = novelButton('导入', '把这份接进原文目录（同名会先问你）', function () {
+    importNovel(false);
+  });
+  var overwrite = novelButton('覆盖导入', '同名时换成你这份，原来那本会被替换掉', function () {
+    importNovel(true);
+  });
+  overwrite.dataset.tone = 'danger';
+  overwrite.style.display = 'none';
+
+  var hint = document.createElement('div');
+  hint.id = NOVEL_HINT_ID;
+  hint.className = 'cs-novel-hint';
+  hint.textContent = '还没读过原文目录。';
+
+  var list = document.createElement('div');
+  list.id = NOVEL_LIST_ID;
+  list.className = 'cs-novel-list';
+
+  var reader = document.createElement('div');
+  reader.id = NOVEL_READER_ID;
+  reader.className = 'cs-novel-reader';
+  reader.textContent = '选中上面一篇，正文显示在这里。';
+
+  var pager = document.createElement('div');
+  pager.id = NOVEL_PAGER_ID;
+  pager.className = 'cs-novel-pager';
+
+  form.appendChild(path);
+  form.appendChild(go);
+  form.appendChild(overwrite);
+  view.appendChild(bar);
+  view.appendChild(form);
+  view.appendChild(hint);
+  view.appendChild(list);
+  view.appendChild(reader);
+  view.appendChild(pager);
+  return view;
+}
+
+// 这一页要用的按钮长一个样，样式表里一条 .cs-novel-btn 管全部。
+function novelButton(text, title, onClick) {
+  var button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'cs-novel-btn';
+  button.textContent = text;
+  button.title = title;
+  button.addEventListener('click', onClick);
+  return button;
+}
+
+function novelHint(text, tone) {
+  var hint = document.getElementById(NOVEL_HINT_ID);
+  if (!hint) return;
+  hint.textContent = text;
+  hint.dataset.tone = tone === 'error' ? 'error' : 'info';
+}
+
+function showOverwrite(visible) {
+  var button = document.querySelector('#' + NOVEL_FORM_ID + ' .cs-novel-btn[data-tone="danger"]');
+  if (button) button.style.display = visible ? '' : 'none';
+}
+
+// 大小和日期都按人看得懂的样子写：面板上"3145728 字节"和"3.0 MB"是同一件事，
+// 但只有后者能让人一眼判断这篇值不值得打开。
+function formatBytes(bytes) {
+  if (typeof bytes !== 'number' || bytes < 0) return '大小不明';
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+}
+
+function formatTime(seconds) {
+  if (typeof seconds !== 'number' || !seconds) return '改于不明';
+  return new Date(seconds * 1000).toLocaleString();
+}
+
+function novelEmpty(text) {
+  var empty = document.createElement('div');
+  empty.className = 'cs-novel-empty';
+  empty.textContent = text;
+  return empty;
+}
+
+// note 是"刚刚发生的那件事"（刚导进来一本、刚删掉一篇）。它有理由压过目录摘要：
+// 用户按下那个按钮，要看到的是"这一下成没成"，而不是又一次被念目录在哪、共几篇。
+function loadNovels(note) {
+  var list = document.getElementById(NOVEL_LIST_ID);
+  if (list && !STATE.novels) {
+    list.textContent = '';
+    list.appendChild(novelEmpty('正在列原文目录…'));
+  }
+  // 连点两下"刷新"、或者切页切得快，回话可能乱序：认序号，不是最新那趟的就不画。
+  STATE.novelListToken = (STATE.novelListToken || 0) + 1;
+  var token = STATE.novelListToken;
+  return Promise.resolve(bridge.request('novels/list', {})).then(
+    function (response) {
+      if (token !== STATE.novelListToken) return null;
+      // 通道本身出事（宿主退了、连接断了）时 bridge 那边也可能直接把 Promise 打回失败，
+      // 所以下面那个 rejection 分支照留；这里管的是"通道在，但宿主回了 ok:false"。
+      if (!response || response.ok !== true) {
+        var error = (response && response.error) || {};
+        STATE.novels = null;
+        novelHint('列不了原文目录: ' + (error.message || '未知错误'), 'error');
+        paintNovels(null);
+        return null;
+      }
+      var result = response.result || null;
+      STATE.novels = result;
+      paintNovels(result);
+      if (note) novelHint(note, 'info');
+      return result;
+    },
+    function (err) {
+      if (token !== STATE.novelListToken) return null;
+      STATE.novels = null;
+      novelHint('列不了原文目录: ' + message(err), 'error');
+      paintNovels(null);
+      return null;
+    }
+  );
+}
+
+function paintNovels(result) {
+  var list = document.getElementById(NOVEL_LIST_ID);
+  if (!list) return;
+  list.textContent = '';
+  if (!result) return;
+  // exists=false 不是失败：目录还没建出来（这个检出从没导过原文）或者这个检出里没有漫剧
+  // 数据目录。这两件事在界面上要说成人话，而不是画成一个红叉。
+  if (result.exists !== true) {
+    novelHint(
+      '这个检出里还没有原文目录（' + (result.dir || '路径不明') + '）：导入一本就会建出来。',
+      'info'
+    );
+    list.appendChild(novelEmpty('还没有原文。'));
+    return;
+  }
+  var novels = result.novels || [];
+  novelHint(
+    (result.dir || '原文目录') +
+      ' · 共 ' +
+      result.matched +
+      ' 篇' +
+      (result.truncated ? '（只列了前 ' + result.returned + ' 篇）' : ''),
+    'info'
+  );
+  if (!novels.length) {
+    list.appendChild(novelEmpty('目录里没有原文（txt/md）。用上面的「导入…」接一份进来。'));
+    return;
+  }
+  novels.forEach(function (row) {
+    list.appendChild(novelRow(row));
+  });
+}
+
+function novelRow(row) {
+  var line = document.createElement('div');
+  line.className = 'cs-novel-row';
+  line.dataset.name = row.name;
+  if (STATE.novelOpen && STATE.novelOpen.name === row.name) line.dataset.open = 'true';
+
+  var name = document.createElement('div');
+  name.className = 'cs-novel-name';
+  name.textContent = row.name;
+
+  var meta = document.createElement('div');
+  meta.className = 'cs-novel-meta';
+  meta.textContent = formatBytes(row.bytes) + ' · ' + formatTime(row.mtime);
+
+  var actions = document.createElement('div');
+  actions.className = 'cs-novel-actions';
+
+  var read = novelButton(
+    '读',
+    row.text === true ? '读这一篇的正文' : '不是 txt/md，面板读不了这种格式',
+    function () {
+      openNovel(row.name, 0);
+    }
+  );
+  // 不是 txt/md 的照样列出来（就躺在那个目录里，藏起来更让人摸不着头脑），但读不了。
+  if (row.text !== true) read.disabled = true;
+  actions.appendChild(read);
+  actions.appendChild(
+    novelButton('拿去对话', '把"用这篇开工"写进对话框（自己改完再发）', function () {
+      novelToChat(row);
+    })
+  );
+
+  // 删除要两下："删除"变成"确认删除"才算数，而且只对着刚点的那一行。
+  // 挪走回收站那种后手不做：宿主的 novels/delete 是真删，界面上就得让人看得见这一步有多重。
+  var armed = STATE.novelDeleteArmed === row.name;
+  var remove = novelButton(
+    armed ? '确认删除' : '删除',
+    armed ? '再点一下就从磁盘上删掉这份原文' : '从原文目录里删掉这一篇（会先问一次）',
+    function () {
+      if (STATE.novelDeleteArmed === row.name) {
+        deleteNovel(row.name);
+        return;
+      }
+      STATE.novelDeleteArmed = row.name;
+      paintNovels(STATE.novels);
+    }
+  );
+  remove.dataset.tone = 'danger';
+  if (armed) remove.dataset.armed = 'true';
+  actions.appendChild(remove);
+
+  line.appendChild(name);
+  line.appendChild(meta);
+  line.appendChild(actions);
+  return line;
+}
+
+// 读一篇的一页。offset 是第几个**字**（0 起，宿主按字符分页，见 lib/comfy_studio/novels.py）：
+// 面板这边绝不去算字节 —— UTF-8 是变长的，算错了就会把汉字劈成两半。
+function openNovel(name, offset) {
+  var reader = document.getElementById(NOVEL_READER_ID);
+  if (!reader) return null;
+  var open = STATE.novelOpen;
+  if (!open || open.name !== name) {
+    // 换了一篇（不是翻页）：正文区先清掉。留着上一篇的字，人会以为自己点的那本已经打开了。
+    open = { name: name, offset: 0, page: null, token: 0 };
+    STATE.novelOpen = open;
+    reader.textContent = '正在读 ' + name + ' …';
+    var pager = document.getElementById(NOVEL_PAGER_ID);
+    if (pager) pager.textContent = '';
+    // 列表那一行要跟着变粗（[data-open="true"]）：只重画名字那一格，别整表重建，
+    // 否则"点了读"之后滚动位置会跳回顶上。
+    if (STATE.novels) paintNovels(STATE.novels);
+  }
+  // 连点翻页时的票，跟列表那条一个道理：不是最新那趟的回话，一个字都不许往正文区里写。
+  open.token = (open.token || 0) + 1;
+  var ticket = open.token;
+  return Promise.resolve(
+    bridge.request('novels/read', { name: name, offset: offset })
+  ).then(
+    function (response) {
+      if (!STATE.novelOpen || STATE.novelOpen.name !== name || STATE.novelOpen.token !== ticket) {
+        return null;
+      }
+      if (!response || response.ok !== true) {
+        var error = (response && response.error) || {};
+        // 宿主给的原因可能是一整段（认不出编码这类，里面要写清试过哪几种、该怎么办）：
+        // 整段放正文区那个大地方，状态行只报是哪一篇读不了 —— 一行里塞一整段，谁也读不完。
+        var reason = error.message || '未知错误';
+        reader.textContent = '读不了这一篇: ' + reason;
+        novelHint('读不了 ' + name + '：原因写在正文区', 'error');
+        return null;
+      }
+      var page = response.result || {};
+      STATE.novelOpen.offset = page.offset || 0;
+      STATE.novelOpen.page = page;
+      paintNovelPage(page);
+      return page;
+    },
+    function (err) {
+      if (!STATE.novelOpen || STATE.novelOpen.name !== name || STATE.novelOpen.token !== ticket) {
+        return null;
+      }
+      reader.textContent = '读不了这一篇: ' + message(err);
+      novelHint('读不了 ' + name + ': ' + message(err), 'error');
+      return null;
+    }
+  );
+}
+
+function paintNovelPage(page) {
+  var reader = document.getElementById(NOVEL_READER_ID);
+  var pager = document.getElementById(NOVEL_PAGER_ID);
+  if (!reader || !pager) return;
+  var text = typeof page.text === 'string' ? page.text : '';
+  reader.textContent = text === '' ? '（这一篇到这里就完了）' : text;
+  // 翻页要停在页首，不然下一页一出来就停在半中间，读起来得像倒着走。
+  reader.scrollTop = 0;
+
+  pager.textContent = '';
+  var name = page.name || '';
+  var start = page.offset || 0;
+  var end = start + (page.chars || 0);
+  // 页长用宿主**这一次实际要了多少字**（requested_chars），不是这一页的正文长度（chars）：
+  // 末页比一页短，拿正文长度退回去会退不够，"上一页"就落在半中间。页长由宿主给，面板不再自己定。
+  var step = typeof page.requested_chars === 'number' ? page.requested_chars : 0;
+  var back = novelButton('上一页', '往回翻一页', function () {
+    openNovel(name, Math.max(0, start - step));
+  });
+  if (start <= 0 || step <= 0) back.disabled = true;
+  var next = novelButton('下一页', '接着往下翻一页', function () {
+    openNovel(name, start + step);
+  });
+  if (page.at_end === true || step <= 0) next.disabled = true;
+  pager.appendChild(back);
+  pager.appendChild(next);
+
+  var pos = document.createElement('span');
+  pos.className = 'cs-novel-pos';
+  pos.textContent =
+    '第 ' + start + '–' + end + ' 字 / 共 ' + (page.total_chars || 0) + ' 字' +
+    '（' + formatBytes(page.bytes) + '）';
+  pager.appendChild(pos);
+  // 编码只在**不是 UTF-8** 时说出来：那是"宿主替你认了另一种编码"这件事本身，值得写在脸上
+  // （中文网文多是 GB18030）。UTF-8 是默认档，写出来只是噪音。
+  var encoding = page.encoding && page.encoding !== 'utf-8' ? ' · ' + page.encoding : '';
+  novelHint(
+    name + ' · ' + formatTime(page.mtime) + encoding + (page.at_end === true ? ' · 已到末尾' : ''),
+    'info'
+  );
+}
+
+// 把某一篇从正文区里收掉：它已经被删掉了，或者刚被另一份同名文件覆盖了。
+// 留着字，人会以为文件还在（列表明明写着换成了新的，正文却还是旧的，等于拿两份不同的字给人看）。
+// 传名字而不是无条件清空：在读的是别的篇时，那篇不该受影响。
+function closeNovel(name) {
+  if (!STATE.novelOpen || STATE.novelOpen.name !== name) return;
+  STATE.novelOpen = null;
+  var reader = document.getElementById(NOVEL_READER_ID);
+  if (reader) reader.textContent = '选中上面一篇，正文显示在这里。';
+  var pager = document.getElementById(NOVEL_PAGER_ID);
+  if (pager) pager.textContent = '';
+}
+
+// 把导入表单上那几个控件开关起来。请求在飞的时候必须关：粘着路径连点两下「导入」，
+// 同一份文件会被拷两遍（第二遍是覆盖），用户看到的却像只点了一下。
+function setNovelFormEnabled(enabled) {
+  var form = document.getElementById(NOVEL_FORM_ID);
+  if (!form) return;
+  var controls = form.querySelectorAll('input, button');
+  for (var index = 0; index < controls.length; index += 1) {
+    controls[index].disabled = !enabled;
+    // 「覆盖导入」的显隐是另一回事（由 showOverwrite 管 display），这里只动 disabled：
+    // 关表单不会把藏着的那个按钮露出来，重新打开也不会替它做"该不该露"的决定。
+  }
+}
+
+function importNovel(overwrite) {
+  var path = document.getElementById(NOVEL_PATH_ID);
+  if (!path) return null;
+  var source = (path.value || '').trim();
+  if (source === '') {
+    novelHint('先粘一份本机 txt/md 的绝对路径。', 'error');
+    path.focus();
+    return null;
+  }
+  setNovelFormEnabled(false);
+  novelHint('正在把 ' + source + (overwrite ? ' 覆盖进来…' : ' 接进原文目录…'), 'info');
+  return Promise.resolve(
+    bridge.request('novels/import', { path: source, overwrite: overwrite === true })
+  ).then(
+    function (response) {
+      setNovelFormEnabled(true);
+      if (!response || response.ok !== true) {
+        var error = (response && response.error) || {};
+        // 路径不对、不是 txt/md、拷不动 —— 都是"这一次没成"，不是"结果里有话要说"。
+        showOverwrite(false);
+        novelHint('没导进来: ' + (error.message || '未知错误'), 'error');
+        return null;
+      }
+      var result = response.result || {};
+      if (result.imported !== true) {
+        // 同名不是错误：宿主回的是 {imported:false, reason:"exists"}，是"要你确认一下"。
+        // 这时候才把「覆盖导入」露出来 —— 而且只对着刚问过的那条路径，改了路径就收回
+        // （见 NOVEL_PATH_ID 的 input 监听）。
+        showOverwrite(true);
+        novelHint(result.message || '原文目录里已经有这一本了：要换成你这份就点「覆盖导入」', 'info');
+        return result;
+      }
+      showOverwrite(false);
+      path.value = '';
+      var note =
+        (result.overwritten === true ? '换成了 ' : '接进来了 ') +
+        result.name +
+        '（' + formatBytes(result.bytes) + '）' +
+        (result.created_dir === true ? ' —— 原文目录是这一下建出来的' : '');
+      // 导完把列表重列一遍：目录里多了一份（或者少了一份旧的、多了个新的）。
+      closeNovel(result.name);
+      loadNovels(note);
+      return result;
+    },
+    function (err) {
+      setNovelFormEnabled(true);
+      showOverwrite(false);
+      novelHint('没导进来: ' + message(err), 'error');
+      return null;
+    }
+  );
+}
+
+function deleteNovel(name) {
+  // 已经点到第二步了：先把"待确认"收回去，别让请求还在飞的时候界面上还举着红按钮
+  // （那会让人以为是点漏了，接着再点一下）。
+  STATE.novelDeleteArmed = null;
+  novelHint('正在删 ' + name + ' …', 'info');
+  return Promise.resolve(bridge.request('novels/delete', { name: name })).then(
+    function (response) {
+      if (!response || response.ok !== true) {
+        var error = (response && response.error) || {};
+        var reason = error.message || '未知错误';
+        loadNovels('删不掉 ' + name + ': ' + reason);
+        return null;
+      }
+      var result = response.result || {};
+      // 删掉的正好是开着的那一篇：正文区跟着收掉（磁盘上已经没有这份原文了）。
+      closeNovel(name);
+      loadNovels('删掉了 ' + name + '（' + formatBytes(result.bytes) + '）');
+      return result;
+    },
+    function (err) {
+      loadNovels('删不掉 ' + name + ': ' + message(err));
+      return null;
+    }
+  );
+}
+
+// "拿去对话"：把这句话写进对话输入框，然后**停手**。面板不替人按发送 —— 拿哪一篇开工、
+// 怎么开工是用户的事，替他发出去等于替他下了这个决定（而且删掉的原文可撤不回来）。
+function novelToChat(row) {
+  switchView('chat');
+  var input = document.getElementById(INPUT_ID);
+  if (!input) return;
+  var line = '用原文「' + row.name + '」开工';
+  if ((input.value || '').trim() === '') {
+    input.value = line;
+  } else {
+    // 人家可能正打着半句话：接着往下写一行，别覆盖掉。
+    // 这一段 JS 住在 TS 模板字符串里，反斜杠要写两遍：只写一遍的话，转义会被模板那层
+    // 先吃掉（正则变成 s，换行变成一个真换行、把字符串截断）—— 跟上面 NOVEL_PATH_ID
+    // 的 placeholder 是同一个坑。
+    input.value = input.value.replace(/\\s+$/, '') + '\\n' + line;
+  }
+  input.focus();
+  setStatus('已把「' + row.name + '」写进对话框：添上要求再发。');
+}
+
 // ---- 侧栏按钮 ----------------------------------------------------------
 
 function buildButton() {
@@ -2051,7 +2638,10 @@ export function getComfyStudioChatContentScript(): string {
     `if (window.__comfyStudioChat) return;\n` +
     `window.__comfyStudioChat = { started: false, open: false, busy: false, turn: null, ` +
     `model: '', agent: '', session: 'default', sessions: null, closeArmed: false, ` +
-    `remembered: '', archive: null, pending: null, paint: 0, cards: {}, planCard: null };\n` +
+    `remembered: '', archive: null, pending: null, paint: 0, cards: {}, planCard: null, ` +
+    // 抽屉里的两页（'chat' / 'novel'）与小说那一页的当前状态：列表那一趟的票、
+    // 正开着的是哪一篇（含它自己那趟读的票）、删除按到第二步的是哪一行。
+    `view: 'chat', novels: null, novelOpen: null, novelDeleteArmed: null, novelListToken: 0 };\n` +
     STUDIO_CHAT_MAIN_JS +
     `})();\n`
   return cachedScript

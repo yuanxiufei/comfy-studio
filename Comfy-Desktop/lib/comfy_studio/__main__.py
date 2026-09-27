@@ -98,6 +98,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--novel-dir",
+        default=None,
+        help=(
+            "漫剧原文目录（面板「管理小说」那一页读写的落点，novels/* 那几张 RPC）；"
+            "默认取 <comfyui-dir>/custom_nodes/comfy_studio/manju/novel —— "
+            "漫剧业务数据住在引擎检出里，这条是仓库内相对路径（也可用 COMFY_STUDIO_NOVEL_DIR）。"
+            "不给 --comfyui-dir 又不给这个，就挂不上原文目录，面板那一页会照实说"
+        ),
+    )
+    parser.add_argument(
         "--no-memory",
         action="store_true",
         help=(
@@ -163,6 +173,7 @@ def main(argv: list[str] | None = None) -> int:
                 plan=args.plan,
                 input_dir=args.input_dir or os.environ.get("COMFY_INPUT_DIR"),
                 output_dir=args.output_dir or os.environ.get("COMFY_OUTPUT_DIR"),
+                novel_dir=args.novel_dir or os.environ.get("COMFY_STUDIO_NOVEL_DIR"),
                 memory=not args.no_memory,
                 memory_dir=args.memory_dir or os.environ.get("COMFY_STUDIO_MEMORY_DIR"),
                 agents_dir=args.agents_dir or os.environ.get("COMFY_STUDIO_AGENTS_DIR"),

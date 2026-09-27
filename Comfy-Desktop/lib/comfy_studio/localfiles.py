@@ -158,8 +158,11 @@ LOCAL_FILES_TOOLS: tuple[_Spec, ...] = (
 )
 
 
-def _inside(root: Path, candidate: Path) -> bool:
+def is_within(root: Path, candidate: Path) -> bool:
     """``candidate`` 落在 ``root`` 之内吗？
+
+    对外的名字：本模块和 :mod:`comfy_studio.novels` 都要用同一套越界检查，
+    这种守卫各写一份迟早会有一份被改松。
 
     抄 ``ComfyUI/folder_paths.py:326-340`` 的 ``is_within_directory``：两边都过 realpath，
     这样 root 里放一个指向别处的符号链接也逃不出去；不同盘符（Windows）会抛
@@ -264,7 +267,7 @@ class LocalFiles:
         # 上游上传图片时也是先建目录再写（``ComfyUI/server.py:417-418``）。
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest = dest_dir / target_name
-        if not _inside(self.input_dir, dest):
+        if not is_within(self.input_dir, dest):
             raise LocalFilesError(f"目标路径跑到 input 目录外面了: {dest}")
 
         reused = False
@@ -303,7 +306,7 @@ class LocalFiles:
     def _subdir(self, subfolder: str) -> Path:
         rel = subfolder.strip().replace("\\", "/").strip("/")
         target = self.input_dir if rel == "" else self.input_dir / rel
-        if not _inside(self.input_dir, target):
+        if not is_within(self.input_dir, target):
             raise LocalFilesError(f"subfolder 跑到 input 目录外面了: {subfolder}")
         return target
 
@@ -486,4 +489,5 @@ __all__ = [
     "LocalFilesServerConfig",
     "MAX_LIST_LIMIT",
     "MAX_TEXT_BYTES",
+    "is_within",
 ]

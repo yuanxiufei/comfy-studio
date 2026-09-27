@@ -127,6 +127,24 @@ agent / skill / mcp 三件能力**前后端各有一份**，按各自项目里�
   `<comfyui-dir>/input` 猜，接进去的素材引擎看不见、报出来的产出路径也不对。单独拿
   `run-mcp.mjs` 喂别的 MCP 客户端时才需要手动给 `--input-dir` / `--output-dir`
   （或 `COMFY_INPUT_DIR` / `COMFY_OUTPUT_DIR`）。
+* `novels.py` —— 漫剧**原文**的读写，面板「管理小说」那一页的后端：`novels/list` 报目录里有哪些
+  小说（名字、大小、改于何时）、`novels/read` 按**字符**分页读正文、`novels/import` 把本机一份
+  txt/md 接进来（导入第一本时顺手把目录建出来）、`novels/delete` 删一篇。它不是给模型用的工具，
+  是**给人用的**：这几件事没有一件适合让模型代劳（删掉原文可撤不回来）。落点是引擎侧的业务数据
+  目录 `ComfyUI/custom_nodes/comfy_studio/manju/novel`（**仓库内相对路径**，从 `--comfyui-dir`
+  推出来，`--novel-dir` / `COMFY_STUDIO_NOVEL_DIR` 可改），与素材/产出（`localfiles.py` 的
+  input/output）共用同一套越界检查（`localfiles.is_within`，谁也走不出自己的目录）。几条有意的取舍：
+  **同名不覆盖** —— 目录里已经有这一本时返回 `{imported: false, reason: "exists"}`，面板把「覆盖导入」
+  这个按钮**这时才露出来**，而不是先覆盖再告诉人家；**认编码**（`decode_text`）—— 中文网文十有八九是
+  GB18030 而不是 UTF-8，只认一种等于读不了用户自己的书：先严格试 UTF-8（几万个字节全合法就认它，
+  带 BOM 的 `utf-8-sig` 与 `utf-16` 也认），不成再试 gb18030 —— 而 gb18030 几乎什么字节都能解出来，
+  所以解完还要验"是不是人话"（不像正文的字符占比 + 中文占比），验不过就明确报错，绝不把一屏乱码
+  当正文交出去；繁体 Big5 **有意不在候选里**（与 GB18030 共用字节区间，纯靠统计分不开，认错给的是
+  "看着像字其实不是"的东西），报错里会把这件事说清。读回来的 `encoding` 如实报给面板，非 UTF-8 的
+  会写在状态行上；分页按字符而不是字节（"第几字节"对人没有意义，按字节切还会把汉字劈成两半）；
+  超过 32 MB 的原文不读并明确报错，不做静默截断半篇；隐藏项（`.gitkeep`、`.DS_Store`，以及**隐藏目录
+  里的东西**）既不入列表，也不能按名字读或删 —— 列表里不出现的名字，`delete` 那条路也不认（`.git/config`
+  这种名字落在原文目录里是真文件，不拦就是能删）。
 * `memory.py` —— 跨会话的长期记忆：对话正文会存盘（见下面的 `history.py`），但"我喜欢方形
   构图"、"这台是 24G 的 4090"这类**事实**不该指望别人去翻上一段对话，它们得是随叫随到的。
   这里用三张工具把它记下来：
@@ -208,6 +226,20 @@ agent / skill / mcp 三件能力**前后端各有一份**，按各自项目里�
 这一轮回的是**正常结果**（`cancelled: true`）而不是错误，面板把它画成"已停止"，
 历史配对完整，接着聊下一句就行。
 
+抽屉里有两页，头上两个页签：**对话**和**管理小说**。后者就是 `novels.py` 的门面（列、读、导入、
+删除），左边点一篇、右边读一页，翻页按钮按 `novels/read` 的字符偏移走；一页多少字由**宿主**定
+（面板不传 `chars`，翻页用的页长也从回话的 `requested_chars` 拿，不自己留一份 —— 两份数对不上时是
+静默的：翻页会跳字或原地打转）。编码不用挑：宿主自己判
+（中文网文多是 GB18030），不是 UTF-8 的那些会把用的编码写在状态行上 —— "这字怎么看着不对"得
+有个出处可查，而不是让人对着屏幕猜是不是面板坏了。它**做在同一个抽屉里**是
+有意的：上游 `Comfy-Desktop` 的 `PanelKey` / 文件菜单项 / 视图组件都是人家的代码，往里加一页就得
+扩我们那份 `upstream-wiring.patch` 并持续跟上游对账 —— 为了一个"看看书库"的面板去背一份会漂的补丁
+不划算，而抽屉本来就是我们自己注入的（`comfyStudioChatContentScript.ts`）。这一页只干四件事，都是
+用户按下去的：**导入同名不覆盖**（先把「覆盖导入」问出来）、**删除要点两下**（第一下只是把那一行
+武装起来，而且只对着那一行）、**「拿去对话」只把那句话写进输入框、不替用户发送**（拿哪一篇开工是
+用户的决定）。读完的那一篇在列表里标出"在读"，删掉的正好是开着的那篇就把正文区一起清掉 —— 留着字
+人会以为文件还在。目录还没建时不报错，就说"还没有原文，导入一本就会建出来"。
+
 这个抽屉和宿主是两套生命周期：页面刷新、换个画布、宿主进程退出又起来，对话都不该凭空消失。
 所以打开抽屉（且里面还是空的）时，面板会问一次 `agent/history`：会话还活着就从它手里拿，
 没有就读盘上那份存档，拿到的条目走的是**和实时事件同一套画法** —— 重开面板看到的是上次那段
@@ -276,16 +308,16 @@ agent / skill / mcp 三件能力**前后端各有一份**，按各自项目里�
 除了上面新增的扩展位，胶水本身靠的是 Comfy-Desktop 自己就支持「接管一份已有的引擎检出 + 目录里的 venv」这个能力：
 
 1. **引擎侧**：`ComfyUI/custom_nodes/comfy_studio/tools/install-engine.ps1`（`npm run setup`）在 `ComfyUI/.venv` 建 Python 3.11 环境，装 CUDA 版 torch（本机有 N 卡时；否则回退 CPU 轮子）和上游 `requirements.txt` 的其余依赖。
-2. **接线侧**：`Comfy-Desktop/lib/comfy_studio/tools/seed-desktop.mjs`（`npm run seed`，`npm run dev` 会先跑它）往 Comfy-Desktop 的安装清单
-   （Windows：`%APPDATA%\comfyui-desktop-2\installations.json`）写一条 `sourceId: "git"` 的记录：
-   `installPath` 是**仓库根**，`venvPath` 指着 `ComfyUI/.venv` —— 壳认的布局是「安装根下套一个
-   `ComfyUI/` 子目录、venv 在 `ComfyUI/.venv`」，和上游 git 检出长得一样，于是本仓 `ComfyUI/` 与它的 `.venv` 都被认到。
-   起引擎那条路是 `<venvPath>/Scripts/python.exe -s main.py <launchArgs>`，cwd 取 `main.py`
-   所在目录 —— 只用 `venvPath` 与 `main.py`，不读 `.git`，所以本仓这种已入库的检出照样能被拉起。
-   注意 comfy-studio 宿主（`Comfy-Desktop/lib/comfy_studio`）不走这条路：它按 `<installPath>/ComfyUI/.venv`
-   派生 python（`Comfy-Desktop/src/main/lib/pythonEnv.ts` 的 `getVenvPythonPath`），不读 `venvPath`；
-   `installPath` 写偏一层时，引擎照起、面板却整片报「没有可用的 venv python」。`npm run doctor`
-   （脚本在 `Comfy-Desktop/lib/comfy_studio/tools/doctor.mjs`）的「接线」段会把这条路单独核一遍。
+2. **接线侧**：`Comfy-Desktop/scripts/comfy-studio/seed-desktop.mjs`（`npm run seed`，`npm run dev` 会先跑它）往 Comfy-Desktop 的安装清单
+  （Windows：`%APPDATA%\comfyui-desktop-2\installations.json`）写一条 `sourceId: "git"` 的记录：
+  `installPath` 是**仓库根**，`venvPath` 指着 `ComfyUI/.venv` —— 壳认的布局是「安装根下套一个
+  `ComfyUI/` 子目录、venv 在 `ComfyUI/.venv`」，和上游 git 检出长得一样，于是本仓 `ComfyUI/` 与它的 `.venv` 都被认到。
+  起引擎那条路是 `<venvPath>/Scripts/python.exe -s main.py <launchArgs>`，cwd 取 `main.py`
+  所在目录 —— 只用 `venvPath` 与 `main.py`，不读 `.git`，所以本仓这种已入库的检出照样能被拉起。
+  注意 comfy-studio 宿主（`Comfy-Desktop/lib/comfy_studio`）不走这条路：它按 `<installPath>/ComfyUI/.venv`
+  派生 python（`Comfy-Desktop/src/main/lib/pythonEnv.ts` 的 `getVenvPythonPath`），不读 `venvPath`；
+  `installPath` 写偏一层时，引擎照起、面板却整片报「没有可用的 venv python」。`npm run doctor`
+  （脚本在 `Comfy-Desktop/scripts/comfy-studio/doctor.mjs`）的「接线」段会把这条路单独核一遍。
    上游源码里 `.git` 只被 `probeInstallation`（UI 里「添加已有安装」那条路）和详情页的 git 动作用到，
    我们直接写记录、不经过前者，代价是后者对本仓这个安装不可用。
    有了这条记录，首启的「用云端还是本地」向导也会被跳过（列表里已有非 cloud 安装）。
@@ -339,7 +371,11 @@ comfy-studio/
 │  │  └─ tests/                        # 宿主端到端测试（真进程 + 真 MCP 子进程）
 │  ├─ scripts/comfy-studio/            # 宿主与跨两侧的脚本：注册安装 / 起宿主 / 清壳缓存 / 体检
 │  └─ src/main/lib/                    # 面板注入脚本 / 宿主拉起 / IPC 注册（新增的 TS）
-└─ .cache/           # 过滤清单、自检输出、安装日志，以及两份上游的 .git（父仓库忽略）
+├─ MiniMax-H3-资料汇总.md               # 本地模型部署调研笔记（当前无任何代码/文档引用，纯资料）
+├─ reference/        # 参考仓库搬运池：80 个上游兄弟仓库的检出，只作"抄参考实现"的素材（父仓库忽略）
+└─ .cache/           # 父仓库忽略。长期留存：upstream-git/（两份上游的 .git）、agent-voide.git/（改名前的
+                     #   前身仓库历史，**勿删**，当前仓库里没有那段 commit）、手工下载的 torch 轮子。
+                     #   其余（安装日志 / filtered.txt / 调试探针）都是脚本临时产物，可随时清
 ```
 
 两组自检都直接在检出里跑（自己人代码就住在那里），不需要先装什么。
@@ -361,8 +397,8 @@ cd ComfyUI/custom_nodes
 ```powershell
 cd Comfy-Desktop/lib
 ..\..\ComfyUI\.venv\Scripts\python.exe -m unittest comfy_studio.tests.test_host_e2e -v
-# 纯逻辑用例（本机文件 / 计划通道 / 长期记忆 / 对话存档，不拉子进程）：
-# test_local_files.py、test_plan_tools.py、test_memory_tools.py、test_history.py
+# 纯逻辑用例（本机文件 / 计划通道 / 长期记忆 / 对话存档 / 漫剧原文，不拉子进程）：
+# test_local_files.py、test_plan_tools.py、test_memory_tools.py、test_history.py、test_novels.py
 ..\..\ComfyUI\.venv\Scripts\python.exe -m unittest discover -s comfy_studio/tests
 ```
 
