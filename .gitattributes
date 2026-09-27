@@ -1,5 +1,12 @@
-# 覆盖层源要求在任何平台上逐字节可重放：
-# - patches 被 git apply 用来匹配上游工作区的上下文，行尾一旦被转成 CRLF 就会整片失配；
-# - overlay 会被 attach 原样复制进两份检出，统一 LF 才能让 Windows / Linux 装出同一份结果。
-studio/overlay/** text eol=lf
-studio/patches/** text eol=lf
+# 要求在平台上逐字节可重放的源文件，钉死行尾：
+# - `.codebuddy/agents/**` 是**交付物**：同一份内容既住本仓，又要装进 `~/.codebuddy/agents/`，
+#   而 `tests/test_agents.py` 会「按源规格重算」逐字比对（含用户级副本是否陈旧）。
+#   该断言本身已对 `\r\n` 做归一，这里锁 eol 是为了让**工作区字节**也稳定下来 ——
+#   本机 `core.autocrlf` 默认会把它们改写成 CRLF，属于「不报错、只静默改内容」那类。
+.codebuddy/agents/** text eol=lf
+
+# 历史：本文件原先是为「覆盖层机制」而设（`studio/overlay/**` · `studio/patches/**`）。
+# 2026-09-27 该机制随 overlay 目录一并撤除，本仓已无 `studio/`，那两条规则成了死规则
+# （matcher 永不命中），故删。补丁的行尾保护现由 `Comfy-Desktop/.gitattributes`
+# （`* text=auto eol=lf`）负责，工作流的由 `manju/.gitattributes` 负责。
+
