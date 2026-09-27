@@ -4,6 +4,8 @@
 （``agent/history`` 先看活会话再看存档、``agent/reset`` 连存档一起删、一轮跑完自动落盘、
 新会话把存档喂回去接着聊）。
 
+另外验会话位满了怎么办（存档让"淘汰"变成无损操作，于是可以自动腾位子；没存档兜底就老实拒绝）。
+
 跑法（引擎 venv 的 python，cwd 在 Comfy-Desktop/lib）::
 
     <仓库>/ComfyUI/.venv/Scripts/python.exe -m unittest comfy_studio.tests.test_history -v
@@ -30,9 +32,10 @@ from comfy_studio.history import (
     SessionHistoryStore,
     entries as history_entries,
 )
+from comfy_studio.cancel import CancelToken
 from comfy_studio.mcp import McpTool
-from comfy_studio.rpc import INTERNAL_ERROR, RpcError
-from comfy_studio.server import DEFAULT_SESSION, StudioHost
+from comfy_studio.rpc import INVALID_PARAMS, INTERNAL_ERROR, RpcError
+from comfy_studio.server import DEFAULT_SESSION, MAX_SESSIONS, StudioHost
 from comfy_studio.skills import SkillCatalog
 
 
@@ -76,10 +79,13 @@ class _Ctx:
         self.events.append((method, params))
 
 
-def _make_host(store: SessionHistoryStore | None) -> StudioHost:
-    """只挂对话存档的最小宿主（MCP 一个都不拉，工具表由假 hub 顶上）。"""
+def _make_host(store: SessionHistoryStore | None, *, max_sessions: int = MAX_SESSIONS) -> StudioHost:
+    """只挂对话存档的最小宿主（MCP 一个都不拉，工具表由假 hub 顶上）。
+
+    ``max_sessions`` 调小给"会话位满了怎么办"那组用例用：真上限是 8，为了验淘汰没必要真建 8 个。
+    """
     hub = _StubHub()
-    return StudioHost(hub, SkillCatalog(hub), history=store)  # type: ignore[arg-type]
+    return StudioHost(hub, SkillCatalog(hub), history=store, max_sessions=max_sessions)  # type: ignore[arg-type]
 
 
 def _pairs(count: int) -> list[ChatMessage]:
@@ -472,8 +478,11 @@ class SessionRestoreTests(unittest.TestCase):
         self.assertEqual([m.role for m in session.messages], ["system"])
 
 
-class HostHistoryTests(unittest.TestCase):
-    """宿主那层：``agent/history`` 先看活会话再看存档，``agent/reset`` 连存档一起删。"""
+class HostHistoryTests(unittest.IsolatedAsyncioTestCase):
+    """宿主那层：``agent/history`` 先看活会话再看存档，``agent/reset`` 连存档一起删。
+
+    建会话（``StudioHost._session``）是 async 的：会话位满了它得先淘汰一个（关掉要是 await）。
+    """
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="comfy-studio-history-")
@@ -573,25 +582,26 @@ class HostHistoryTests(unittest.TestCase):
         # 别的会话的存档动都不动。
         self.assertTrue(self.store.path("other").exists())
 
-    def test_a_new_session_continues_the_archived_conversation(self) -> None:
+    async def test_a_new_session_continues_the_archived_conversation(self) -> None:
         # 宿主重启之后接着聊，走的就是这一步：建会话时把存档喂回去。
         self.store.save(DEFAULT_SESSION, [ChatMessage(role="user", content="上次问的")])
         host = _make_host(self.store)
         with mock.patch.dict(os.environ, {"COMFY_STUDIO_LLM_MODEL": "fake-model"}):
-            session = host._session(DEFAULT_SESSION)
-            again = host._session(DEFAULT_SESSION)
+            session = await host._session(DEFAULT_SESSION)
+            again = await host._session(DEFAULT_SESSION)
         self.assertIs(session, again, "同一个会话不该被重建两遍")
         self.assertEqual([m.role for m in session.messages], ["system", "user"])
         self.assertEqual(session.messages[1].content, "上次问的")
+        await host.close()
 
-    def test_a_broken_archive_blocks_a_new_session(self) -> None:
+    async def test_a_broken_archive_blocks_a_new_session(self) -> None:
         path = self.store.path(DEFAULT_SESSION)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("坏了", encoding="utf-8")
         host = _make_host(self.store)
         with mock.patch.dict(os.environ, {"COMFY_STUDIO_LLM_MODEL": "fake-model"}):
             with self.assertRaises(RpcError) as caught:
-                host._session(DEFAULT_SESSION)
+                await host._session(DEFAULT_SESSION)
         self.assertEqual(caught.exception.code, INTERNAL_ERROR)
 
     def test_a_failed_write_only_warns(self) -> None:
@@ -619,7 +629,7 @@ class TurnPersistTests(unittest.IsolatedAsyncioTestCase):
             store = SessionHistoryStore(Path(tmp) / SESSION_SUBDIR)
             host = _make_host(store)
             with mock.patch.dict(os.environ, {"COMFY_STUDIO_LLM_MODEL": "fake-model"}):
-                session = host._session(DEFAULT_SESSION)
+                session = await host._session(DEFAULT_SESSION)
             session.llm = _FakeLLM("已经好了")  # 换掉真 HTTP 客户端：这一轮不连网
 
             ctx = _Ctx()
@@ -644,7 +654,7 @@ class TurnPersistTests(unittest.IsolatedAsyncioTestCase):
             )
             host = _make_host(store)
             with mock.patch.dict(os.environ, {"COMFY_STUDIO_LLM_MODEL": "fake-model"}):
-                session = host._session(DEFAULT_SESSION)
+                session = await host._session(DEFAULT_SESSION)
             session.llm = _FakeLLM("接着答")
             llm = session.llm
 
@@ -658,6 +668,97 @@ class TurnPersistTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 [m.role for m in store.load(DEFAULT_SESSION).messages], ["user", "assistant", "user", "assistant"]
             )
+
+
+class SessionCapTests(unittest.IsolatedAsyncioTestCase):
+    """会话位满了怎么办：能无损淘汰就自动淘汰，淘汰不了就如实拒绝 —— 别偷偷把对话丢了。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="comfy-studio-history-")
+        self.dir = Path(self._tmp.name)
+        self.store = SessionHistoryStore(self.dir / SESSION_SUBDIR)
+        # 建会话要有一份能用的模型配置；这里不连网，只求 create_session 别在构造时就报错。
+        env = mock.patch.dict(os.environ, {"COMFY_STUDIO_LLM_MODEL": "fake-model"})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    async def test_the_least_recently_used_session_makes_room(self) -> None:
+        host = _make_host(self.store, max_sessions=2)
+        await host._session("s1")
+        await host._session("s2")
+        await host._session("s1")  # 碰一下 s1：最久没用的就换成了 s2
+        await host._session("s3")
+        self.assertEqual(list(host._sessions), ["s1", "s3"])
+        await host.close()
+
+    async def test_an_evicted_session_comes_back_from_the_archive(self) -> None:
+        # 敢自动淘汰的前提就在这儿：淘汰等于把会话从内存里请出去，对话本身还在盘上。
+        self.store.save("s2", [ChatMessage(role="user", content="s2 上次问的")])
+        host = _make_host(self.store, max_sessions=1)
+        await host._session("s1")
+        await host._session("s2")  # 顶掉 s1，同时把 s2 的存档喂回来
+        self.assertEqual(list(host._sessions), ["s2"])
+        self.assertEqual([m.role for m in host._sessions["s2"].messages], ["system", "user"])
+        self.assertEqual(host._sessions["s2"].messages[1].content, "s2 上次问的")
+        await host.close()
+
+    async def test_a_session_in_the_middle_of_a_turn_is_not_evicted(self) -> None:
+        # 那一轮还在往它的 messages 里写，关掉它等于把活劈了。
+        host = _make_host(self.store, max_sessions=1)
+        await host._session("s1")
+        host._turns["s1"] = CancelToken()
+        with self.assertRaises(RpcError) as caught:
+            await host._session("s2")
+        self.assertEqual(caught.exception.code, INVALID_PARAMS)
+        self.assertIn("都有一轮在跑", caught.exception.message)
+        self.assertIn("s1", caught.exception.message)
+        self.assertEqual(list(host._sessions), ["s1"])
+
+    async def test_without_the_archive_a_new_session_is_refused(self) -> None:
+        # --no-history：没有存档兜底，淘汰就是真把对话丢了 —— 宁可拒绝，也不偷偷丢。
+        host = _make_host(None, max_sessions=1)
+        await host._session("s1")
+        with self.assertRaises(RpcError) as caught:
+            await host._session("s2")
+        self.assertEqual(caught.exception.code, INVALID_PARAMS)
+        self.assertIn("--no-history", caught.exception.message)
+        self.assertIn("复用已有的 session_id", caught.exception.message)
+        # 别给一个做不到的建议：agent/reset 只清对话、不腾会话位（宿主没有"关会话"的调用）。
+        self.assertNotIn("先 agent/reset 掉不用的", caught.exception.message)
+        self.assertEqual(list(host._sessions), ["s1"])
+
+    async def test_a_session_created_while_making_room_is_reused(self) -> None:
+        # 腾位子要 await（关掉被淘汰的会话），这中间可能已经有人把同一个会话建好了：
+        # 那就用那个，别再建第二个 —— 后建的会把前一个顶掉，谁都不再关得上它。
+        host = _make_host(self.store, max_sessions=1)
+        await host._session("s1")
+        impostor = AgentSession(_StubHub(), [_tool()], llm=_FakeLLM())  # type: ignore[arg-type]
+
+        async def fake_make_room() -> None:
+            host._sessions.pop("s1")
+            host._sessions["s2"] = impostor
+
+        with mock.patch.object(host, "_make_room", new=fake_make_room):
+            session = await host._session("s2")
+        self.assertIs(session, impostor)
+        self.assertEqual(list(host._sessions), ["s2"])
+
+    def test_reset_is_refused_while_a_turn_is_running(self) -> None:
+        # 否则这一轮收尾会把刚删掉的存档原样写回来：白删一次，用户还以为清干净了。
+        self.store.save(DEFAULT_SESSION, [ChatMessage(role="user", content="问")])
+        host = _make_host(self.store)
+        host._sessions[DEFAULT_SESSION] = AgentSession(  # type: ignore[arg-type]
+            _StubHub(), [_tool()], llm=_FakeLLM()
+        )
+        host._turns[DEFAULT_SESSION] = CancelToken()
+        with self.assertRaises(RpcError) as caught:
+            host.agent_reset({}, None)  # type: ignore[arg-type]
+        self.assertEqual(caught.exception.code, INVALID_PARAMS)
+        self.assertIn("agent/cancel", caught.exception.message)
+        self.assertTrue(self.store.path(DEFAULT_SESSION).exists(), "被拒的重置不该动存档")
 
 
 if __name__ == "__main__":

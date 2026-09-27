@@ -22,7 +22,7 @@
 ``agent/answer``         审核通道的回程：``{call_id, answer}`` → 唤醒等着的提问
 ``agent/plan_result``    计划通道的回程：``{call_id, approved, feedback?}`` → 唤醒等着的确认
 ``agent/history``        ``{session_id?}`` → 这个会话说过的话（面板重开时照着重画）
-``agent/reset``          清空某个会话的历史与它的存档
+``agent/reset``          清空某个会话的历史与它的存档（这一轮在跑就拒绝，免得被收尾写回来）
 ======================  ==============================================
 
 ``agent/canvas_result`` / ``agent/answer`` / ``agent/plan_result`` 是三条「回程」：桌面壳要
@@ -37,6 +37,7 @@
 from __future__ import annotations
 
 import sys
+from collections import OrderedDict
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
@@ -67,7 +68,8 @@ from .skills import SkillCatalog, SkillsError
 SERVER_NAME = "comfy-studio-desktop"
 SERVER_VERSION = "0.1.0"
 
-#: 同时最多留几个对话会话，防止面板反复点造成泄露。
+#: 同时最多留几个**活着**的对话会话（每个握着一条 HTTP 连接、一份对话内存），防止面板
+#: 反复点造成泄露。到上限不是硬墙：再开新的就淘汰最久没用的那个（见 :meth:`StudioHost._make_room`）。
 MAX_SESSIONS = 8
 
 #: 不指定 session_id 时用的会话。
@@ -130,7 +132,9 @@ class StudioHost:
         self.history = history
         #: 面板里切过的模型；None = 用环境变量里那个（进程内有效，不落盘）。
         self.default_model: str | None = None
-        self._sessions: dict[str, AgentSession] = {}
+        #: 活着的会话。顺序就是"最近用过"的顺序（用得越晚排得越靠后，见 :meth:`_session`），
+        #: 到上限时淘汰队首那个 —— 所以这里得是 OrderedDict，普通 dict 改键不会挪位置。
+        self._sessions: OrderedDict[str, AgentSession] = OrderedDict()
         #: 正在跑一轮的会话：session_id → 那一轮的取消令牌。
         #: 这些会话不能被换模型打断（换客户端会把在飞的一轮劈了）。
         self._turns: dict[str, CancelToken] = {}
@@ -302,7 +306,7 @@ class StudioHost:
                 INVALID_PARAMS,
                 f"会话 {session_id} 已有一轮在跑；等它结束、agent/cancel 掉它，或换个 session_id",
             )
-        session = self._session(session_id)
+        session = await self._session(session_id)
 
         async def on_event(event: object) -> None:
             to_json = getattr(event, "to_json", None)  # AgentEvent
@@ -460,6 +464,13 @@ class StudioHost:
         session_id = args.get("session_id") or DEFAULT_SESSION
         if not isinstance(session_id, str):
             raise RpcError(INVALID_PARAMS, "session_id 必须是字符串")
+        # 有一轮在跑就先别清：那一轮收尾时会把它的历史落盘（见 agent_chat 的 finally），
+        # 刚删掉的存档会被原样写回来 —— 用户看到的又是"清了个寂寞"，还白删一次文件。
+        if session_id in self._turns:
+            raise RpcError(
+                INVALID_PARAMS,
+                f"会话 {session_id} 有一轮在跑；先 agent/cancel 掉它或等它结束再清",
+            )
         # 存档也要删。只清内存的话，下次重启会被存档原样复活 —— 用户看到的是"清了个寂寞"。
         cleared = self._clear_history(session_id)
         session = self._sessions.get(session_id)
@@ -545,15 +556,61 @@ class StudioHost:
         store = self.memory.store
         return lambda: compose_system_prompt(store.digest())
 
-    def _session(self, session_id: str) -> AgentSession:
-        existing = self._sessions.get(session_id)
-        if existing is not None:
-            return existing
-        if len(self._sessions) >= self.max_sessions:
+    async def _make_room(self) -> None:
+        """会话位满了，腾一个出来：淘汰**最久没用过**的那个。
+
+        面板每换一个 session_id 就多留一个会话，上限是为了不让它无限涨。但"满了就报错"
+        对用户是说不通的（他又没做错什么，只是想开个新对话），所以这里自动淘汰 —— 前提是
+        淘汰**不丢东西**：每一轮收尾都把对话落了盘（:meth:`_save_history`），被淘汰的会话下次
+        用同一个 session_id 会被 :meth:`_load_history` 从存档喂回来，用户看到的还是上次那段。
+
+        因此只有**开着存档**时才敢这样淘汰。``--no-history`` 时没有这份兜底，淘汰就是真把
+        对话丢了 —— 宁可拒绝，也不偷偷丢：如实说明原因，并把真能做的（复用 session_id、
+        重启宿主）讲清。别写成"先 agent/reset 掉不用的"：reset 只清对话，不腾会话位。
+
+        正在跑一轮的会话一律不动：那一轮还在往它的 messages 里写，关掉它等于把活劈了。
+        挑不出空闲的就照旧拒绝，并报出卡在哪儿。
+        """
+        if self.history is None:
             raise RpcError(
                 INVALID_PARAMS,
-                f"会话数已达上限 {self.max_sessions}；先 agent/reset 掉不用的，或复用已有 session_id",
+                f"会话数已达上限 {self.max_sessions}；这次启动没开对话存档（--no-history），"
+                "淘汰一个会话就等于把它的对话丢掉，所以不自动淘汰。这一档下会话位也不会再释放"
+                "（agent/reset 只清对话、不腾位子）：复用已有的 session_id，或重启宿主"
+                "（关掉桌面壳再开）",
             )
+        victim = next((sid for sid in self._sessions if sid not in self._turns), None)
+        if victim is None:
+            busy = "、".join(sorted(self._turns)) or "（无）"
+            raise RpcError(
+                INVALID_PARAMS,
+                f"会话数已达上限 {self.max_sessions}，而且这些会话都有一轮在跑（{busy}）："
+                "等其中一轮结束，或复用已有的 session_id",
+            )
+        await self._retire(victim)
+
+    async def _retire(self, session_id: str) -> None:
+        """把会话从登记表里摘掉并关掉它（顺带放掉它手里的 HTTP 连接）。
+
+        对话没丢：它每轮末尾都落过盘，同一个 session_id 再用会从存档读回来。
+        """
+        session = self._sessions.pop(session_id, None)
+        if session is not None:
+            await session.close()
+
+    async def _session(self, session_id: str) -> AgentSession:
+        existing = self._sessions.get(session_id)
+        if existing is not None:
+            self._sessions.move_to_end(session_id)  # 用一次就算"最近用过"
+            return existing
+        if len(self._sessions) >= self.max_sessions:
+            await self._make_room()
+            # 腾位子时让出过执行权，其间可能已经有人把**同一个**会话建好了（面板重发一次请求
+            # 就够了）：那就用它。建两个的话后建的那个会把前一个从表里顶掉，谁都不再关得上它。
+            raced = self._sessions.get(session_id)
+            if raced is not None:
+                self._sessions.move_to_end(session_id)
+                return raced
         history = self._load_history(session_id)
         try:
             session = create_session(
