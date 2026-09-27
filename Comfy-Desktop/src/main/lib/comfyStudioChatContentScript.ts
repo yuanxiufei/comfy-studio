@@ -794,7 +794,7 @@ function setAgentHint(text) {
 function agentHint(result) {
   var parts = [];
   if (result.missing) parts.push(String(result.missing));
-  if (result.error) parts.push('智能体目录读不了（' + result.error + '）；这里只有内置的那几个');
+  if (result.error) parts.push('智能体目录读不了（' + result.error + '）；这里只剩内置与随包带的几个');
   var broken = result.problems || [];
   if (broken.length) {
     var files = [];

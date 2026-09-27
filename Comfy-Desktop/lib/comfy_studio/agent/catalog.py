@@ -6,12 +6,14 @@
 拼成一条系统提示词，所以换智能体**不动工具表、也不动对话历史**：它就是换一句话
 （历史里从来不含 system，见 :mod:`comfy_studio.history`）。
 
-两条来源：
+三条来源：
 
-* **内置**：:data:`BUILTIN_PROFILES`。写的是**提要** —— 这个角色负责哪一类活、产出该
-  是什么形态、信息不够时怎么办。**具体风格、数量、平台与措辞一概不写死**：那些是用户
-  当场的活（"出几个分镜""要不要电影感"），写进代码只会变成一份谁都不敢改的教条，
-  也会跟用户手上的完整配置文档对不上。想要更细的版本，就放一份自己的文件。
+* **内置**：:data:`BUILTIN_PROFILES`。**只剩「通用助手」一项** —— 它不带任何角色段，就是
+  这套工作台的出厂行为。角色的正文都搬进了下面两条的**文件**里：人设不写在代码里，代码里
+  也就不会多出一份要跟文档同步的副本（"出几个分镜""要不要电影感"这类事一概不由代码说了算）。
+* **随包预置**：:data:`PRESET_AGENTS` 那 6 份完整规格（落在 :data:`PRESET_DIR` 的 ``*.md``）。
+  成品人设，正文**整份**读进来当角色段 —— 它们本来的用途就是整份塞进 System Prompt（见各份
+  开头的「用途」），不是提要。选中哪个才带哪个。
 * **用户自己的文件**：目录（默认是工作台数据目录下的 ``agents/``，见 ``--agents-dir``）
   里的 ``*.md``，一份文件一个智能体。认识这个形状::
 
@@ -33,8 +35,13 @@
 * **正文为空的文件算坏文件**，不悄悄当成"通用助手"：人设空着的时候 ``AgentSession``
   本来就要报错（见 ``agent/loop.py`` 的 ``_system_text``），与其等到聊天时才发现，
   不如在清单里就说明白。
-* **内置不可被覆盖**：用户文件与内置重名就是一条 ``error``（改个文件名即可）。否则
-  "我把内置那份改了怎么没生效"会变成一件要靠猜的事。
+* **代码内置的不可被覆盖**：用户文件与内置（也就是「通用助手」）重名是一条 ``error``
+  （改个文件名即可）。否则"我把内置那份改了怎么没生效"会变成一件要靠猜的事。
+* **随包预置可以被覆盖**：用户文件与预置 **id 相同**时就地顶掉它（不报错，位置也不动）。
+  预置是"默认底稿"，用户手上那份才是他要的 —— 想改哪一项，就写个同 id 的文件丢进
+  ``--agents-dir``，面板里那一项当场换成他的。
+* **预置读不了只报那一条**：``file`` 写成 ``presets/<文件名>``，好让人分得清"包里的东西
+  坏了"与"我自己写的文件有问题"。预置全读不出来时，清单里还剩通用助手与用户自己的文件。
 * **id 从文件名来，不另设一套命名规则**：目录里重名本来就不可能（同一个目录里不会有
   两个同名文件），所以不需要额外去重逻辑。
 """
@@ -58,6 +65,11 @@ GENERAL_AGENT_ID = "general"
 #: 说明行最多显示多少字符（面板下拉一行放不下更长的）。
 SUMMARY_CHARS = 60
 
+#: 随包预置的成品人设放在哪：与本文件同级的 ``presets/``。
+#: 从 :data:`__file__` 推、不认工作目录 —— 桌面壳起宿主时 cwd 是它自己的安装目录，跟包在
+#: 哪没关系（``run-studio.mjs`` 起进程时也不改 cwd）。
+PRESET_DIR = Path(__file__).resolve().parent / "presets"
+
 
 class AgentCatalogError(RuntimeError):
     """智能体目录层面的错误：文件读不了、形状不对、要的那个不在清单里。"""
@@ -75,9 +87,10 @@ class AgentProfile:
     summary: str
     #: 角色段正文；空串表示"不加任何角色段"。
     prompt: str
-    #: 是不是内置的。
+    #: 是不是随包带来的（代码内置 + 随包预置）；False = 用户目录里的文件。
     builtin: bool = False
-    #: 用户文件的文件名（内置的是空串）—— 出问题时把文件名指给用户看。
+    #: 这个名字从哪来：用户文件的文件名，或预置的 ``presets/<文件名>``；代码内置的是空串。
+    #: 出问题时把文件名指给用户看（面板也据此画出"读不了"的那几行）。
     file: str = ""
 
 
@@ -91,15 +104,20 @@ class AgentProblem:
 
 @dataclass(frozen=True)
 class AgentListing:
-    """一次扫描的结果：能用的 + 读不了的。``error`` 是目录整体的毛病（那时只剩内置）。"""
+    """一次扫描的结果：能用的 + 读不了的。``error`` 是用户目录整体的毛病
+    （那时清单里只剩内置与预置）。"""
 
     profiles: tuple[AgentProfile, ...]
     problems: tuple[AgentProblem, ...] = ()
     error: str | None = None
 
 
-#: 内置智能体。只写提要：说清职责与产出形态，数量/风格/平台交给用户当场定。
-#: 名字与用户手上的完整配置文档对得上，方便他对号入座；内容刻意比文档短得多。
+#: 代码里内置的智能体。**只剩「通用助手」**：不带任何角色段，就是这套工作台的出厂行为。
+#:
+#: 从前这里还放着几个角色的"提要"（一段话的职责与产出形态）。那些角色现在由
+#: :data:`PRESET_AGENTS` 带着**完整规格**随包预置 —— 同一件事不在两处各存一份，也就没有
+#: "代码那份跟文档对不上"这回事。通用助手留在代码里，是因为它**不是**某个人设：它就是
+#: "不加角色段"这个默认值本身。
 BUILTIN_PROFILES: tuple[AgentProfile, ...] = (
     AgentProfile(
         id=GENERAL_AGENT_ID,
@@ -108,78 +126,80 @@ BUILTIN_PROFILES: tuple[AgentProfile, ...] = (
         prompt="",
         builtin=True,
     ),
-    AgentProfile(
-        id="storyboard",
-        name="分镜导演助手",
-        summary="把故事拆成可拍摄的分镜，再给到画面提示词",
-        prompt=(
-            "当前角色：分镜导演。把小说、剧本、梗概或一句话创意变成可拍摄的分镜：先给整段的分镜方案，"
-            "再逐镜拆解景别、机位、运动、光线与氛围，最后给出能直接落进图像生成的画面提示词。"
-            "分镜数量、视觉风格、画幅与语言按用户要求；用户没说就按你判断合适的量来做，并说明你的取舍。"
-            "镜头与提示词要具体到能直接执行，不要用空泛形容词堆砌。"
-        ),
-        builtin=True,
+)
+
+
+#: 随包预置的成品智能体：``(id, 下拉显示名, 一句说明, 包内文件名)``。
+#:
+#: 与 :data:`BUILTIN_PROFILES` 的分工是"正文从哪来"：内置把整段人设写在代码里，预置把
+#: **整份规格文档**放在 :data:`PRESET_DIR` 里、一字不改地读进来当角色段。那些文档是给人看、
+#: 也能整份搬到别的平台的完整人设（身份、工作流、输出规范、示例），在代码里再誊一遍既会
+#: 走样，也会变成第二份要同步的副本。
+#:
+#: 这里的名字与说明**不**从文档里读：这 6 份的一级标题带着「完整迁移配置」这类**用途**
+#: 标记（那是文件名与标题的约定），直接拿来当下拉项又长又乱；标题下面那段引用块也时有时无
+#: （``AI剧本创作`` 与 ``AI漫剧资产库角色道具智能体`` 两份紧跟标题的就是二级标题）。
+#: 面板上显示成什么、与文档里写了什么，是两件事 —— 要改的也只是前者。
+#:
+#: id 沿用从前那几个内置项的 id：谁之前选过其中一个，现在选中的还是同一项，只是角色段从
+#: "一段提要"换成了完整规格。正文体量见 ``presets/README.md``（每份 2.6–4.9 万字符；
+#: 选中哪个才带哪个，但那一轮每一轮都带）。
+PRESET_AGENTS: tuple[tuple[str, str, str, str], ...] = (
+    (
+        "storyboard", "分镜导演助手", "把故事拆成可拍摄的分镜，再给到画面提示词",
+        "分镜导演助手_完整迁移配置.md",
     ),
-    AgentProfile(
-        id="script",
-        name="剧本创作",
-        summary="把故事改编成节奏紧凑的短剧剧本",
-        prompt=(
-            "当前角色：短剧编剧。把原始故事、小说、梗概或半成品剧本改造成节奏紧凑的短剧剧本："
-            "场次与台词齐备，重视开场钩子、冲突升级与收尾的悬念；需要时一并给人物设定与后续分集走向。"
-            "篇幅、集数与更新节奏按用户要求。改稿时保留用户的原意，只动该动的地方并说明改了什么。"
-        ),
-        builtin=True,
+    (
+        "script", "剧本创作", "把故事改编成节奏紧凑的短剧剧本",
+        "AI剧本创作_完整迁移配置.md",
     ),
-    AgentProfile(
-        id="costume",
-        name="漫剧服化道",
-        summary="人物造型、服装、道具与场景的视觉设定",
-        prompt=(
-            "当前角色：服化道设计。按用户给的叙事或人物设定产出造型、服装、道具与场景的视觉方案，"
-            "并从世界观出发保持它们之间的连续性：时代、地域、阶层、色彩语言要能对得上。"
-            "产出以可直接用于图像生成的中英双语提示词为主；用户要图就用工具出图。"
-            "缺的设定先按世界观补全，并标明哪些是你的补全，不要默默改掉用户已经写明的东西。"
-        ),
-        builtin=True,
+    (
+        "costume", "漫剧服化道", "人物造型、服装、道具与场景的视觉设定",
+        "AI漫剧服化道智能体_完整迁移配置.md",
     ),
-    AgentProfile(
-        id="asset",
-        name="角色道具资产库",
-        summary="角色/道具的标准化资产与三视图，前后一致可复用",
-        prompt=(
-            "当前角色：角色与道具资产设定。把一句自然语言设定整理成标准化、可复用的资产："
-            "先补全缺的信息（外貌、服装、材质、配色、装备），再给出可复用的资产提示词与设定说明。"
-            "做角色三视图时，正面、侧面、背面必须是同一个角色：发型、服装、配色、材质要对得上，"
-            "并突出面部与材质细节。字段与命名沿用用户习惯，不要另发明一套。"
-        ),
-        builtin=True,
+    (
+        "asset", "角色道具资产库", "角色/道具的标准化资产与三视图，前后一致可复用",
+        "AI漫剧资产库角色道具_完整迁移配置.md",
     ),
-    AgentProfile(
-        id="voice",
-        name="调音大师班",
-        summary="人物声线、环境氛围与道具音效的声音提示词",
-        prompt=(
-            "当前角色：声音设计。把人物形象、场景、道具、剧情与情绪转成可直接喂给配音、音效与音乐"
-            "生成模型的声音提示词：人物声线（音色、年龄感、气息、颗粒感、情绪张力、语速、停顿）、"
-            "环境氛围（空间、混响、材质、动态），以及道具 Foley 与特殊音效。"
-            "信息不足时按设定补全并说明补了什么；输出以能直接复制使用为准，不要写分析过程。"
-        ),
-        builtin=True,
+    (
+        "voice", "调音大师班", "人物声线、环境氛围与道具音效的声音提示词",
+        "调音大师班_完整迁移配置.md",
     ),
-    AgentProfile(
-        id="lyrics",
-        name="歌词创作",
-        summary="歌词、段落结构与适配的音乐风格提示词",
-        prompt=(
-            "当前角色：歌词与歌曲创作。按用户给的主题、情绪、语言、曲风与参考，产出完整歌词"
-            "（含段落结构与记忆点）与适配的风格提示词；需要时补上标题、编曲配器与 MV 氛围，"
-            "让成品能直接复制进音乐生成工具使用。语言与曲风按用户要求；用户给的信息很少时主动补全"
-            "并说明补了什么，不要反过来追问一大堆参数。"
-        ),
-        builtin=True,
+    (
+        "lyrics", "歌词创作", "歌词、段落结构与适配的音乐风格提示词",
+        "Suno歌词大师_完整迁移配置.md",
     ),
 )
+
+
+def _read_presets(directory: Path) -> tuple[list[AgentProfile], list[AgentProblem]]:
+    """把随包预置读成清单项。读不了的那份单列成一条 problem，其余照旧可用。
+
+    预置是**随包内容**：包被裁掉、搬坏，或者 :data:`PRESET_AGENTS` 里的文件名写错时，它就
+    读不出来。处置口径与用户文件读不了时一致 —— 只报那一条，不让整份清单跟着塌（通用助手
+    与用户自己的文件都还在）。``file`` 写成 ``presets/<文件名>``，好让人一眼看出毛病出在
+    包里、不在自己的目录里。
+    """
+    profiles: list[AgentProfile] = []
+    problems: list[AgentProblem] = []
+    for agent_id, name, summary, filename in PRESET_AGENTS:
+        shown = f"{directory.name}/{filename}"
+        try:
+            prompt = (directory / filename).read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError) as err:
+            problems.append(AgentProblem(file=shown, error=f"读不了：{err}"))
+            continue
+        if prompt == "":
+            problems.append(
+                AgentProblem(file=shown, error="文件是空的 —— 这个智能体的人设正文没了")
+            )
+            continue
+        profiles.append(
+            AgentProfile(
+                id=agent_id, name=name, summary=summary, prompt=prompt, builtin=True, file=shown
+            )
+        )
+    return profiles, problems
 
 
 def _plain_summary(text: str) -> str:
@@ -235,36 +255,58 @@ def _profile_from_file(path: Path) -> AgentProfile:
 
 
 class AgentCatalog:
-    """一份智能体清单：内置的 + 用户目录里的。
+    """一份智能体清单：内置的 + 随包预置的 + 用户目录里的。
 
-    ``directory`` 给 None 表示"没有用户目录"，清单里就只剩内置那几项（直接构造
-    :class:`comfy_studio.server.StudioHost` 的调用方与单测走这条）。
+    ``directory`` 给 None 表示"没有用户目录"，清单里就只剩内置与预置（直接构造
+    :class:`comfy_studio.server.StudioHost` 的调用方与单测走这条）。``presets`` 给 None
+    表示"一份预置都不装"：测"没有预置时是什么样"走这条。
     """
 
-    def __init__(self, directory: str | os.PathLike[str] | None = None) -> None:
+    def __init__(
+        self,
+        directory: str | os.PathLike[str] | None = None,
+        presets: str | os.PathLike[str] | None = PRESET_DIR,
+    ) -> None:
         self.directory = Path(directory).expanduser() if directory is not None else None
+        #: 随包预置目录；None = 不装预置（见 :data:`PRESET_AGENTS`）。
+        self.presets = Path(presets).expanduser() if presets is not None else None
 
     def scan(self) -> AgentListing:
-        """重新扫一遍目录。
+        """重新扫一遍。
 
         每次调用都读盘：用户随时可以往里丢一份新文件或改一份，不必重启宿主 —— 与
-        :class:`comfy_studio.skills.SkillCatalog` 的 ``refresh`` 是同一个理由。
+        :class:`comfy_studio.skills.SkillCatalog` 的 ``refresh`` 是同一个理由。预置那份
+        也照读：它是随包内容、本不会变，但"用户手改了包内那份"与"文件被搬走"都该当场看见。
         """
-        profiles = list(BUILTIN_PROFILES)
-        taken = {profile.id for profile in profiles}
+        profiles: list[AgentProfile] = list(BUILTIN_PROFILES)
+        blocked = {profile.id for profile in profiles}  # 代码内置：谁都不许顶
         problems: list[AgentProblem] = []
+        # id → 它在清单里的位置，供"顶掉"用（用户文件顶预置；预置顶不了内置）。
+        placed: dict[str, int] = {}
+        if self.presets is not None:
+            preset_profiles, preset_problems = _read_presets(self.presets)
+            problems.extend(preset_problems)
+            for profile in preset_profiles:
+                placed[profile.id] = len(profiles)
+                profiles.append(profile)
         if self.directory is None or not self.directory.exists():
-            # 没配目录、或还没往里放过文件：都不是错误，内置那几项照用。
-            return AgentListing(profiles=tuple(profiles))
+            # 没配目录、或还没往里放过文件：都不是错误，内置与预置照用 —— 但预置自己读不了
+            # 的那几条得如实带出来（以前这几个早退分支不带 problems，那时 problems 必然为空，
+            # 有了预置就不一定了）。
+            return AgentListing(profiles=tuple(profiles), problems=tuple(problems))
         if not self.directory.is_dir():
             return AgentListing(
-                profiles=tuple(profiles), error=f"智能体目录不是目录（{self.directory}）"
+                profiles=tuple(profiles),
+                problems=tuple(problems),
+                error=f"智能体目录不是目录（{self.directory}）",
             )
         try:
             paths = sorted(self.directory.glob(f"*{USER_SUFFIX}"))
         except OSError as err:
             return AgentListing(
-                profiles=tuple(profiles), error=f"读智能体目录失败（{self.directory}）：{err}"
+                profiles=tuple(profiles),
+                problems=tuple(problems),
+                error=f"读智能体目录失败（{self.directory}）：{err}",
             )
         for path in paths:
             try:
@@ -272,15 +314,22 @@ class AgentCatalog:
             except AgentCatalogError as err:
                 problems.append(AgentProblem(file=path.name, error=str(err)))
                 continue
-            if profile.id in taken:
+            if profile.id in blocked:
+                # 代码内置的（也就是「通用助手」）不能被顶掉：重名是一条错误（改个文件名
+                # 就行），不是静默覆盖。"我把内置那份改了怎么没生效"不该靠猜。
                 problems.append(
                     AgentProblem(
                         file=path.name,
-                        error=f"id {profile.id!r} 和已有的智能体重名；改个文件名就行",
+                        error=f"id {profile.id!r} 和内置的智能体重名；改个文件名就行",
                     )
                 )
                 continue
-            taken.add(profile.id)
+            if profile.id in placed:
+                # 随包预置可以被顶掉：预置是"默认底稿"，用户手上那份才是他要的。就地替换，
+                # 位置不动 —— 换一份自己的文件不该让下拉里的次序跳一下。
+                profiles[placed[profile.id]] = profile
+                continue
+            placed[profile.id] = len(profiles)
             profiles.append(profile)
         return AgentListing(profiles=tuple(profiles), problems=tuple(problems))
 
@@ -298,6 +347,8 @@ __all__ = [
     "AGENTS_SUBDIR",
     "BUILTIN_PROFILES",
     "GENERAL_AGENT_ID",
+    "PRESET_AGENTS",
+    "PRESET_DIR",
     "SUMMARY_CHARS",
     "USER_SUFFIX",
     "AgentCatalog",
