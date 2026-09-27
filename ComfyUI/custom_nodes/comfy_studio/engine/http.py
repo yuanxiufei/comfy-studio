@@ -2,10 +2,17 @@
 
 MCP server 被 Claude / Cursor 之类的宿主 spawn 出来时走这条路；用到的接口都是
 上游既有路由（``ComfyUI/server.py``）：``/object_info``、``/prompt``、``/history``、
-``/queue``、``/interrupt``，以及列模型清单用的 ``/models``、``/models/{folder}``。
-这些路由同时挂在 ``/`` 与 ``/api`` 前缀下（``ComfyUI/server.py:1231-1242`` 做的复制），
-这里用不带前缀的短路径。后两条是后加的路由，老引擎上没有 —— 见
-:meth:`HttpEngine.list_model_folders` 与 :meth:`HttpEngine.list_models` 的退路。
+``/queue``、``/interrupt``，列模型清单用的 ``/models``、``/models/{folder}``，以及
+撤下某个已提交 prompt 的 ``/api/jobs/{job_id}/cancel``。
+
+前缀：上游会把每条路由再复制一份加 ``/api``（``ComfyUI/server.py`` 的 ``add_routes``
+里那句 ``"/api" + route.path``），所以注册成 ``/prompt`` 的既能用 ``/prompt`` 也能用
+``/api/prompt``，这里一律用不带前缀的短路径。**只有 ``/api/jobs/...`` 是例外**：它注册
+时就带着 ``/api``，复制出来的那份是 ``/api/api/...``，反倒没有不带前缀的形式 —— 那一条
+必须按原样拼（见 :meth:`HttpEngine.cancel_prompt`）。
+
+后三条都是后加的路由，老引擎上没有 —— 见 :meth:`HttpEngine.list_model_folders`、
+:meth:`HttpEngine.list_models` 的退路与 :meth:`HttpEngine.cancel_prompt` 的报错。
 """
 
 from __future__ import annotations
@@ -24,6 +31,11 @@ from .base import DEFAULT_BASE_URL, EngineClient, EngineError
 #: 抄在这里是因为走 HTTP 的实现拿不到 ``folder_paths``：那个模块只在引擎进程里 import 得到，
 #: 而 HttpEngine 恰恰是"没活在引擎进程里"时才用的。
 FOLDER_NAME_ALIASES: dict[str, str] = {"unet": "diffusion_models", "clip": "text_encoders"}
+
+#: 撤下一个已提交的 prompt 时等引擎回话的上限（秒）。
+#: 比常规请求（``request_timeout``，默认 60 秒）短得多：这条路走在"用户刚按下停止"上，
+#: 引擎要是没反应，宁可快点放弃，也不能让一次取消干等一分钟。
+CANCEL_TIMEOUT = 10.0
 
 
 class HttpEngine(EngineClient):
@@ -229,6 +241,44 @@ class HttpEngine(EngineClient):
 
     async def interrupt(self) -> None:
         await self._json("POST", "/interrupt")
+
+    async def cancel_prompt(self, prompt_id: str) -> bool:
+        """按 id 撤下已提交的 prompt：上游 ``POST /api/jobs/{job_id}/cancel``。
+
+        这条路由（``ComfyUI/server.py`` 的 ``cancel_job_by_id``）是状态无关且幂等的：在跑就
+        中断、在排队就出队、已经结束或根本不认识都回 ``{"cancelled": false}`` 而不是报错
+        （形状核实自 ``ComfyUI/server.py`` 里那个 ``cancel_job_by_id`` 的返回值）。
+
+        分类与动作都在引擎里做（``comfy_execution/jobs.py`` 的 ``cancel_job``），这一侧只把
+        id 送过去、把布尔值取回来 —— 不自己在本地查 ``/queue`` 判断该删还是该中断：那会多出
+        一份判据，还会丢掉引擎侧的原子性（中断必须和"当前跑的正是这个 id"一起判断，否则
+        可能中断到快照之后刚起来的另一个 prompt）。
+
+        404 是**另一种**意思：这台引擎没有这条路由（比它老）；不能当成"没撤到"糊过去，
+        否则用户看到的"已停止"底下，那一步生成其实还在跑。超时也单独设短（见
+        :data:`CANCEL_TIMEOUT`）。
+        """
+        session = await self._get_session()
+        url = f"{self.base_url}/api/jobs/{quote(prompt_id, safe='')}/cancel"
+        try:
+            async with session.post(url, timeout=aiohttp.ClientTimeout(total=CANCEL_TIMEOUT)) as resp:
+                status = resp.status
+                text = await resp.text()
+        except aiohttp.ClientError as err:
+            raise EngineError(f"连不上引擎 {url}: {err}") from err
+
+        if status == 404:
+            raise EngineError(
+                "这台引擎没有 /api/jobs/{job_id}/cancel 路由（老版本 ComfyUI），"
+                f"已提交的 prompt {prompt_id} 撤不下来"
+            )
+        if status >= 400:
+            raise EngineError(f"POST /api/jobs/{prompt_id}/cancel 返回 {status}: {_short(text)}")
+        data = _json_loads(text) if text else None
+        cancelled = data.get("cancelled") if isinstance(data, dict) else None
+        if not isinstance(cancelled, bool):
+            raise EngineError(f"撤销 prompt {prompt_id} 返回了意外内容: {_short(text)}")
+        return cancelled
 
 
 def _json_loads(text: str) -> Any:

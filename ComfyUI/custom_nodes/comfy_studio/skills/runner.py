@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import random
+import sys
 import time
 import uuid
 from typing import Any, Awaitable, Callable
@@ -21,6 +22,9 @@ from .types import PromptWorkflow, Skill, SkillOutputImage, SkillRunResult
 
 # 状态回调：state ∈ {"queued", "running", "done"}，data 里带 prompt_id 等细节。
 StatusCallback = Callable[[str, dict[str, Any]], "Awaitable[None] | None"]
+
+# 撤下一个已提交的 prompt；回是否真的撤到了（详见 cancel_prompt）。
+CancelFn = Callable[[str], Awaitable[bool]]
 
 # 名为 seed 的参数传 -1 表示每次随机；KSampler 的 seed 上限是 0xffffffffffffffff，
 # 这里取 48 位随机，避免超出 JSON 安全整数范围（对齐 TS 版 runner.ts）。
@@ -140,6 +144,62 @@ async def _emit(callback: StatusCallback, state: str, data: dict[str, Any]) -> N
         await result
 
 
+async def cancel_prompt(prompt_id: str) -> bool:
+    """把已提交的 prompt 从引擎队列里撤下来：还在排队就出队，已经在跑就中断它。
+
+    判据与动作都交给上游 ``comfy_execution/jobs.py`` 的 ``cancel_job``，这里不另写一份。
+    它把两件很容易写错的事办好了：中断必须走 ``PromptQueue.interrupt_if_running``
+    （``ComfyUI/execution.py``，带 mutex 的原子判断，否则取消可能落到快照之后刚起来的
+    **另一个** prompt 上），而 pending→running 的竞态按"实际做没做到"回话，不硬说撤到了。
+    参数形状对齐引擎自己的取消路由（``ComfyUI/server.py`` 的 ``cancel_job_by_id``）：
+    ``history`` 要传全量，因为 ``classify_job_for_cancel`` 用的是 ``prompt_id in history``。
+
+    返回是否真的撤到了东西，语义与 ``POST /api/jobs/{job_id}/cancel`` 的 ``cancelled``
+    一致：已经跑完或根本不认识的 id 回 ``False``，不算错。
+    """
+    try:
+        from comfy_execution.jobs import (  # type: ignore[import-not-found]
+            CANCEL_PENDING,
+            CANCEL_RUNNING,
+            cancel_job,
+        )
+    except ImportError as err:  # pragma: no cover - 只有很老的引擎才缺这个模块
+        raise SkillExecutionError(
+            "本引擎没有 comfy_execution.jobs（老版本 ComfyUI），无法撤销已提交的 prompt"
+        ) from err
+
+    queue = _server().prompt_queue
+    running, queued = queue.get_current_queue()
+    result = cancel_job(
+        prompt_id,
+        running,
+        queued,
+        queue.get_history(),
+        queue.interrupt_if_running,
+        lambda item_id: queue.delete_queue_item(lambda item: item[1] == item_id),
+    )
+    return result in (CANCEL_RUNNING, CANCEL_PENDING)
+
+
+async def cancel_quietly(prompt_id: str, cancel: CancelFn | None = None) -> None:
+    """取消路径上的撤队列：失败只记一行 stderr，绝不改变"已取消"这个结论。
+
+    按下停止是调用方的意图，撤队列只是顺手把已经没人要的活从引擎队列里清掉。清理失败
+    （引擎连不上、太老、队列不接受）不该把 ``CancelledError`` 换成别的异常 —— 那会让宿主
+    看到"引擎坏了"而不是"已停止"，而取消本身早就生效了。
+    """
+    cancel = cancel or cancel_prompt
+    try:
+        await cancel(prompt_id)
+    except Exception as err:  # CancelledError 是 BaseException，不受这里影响，继续往外传
+        print(
+            f"[skills] 撤销 prompt {prompt_id} 没成功（已忽略，取消照常生效）: "
+            f"{type(err).__name__}: {err}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 def collect_images(entry: dict[str, Any]) -> tuple[SkillOutputImage, ...]:
     """从 history 条目的 outputs 里取出图片（结构来源：SaveImage 的 ui.images）。"""
     images: list[SkillOutputImage] = []
@@ -171,7 +231,13 @@ async def run_skill(
     prompt_id = await submit_prompt(prompt)
     if on_status is not None:
         await _emit(on_status, "queued", {"prompt_id": prompt_id})
-    entry = await wait_for_prompt(prompt_id, timeout=timeout, on_status=on_status)
+    try:
+        entry = await wait_for_prompt(prompt_id, timeout=timeout, on_status=on_status)
+    except asyncio.CancelledError:
+        # 光停下"等结果"这一侧不够：活已经在引擎队列里了，不撤下来的话它照样占着 GPU
+        # 跑完 —— 按了停止的人以为它停了。
+        await cancel_quietly(prompt_id)
+        raise
     return SkillRunResult(
         prompt_id=prompt_id,
         images=collect_images(entry),
@@ -185,6 +251,8 @@ __all__ = [
     "SEED_RANDOM",
     "SkillExecutionError",
     "build_prompt",
+    "cancel_prompt",
+    "cancel_quietly",
     "collect_images",
     "run_skill",
     "submit_prompt",

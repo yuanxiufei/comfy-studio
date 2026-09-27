@@ -1,9 +1,10 @@
 """``engine/inprocess.py``（进程内引擎）的测试。
 
-这是 custom node 跑在引擎进程里时的**默认**实现，之前一条测试都没有：八条原语
+这是 custom node 跑在引擎进程里时的**默认**实现：九条原语
 （object_info / list_model_folders / list_models / submit / wait / history / queue /
-interrupt）加上地址推导全都没跑过。这里用假的 ``server`` / ``folder_paths`` / ``nodes`` /
-``execution`` 模块把整条路走通，不需要真的起 ComfyUI。
+interrupt / cancel_prompt）加上地址推导都在这里跑。这里用假的 ``server`` / ``folder_paths`` /
+``nodes`` / ``execution`` 模块把整条路走通，不需要真的起 ComfyUI；只有取消那条用真的
+``comfy_execution/jobs.py``（见下面的 ``_COMFY_ROOT``）。
 """
 
 from __future__ import annotations
@@ -13,8 +14,16 @@ import os
 import sys
 import types
 import unittest
+from pathlib import Path
 from typing import Any
 from unittest import mock
+
+# ``comfy_execution/jobs.py`` 是引擎自己的取消逻辑（分类 + 该中断还是该出队），纯函数，
+# 这里直接用**真的**：它才是那套判断的事实源，假一份就等于拿替身测替身。它住在 ComfyUI
+# 根下，而跑测试时 cwd 是 ``custom_nodes``，所以补一条路。
+_COMFY_ROOT = Path(__file__).resolve().parents[3]
+if str(_COMFY_ROOT) not in sys.path:
+    sys.path.insert(0, str(_COMFY_ROOT))
 
 from comfy_studio.engine import DEFAULT_BASE_URL, EngineError
 from comfy_studio.engine import inprocess
@@ -43,6 +52,8 @@ class _FakeQueue:
         self.history: dict[str, dict[str, Any]] = {}
         self.running: list[tuple[Any, ...]] = []
         self.pending: list[tuple[Any, ...]] = []
+        #: 被要求"如果正是你在跑就中断"的 prompt_id（取消走这条，不是 interrupt_processing）。
+        self.interrupted: list[str] = []
 
     def put(self, item: tuple[Any, ...]) -> None:
         self.puts.append(item)
@@ -55,6 +66,25 @@ class _FakeQueue:
 
     def get_current_queue_volatile(self) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]]:
         return (list(self.running), list(self.pending))
+
+    def get_current_queue(self) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]]:
+        return (list(self.running), list(self.pending))
+
+    def interrupt_if_running(self, prompt_id: str) -> bool:
+        """引擎那个带 mutex 的原子中断；这里只要"确实在跑才动它、且回真话"这个语义。"""
+        self.interrupted.append(prompt_id)
+        for index, item in enumerate(self.running):
+            if item[1] == prompt_id:
+                self.running.pop(index)
+                return True
+        return False
+
+    def delete_queue_item(self, predicate: Any) -> bool:
+        for index, item in enumerate(self.pending):
+            if predicate(item):
+                self.pending.pop(index)
+                return True
+        return False
 
 
 class _FakePromptServer:
@@ -211,6 +241,35 @@ class InProcessEngineTest(unittest.IsolatedAsyncioTestCase):
         )
         await engine.interrupt()
         self.nodes.interrupt_processing.assert_called_once_with()
+
+    # ---- 取消：按 id 把活从队列里撤下来 ---------------------------------
+
+    async def test_cancel_prompt_interrupts_the_job_that_is_running(self) -> None:
+        # 分类与动作都交给引擎自己的 cancel_job：在跑就中断，且只动这一个。
+        self.queue.running = [(1, "running-id")]
+        self.queue.pending = [(2, "someone-else")]
+
+        self.assertTrue(await InProcessEngine().cancel_prompt("running-id"))
+
+        self.assertEqual(self.queue.interrupted, ["running-id"])
+        self.assertEqual([item[1] for item in self.queue.running], [])
+        self.assertEqual([item[1] for item in self.queue.pending], ["someone-else"], "别人的活不许动")
+
+    async def test_cancel_prompt_dequeues_the_job_that_is_only_pending(self) -> None:
+        self.queue.pending = [(1, "pending-id"), (2, "someone-else")]
+
+        self.assertTrue(await InProcessEngine().cancel_prompt("pending-id"))
+
+        self.assertEqual([item[1] for item in self.queue.pending], ["someone-else"])
+        self.assertEqual(self.queue.interrupted, [], "还没开跑就谈不上中断")
+
+    async def test_cancel_prompt_is_a_no_op_for_finished_or_unknown_ids(self) -> None:
+        # 与上游 POST /api/jobs/{job_id}/cancel 一样幂等：回 False，不当成错误。
+        self.queue.history["done-id"] = {"status": {"completed": True}}
+        engine = InProcessEngine()
+
+        self.assertFalse(await engine.cancel_prompt("done-id"))
+        self.assertFalse(await engine.cancel_prompt("从来没入过队"))
 
     # ---- 地址推导（/view 图片链接要用）-----------------------------------
 

@@ -41,13 +41,21 @@ class FakeComfy:
         files: dict[str, Any] | None = None,
         nodes: dict[str, Any] | None = None,
         models_status: int = 200,
+        cancels: dict[str, Any] | None = None,
+        has_cancel_route: bool = True,
     ) -> None:
         self.models = models
         self.files = files or {}
         self.nodes = nodes or {}
         self.models_status = models_status
+        #: job_id → 原样回包；值是 ``(状态码, 正文)`` 时用来试错误状态。
+        self.cancels = cancels or {}
+        #: False = 模拟"没有这条取消路由"的老引擎。
+        self.has_cancel_route = has_cancel_route
         #: 服务端实际收到的 ``/models/{folder}`` 里的类别名（验证客户端有没有做 URL 编码）。
         self.asked: list[str] = []
+        #: 服务端实际收到的 ``/api/jobs/{job_id}/cancel`` 里的 job_id（同上）。
+        self.cancel_asked: list[str] = []
 
     def table(self) -> web.RouteTableDef:
         table = web.RouteTableDef()
@@ -77,12 +85,29 @@ class FakeComfy:
                 return web.json_response({})
             return web.json_response({node: value})
 
+        if self.has_cancel_route:
+
+            async def cancel(request: web.Request) -> web.Response:
+                job_id = request.match_info["job_id"]
+                self.cancel_asked.append(job_id)
+                payload = self.cancels.get(job_id, {"cancelled": True})
+                if isinstance(payload, tuple):
+                    status, body = payload
+                    return web.json_response(body, status=status)
+                return web.json_response(payload)
+
+            # 上游把它注册在 /api 前缀下（``ComfyUI/server.py`` 的 cancel_job_by_id），
+            # 所以这里也照原样挂，正好顺带验证客户端没自作主张去掉前缀。
+            table.post("/api/jobs/{job_id}/cancel")(cancel)
+
         table.get("/models/{folder}")(files)
         table.get("/object_info/{node}")(object_info)
         return table
 
 
-class HttpModelListTest(unittest.IsolatedAsyncioTestCase):
+class _EngineTestCase(unittest.IsolatedAsyncioTestCase):
+    """起一个假引擎并把 HttpEngine 接上去（模型清单与取消两组用例共用）。"""
+
     async def start(self, fake: FakeComfy) -> HttpEngine:
         app = web.Application()
         app.add_routes(fake.table())
@@ -92,6 +117,9 @@ class HttpModelListTest(unittest.IsolatedAsyncioTestCase):
         engine = HttpEngine(f"http://127.0.0.1:{server.port}", request_timeout=5.0)
         self.addAsyncCleanup(engine.close)
         return engine
+
+
+class HttpModelListTest(_EngineTestCase):
 
     async def test_it_reads_the_folder_set_and_the_files(self) -> None:
         fake = FakeComfy(
@@ -188,6 +216,52 @@ class HttpModelListTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(EngineError) as ctx:
             await engine.list_model_folders()
         self.assertIn("GET /models 返回 500", str(ctx.exception))
+
+
+class HttpCancelPromptTest(_EngineTestCase):
+    """``cancel_prompt``：上游 ``POST /api/jobs/{job_id}/cancel``。
+
+    这是取消一个 skill 时"把活从引擎队列里撤下来"的唯一手段。路由本身是幂等的（已经跑完
+    或根本不认识的 id 回 ``{"cancelled": false}``，不是错误），但 **404 是另一回事**：那说明
+    这台引擎没有这条路由，不能当成"没撤到"糊过去 —— 否则"已停止"底下那步生成还在跑。
+    """
+
+    async def test_it_asks_the_engine_to_cancel_that_exact_job(self) -> None:
+        fake = FakeComfy(cancels={"p1": {"cancelled": True}, "p2": {"cancelled": False}})
+        engine = await self.start(fake)
+
+        self.assertTrue(await engine.cancel_prompt("p1"))
+        self.assertFalse(await engine.cancel_prompt("p2"), "已结束/不认识的 id 回 False，不是错误")
+        self.assertEqual(fake.cancel_asked, ["p1", "p2"])
+
+    async def test_the_job_id_is_url_encoded(self) -> None:
+        # id 是引擎给的（我们这边提交时用的是 uuid4，但形状不该依赖这一点）：不编码的话
+        # "#" 会被当成片段截掉，请求就打到别的路径上去了。
+        fake = FakeComfy(cancels={"a#b": {"cancelled": True}})
+        engine = await self.start(fake)
+
+        self.assertTrue(await engine.cancel_prompt("a#b"))
+        self.assertEqual(fake.cancel_asked, ["a#b"])
+
+    async def test_an_engine_without_the_route_is_reported_not_swallowed(self) -> None:
+        engine = await self.start(FakeComfy(has_cancel_route=False))
+
+        with self.assertRaises(EngineError) as ctx:
+            await engine.cancel_prompt("p1")
+        message = str(ctx.exception)
+        self.assertIn("没有 /api/jobs/{job_id}/cancel 路由", message)
+        self.assertIn("p1", message, "要说清是哪个 prompt 没撤下来")
+
+    async def test_unexpected_shapes_and_statuses_are_reported(self) -> None:
+        engine = await self.start(FakeComfy(cancels={"p1": {"ok": True}}))
+        with self.assertRaises(EngineError) as ctx:
+            await engine.cancel_prompt("p1")
+        self.assertIn("返回了意外内容", str(ctx.exception))
+
+        engine = await self.start(FakeComfy(cancels={"p2": (500, {"error": "boom"})}))
+        with self.assertRaises(EngineError) as ctx:
+            await engine.cancel_prompt("p2")
+        self.assertIn("POST /api/jobs/p2/cancel 返回 500", str(ctx.exception))
 
 
 if __name__ == "__main__":

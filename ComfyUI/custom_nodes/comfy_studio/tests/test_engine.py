@@ -6,12 +6,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import io
 import unittest
 from typing import Any
 
 from ..engine import EngineError, MODEL_PROBES
 from ..skills import build_prompt, load_skills, WORKFLOWS_DIR
-from ..skills.runner import DEFAULT_TIMEOUT
+from ..skills.runner import DEFAULT_TIMEOUT, StatusCallback
 from .support import FakeEngine
 
 
@@ -69,6 +72,25 @@ class ListModelsTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("无法从 VAELoader.vae_name 读取模型列表", str(ctx.exception))
 
 
+class _HangingEngine(FakeEngine):
+    """``wait`` 会一直挂着，好在"正等着"的那一刻把它取消掉。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+
+    async def wait(
+        self,
+        prompt_id: str,
+        timeout: float | None = DEFAULT_TIMEOUT,
+        on_status: StatusCallback | None = None,
+    ) -> dict[str, Any]:
+        self.waits.append({"prompt_id": prompt_id, "timeout": timeout, "has_status": on_status is not None})
+        self.entered.set()
+        await asyncio.sleep(3600)  # 除了被取消，没有别的出路
+        raise AssertionError("被取消的 wait 不该继续往下走")
+
+
 class RunSkillTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.engine = FakeEngine()
@@ -117,6 +139,43 @@ class RunSkillTest(unittest.IsolatedAsyncioTestCase):
             await self.engine.run_skill(self.skill, {"positive": "x"})
         self.assertEqual(self.engine.submitted, [])
         self.assertEqual(self.engine.waits, [])
+
+    async def test_cancelling_the_wait_also_withdraws_the_submitted_prompt(self) -> None:
+        """取消不只是"不等了"：活已经进了引擎队列，得撤下来，否则它照样占着 GPU 跑完。
+
+        守的是 :meth:`EngineClient.run_skill` 里那个 ``except CancelledError`` 分支 ——
+        去掉它，用例照样"取消成功"，只是引擎那边白烧一段算力，肉眼看不出来。
+        """
+        engine = _HangingEngine()
+        task = asyncio.create_task(engine.run_skill(self.skill, {"ckpt_name": "a", "positive": "x"}))
+        await engine.entered.wait()
+
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(engine.waits[0]["prompt_id"], "prompt-1")
+        # 按 id 撤那一个（不是 interrupt 一把梭：那样会误伤队列里别人的活）
+        self.assertEqual(engine.cancels, ["prompt-1"])
+
+    async def test_a_failed_withdrawal_still_reads_as_cancelled(self) -> None:
+        """撤不掉（引擎连不上、比这条路由老）不能把取消变成错误。
+
+        那会让宿主看到"引擎坏了"而不是"已停止"，而取消本身早就生效了 —— 所以撤队列
+        失败只在 stderr 留一行，CancelledError 照旧往外传。
+        """
+        engine = _HangingEngine()
+        engine.cancel_error = EngineError("连不上引擎 http://engine.test")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            task = asyncio.create_task(engine.run_skill(self.skill, {"ckpt_name": "a", "positive": "x"}))
+            await engine.entered.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertEqual(engine.cancels, ["prompt-1"])
+        self.assertIn("撤销 prompt prompt-1 没成功", stderr.getvalue())
 
 
 if __name__ == "__main__":

@@ -724,13 +724,13 @@ class StudioHost:
 
         "停下"的分工要说清：宿主这边**立刻**不再等模型、也不再等引擎（在飞的 HTTP
         请求会被真的断开）；引擎那侧认这条通知（``mcp/protocol.py`` 的
-        ``_handle_notification`` 转 ``_cancel_inflight``），会掐掉那条在跑的 tools/call
-        请求任务，于是不再轮询 ``/history``、不再占着工具执行 —— 这一侧的"别再算了"
-        现在是真生效的。
+        ``_handle_notification`` 转 ``_cancel_inflight``）：既掐掉那条在跑的 tools/call
+        请求任务（不再轮询 ``/history``、不再占着工具执行），也把**已经提交进引擎队列的
+        那个 prompt 按 id 撤下来**（在跑就中断、还在排队就出队，见 ``engine/base.py`` 的
+        ``cancel_prompt``）—— 所以"停止"是真停，不会留下一台机器在背后把这一步跑完。
 
-        但**已经提交进 ComfyUI 队列的活仍会自己跑完**：取消停下的是"等结果的那一侧"，
-        不是队列本身；要从队列里撤下来得调 ``/queue`` 的 delete 或 ``/interrupt``，
-        引擎侧目前没有做这件事。别把这条通知当"队列也停了"。
+        两点边界：只撤这一轮自己提交的那一个（队列里别人的活不动）；撤不掉（引擎比
+        ``/api/jobs/{job_id}/cancel`` 老、或者连不上）只在 stderr 留一行，取消照常生效。
         """
         args = _object(params, "agent/cancel")
         session_id = args.get("session_id") or DEFAULT_SESSION

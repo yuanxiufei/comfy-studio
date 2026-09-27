@@ -12,11 +12,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from typing import Any
 
 from ..skills import Skill, SkillRunResult, build_prompt, collect_images
-from ..skills.runner import DEFAULT_TIMEOUT, StatusCallback
+from ..skills.runner import DEFAULT_TIMEOUT, StatusCallback, cancel_quietly
 
 
 class EngineError(RuntimeError):
@@ -50,7 +51,7 @@ DEFAULT_BASE_URL = "http://127.0.0.1:8188"
 
 
 class EngineClient(ABC):
-    """对引擎的最小操作集。子类只需实现这 6 个原语。"""
+    """对引擎的最小操作集。子类只需实现这 7 个原语。"""
 
     #: 引擎的对外地址，用于拼 /view 图片链接。
     base_url: str = DEFAULT_BASE_URL
@@ -80,6 +81,17 @@ class EngineClient(ABC):
     @abstractmethod
     async def interrupt(self) -> None:
         """中断当前执行。"""
+
+    @abstractmethod
+    async def cancel_prompt(self, prompt_id: str) -> bool:
+        """把**指定**的那个 prompt 从引擎队列里撤下来：在跑就中断，在排队就出队。
+
+        返回是否真的撤到了东西：已经跑完或根本不认识的 id 回 ``False``，不算错。
+
+        与 :meth:`interrupt` 的区别是「精确到 id」：``interrupt`` 是不管三七二十一停掉
+        当前正在跑的那个（可能压根不是你要撤的），取消一个 skill 必须走这个原语，
+        否则会误伤队列里别人的活。
+        """
 
     async def list_model_folders(self) -> list[str]:
         """本机**已注册的模型类别全集**（ComfyUI ``folder_paths`` 的那些键）。
@@ -126,7 +138,13 @@ class EngineClient(ABC):
             result = on_status("queued", {"prompt_id": prompt_id})
             if result is not None:
                 await result
-        entry = await self.wait(prompt_id, timeout=timeout, on_status=on_status)
+        try:
+            entry = await self.wait(prompt_id, timeout=timeout, on_status=on_status)
+        except asyncio.CancelledError:
+            # 光停下"等结果"这一侧不够：活已经进引擎队列了（HTTP 那条路尤其看不见它），
+            # 不撤下来的话它照样占着 GPU 跑完 —— 按了停止的人以为它停了。
+            await cancel_quietly(prompt_id, self.cancel_prompt)
+            raise
         return SkillRunResult(
             prompt_id=prompt_id,
             images=collect_images(entry),

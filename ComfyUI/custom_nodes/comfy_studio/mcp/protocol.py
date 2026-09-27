@@ -11,7 +11,8 @@ notification（没有 id）不回包，未知方法回 -32601，handler 抛错�
 * 超过 :data:`_MAX_LINE` 的单行请求丢弃并回 -32600，**不把它整行读进内存**；
 * ``notifications/cancelled``（宿主放弃一条已发出的请求时补发，见宿主侧
   ``mcp/client.py`` 的 ``_abandon``）会真的掐掉对应的请求任务 —— 否则那条请求会一直
-  占着工具执行、烧 token，宿主却早已不等了。
+  占着工具执行、烧 token，宿主却早已不等了。掐掉的任务带着 ``CancelledError`` 退出，
+  工具层据此把已经提交进引擎队列的活也撤下来（见 ``engine/base.py`` 的 ``run_skill``）。
 """
 
 from __future__ import annotations

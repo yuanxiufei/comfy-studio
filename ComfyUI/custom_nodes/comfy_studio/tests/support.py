@@ -1,6 +1,6 @@
 """测试用的替身：一个假引擎句柄 + 一个假模型客户端。
 
-假引擎只实现 :class:`~comfy_studio.engine.base.EngineClient` 的 6 个原语，
+假引擎只实现 :class:`~comfy_studio.engine.base.EngineClient` 的 7 个原语，
 ``run_skill`` 等上层组合直接用基类的实现 —— 这样这些用例同时在验证基类组合。
 """
 
@@ -58,6 +58,11 @@ class FakeEngine(EngineClient):
         self.model_folders: list[str] | None = None
         #: wait 期间要推的状态序列（默认跑一遍 running → done）。
         self.wait_states: tuple[str, ...] = ("running", "done")
+        #: 被要求撤下的 prompt_id（取消路径有没有真去撤队列，看这里）。
+        self.cancels: list[str] = []
+        #: ``cancel_prompt`` 的回话；非 None 时改成抛这个异常（验证"撤不掉≠取消失败"）。
+        self.cancel_error: Exception | None = None
+        self.cancel_result = True
 
     async def list_model_folders(self) -> list[str]:
         if self.model_folders is None:
@@ -108,6 +113,12 @@ class FakeEngine(EngineClient):
 
     async def interrupt(self) -> None:
         self.interrupts += 1
+
+    async def cancel_prompt(self, prompt_id: str) -> bool:
+        self.cancels.append(prompt_id)
+        if self.cancel_error is not None:
+            raise self.cancel_error
+        return self.cancel_result
 
 
 class FakeLLM:

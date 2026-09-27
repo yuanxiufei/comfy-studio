@@ -11,6 +11,7 @@ import os
 from typing import Any
 
 from ..skills.runner import DEFAULT_TIMEOUT, StatusCallback
+from ..skills.runner import cancel_prompt as _cancel_prompt
 from ..skills.runner import submit_prompt as _submit_prompt
 from ..skills.runner import wait_for_prompt as _wait_for_prompt
 from .base import DEFAULT_BASE_URL, EngineClient, EngineError
@@ -129,6 +130,15 @@ class InProcessEngine(EngineClient):
         import nodes  # type: ignore[import-not-found]
 
         nodes.interrupt_processing()
+
+    async def cancel_prompt(self, prompt_id: str) -> bool:
+        """按 id 撤下已提交的 prompt：直接用引擎自己的队列，不绕 HTTP。
+
+        判据与 HTTP 那条路共用同一份（``skills.runner.cancel_prompt`` → 上游
+        ``comfy_execution/jobs.py`` 的 ``cancel_job``），不在这里再写一遍"查队列决定
+        该删还是该中断"。
+        """
+        return await _cancel_prompt(prompt_id)
 
 
 __all__ = ["InProcessEngine"]
