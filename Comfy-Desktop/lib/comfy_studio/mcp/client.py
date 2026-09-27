@@ -195,9 +195,12 @@ class McpStdioClient:
             )
         except Cancelled:
             # 我们不等了，但 server 可能还在算（跑 skill 就是这种情况）：照 MCP 的规矩
-            # 告诉它别再算了。引擎侧的 comfy_studio 目前把通知一律丢掉
-            # （``mcp/protocol.py`` 里 ``if msg_id is None: return``），所以这条通知
-            # 现在是"发出去了但还没人接"，等引擎侧补齐后才会真的停下队列里的活。
+            # 告诉它别再算了。引擎侧的 comfy_studio 认这条通知（``mcp/protocol.py`` 的
+            # ``_handle_notification`` 转 ``_cancel_inflight``），会掐掉那条在跑的请求
+            # 任务 —— 于是不再轮询 ``/history``、不再占着工具执行。
+            # 但它掐的是"等结果的这一侧"：**已经提交进 ComfyUI 队列的活仍会自己跑完**，
+            # 从队列里撤下来是另一件事（要调 ``/queue`` 的 delete 或 ``/interrupt``，
+            # 引擎侧目前没有做），别把这条通知当成"队列也停了"。
             await self._abandon(request_id, method, "客户端取消")
             raise
         except asyncio.TimeoutError as err:

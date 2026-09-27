@@ -29,8 +29,9 @@ _SEED_RANGE = 0x1_0000_0000_0000
 #: 等一次执行结束的默认上限（秒）。设为 None 表示不设上限。
 DEFAULT_TIMEOUT = 1800.0
 
-#: 轮询历史/队列的间隔（秒）。
-_POLL_INTERVAL = 0.5
+#: 轮询历史/队列的间隔（秒）。进程内（本模块）与 HTTP（``engine/http.py``）两条等待路径
+#: 共用同一个节奏，别再各写一份。
+POLL_INTERVAL = 0.5
 
 
 class SkillExecutionError(RuntimeError):
@@ -130,7 +131,7 @@ async def wait_for_prompt(
                 f"等待 prompt {prompt_id} 超时（{timeout} 秒）；可用 interrupt 工具中断，"
                 "或查看 /queue 判断它是否还排在队列里"
             )
-        await asyncio.sleep(_POLL_INTERVAL)
+        await asyncio.sleep(POLL_INTERVAL)
 
 
 async def _emit(callback: StatusCallback, state: str, data: dict[str, Any]) -> None:
@@ -180,6 +181,7 @@ async def run_skill(
 
 __all__ = [
     "DEFAULT_TIMEOUT",
+    "POLL_INTERVAL",
     "SEED_RANDOM",
     "SkillExecutionError",
     "build_prompt",

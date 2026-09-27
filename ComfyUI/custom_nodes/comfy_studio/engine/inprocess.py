@@ -13,7 +13,7 @@ from typing import Any
 from ..skills.runner import DEFAULT_TIMEOUT, StatusCallback
 from ..skills.runner import submit_prompt as _submit_prompt
 from ..skills.runner import wait_for_prompt as _wait_for_prompt
-from .base import EngineClient, EngineError
+from .base import DEFAULT_BASE_URL, EngineClient, EngineError
 
 
 def _server():
@@ -39,10 +39,10 @@ def _default_base_url() -> str:
     try:
         server = _server()
     except EngineError:
-        return "http://127.0.0.1:8188"
+        return DEFAULT_BASE_URL
     port = getattr(server, "port", None)
     if port is None:
-        return "http://127.0.0.1:8188"
+        return DEFAULT_BASE_URL
     address = str(getattr(server, "address", "127.0.0.1"))
     if address in {"0.0.0.0", "::", ""}:
         address = "127.0.0.1"

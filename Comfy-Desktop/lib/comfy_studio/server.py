@@ -723,9 +723,14 @@ class StudioHost:
         """让某一轮尽快停下。幂等：没有在跑的轮次就回 ``cancelled: false``。
 
         "停下"的分工要说清：宿主这边**立刻**不再等模型、也不再等引擎（在飞的 HTTP
-        请求会被真的断开）；引擎那侧目前收不到这个消息（``mcp/protocol.py`` 把通知
-        一律丢掉），所以已经排进 ComfyUI 队列的活还会自己跑完。要真停下队列里的事，
-        得等引擎侧认 ``notifications/cancelled``。
+        请求会被真的断开）；引擎那侧认这条通知（``mcp/protocol.py`` 的
+        ``_handle_notification`` 转 ``_cancel_inflight``），会掐掉那条在跑的 tools/call
+        请求任务，于是不再轮询 ``/history``、不再占着工具执行 —— 这一侧的"别再算了"
+        现在是真生效的。
+
+        但**已经提交进 ComfyUI 队列的活仍会自己跑完**：取消停下的是"等结果的那一侧"，
+        不是队列本身；要从队列里撤下来得调 ``/queue`` 的 delete 或 ``/interrupt``，
+        引擎侧目前没有做这件事。别把这条通知当"队列也停了"。
         """
         args = _object(params, "agent/cancel")
         session_id = args.get("session_id") or DEFAULT_SESSION

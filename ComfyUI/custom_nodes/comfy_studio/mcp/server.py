@@ -43,13 +43,6 @@ def skills_dir() -> Path:
     return Path(override).expanduser() if override else WORKFLOWS_DIR
 
 
-def load_default_skills() -> tuple[Skill, ...]:
-    """内置 + 用户 skill 的一次性列表（工具集请用 :func:`default_registry`，那个是活的）。"""
-    registry = default_registry()
-    registry.reload()
-    return registry.all()
-
-
 def default_registry() -> SkillRegistry:
     """默认的 skill 目录视图：随包自带的只读目录 + 用户自己的可写目录。"""
     return SkillRegistry(builtin_dir=skills_dir(), user_dir=user_skills_dir())
@@ -144,7 +137,6 @@ __all__ = [
     "SKILLS_DIR_ENV",
     "create_server",
     "default_registry",
-    "load_default_skills",
     "main",
     "serve_stdio",
     "skills_dir",

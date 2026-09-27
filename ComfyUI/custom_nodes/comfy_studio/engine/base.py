@@ -44,11 +44,16 @@ MODEL_PROBES: dict[str, tuple[str, str]] = {
 }
 
 
+#: 引擎的默认地址：走 HTTP 且没给 ``COMFY_URL`` 时用它。
+#: 进程内那条路只在拿不到 ``PromptServer.port`` 时才回退到它（``engine/inprocess.py``）。
+DEFAULT_BASE_URL = "http://127.0.0.1:8188"
+
+
 class EngineClient(ABC):
     """对引擎的最小操作集。子类只需实现这 6 个原语。"""
 
     #: 引擎的对外地址，用于拼 /view 图片链接。
-    base_url: str = "http://127.0.0.1:8188"
+    base_url: str = DEFAULT_BASE_URL
 
     @abstractmethod
     async def object_info(self, node_class: str | None = None) -> dict[str, Any]:
@@ -129,4 +134,4 @@ class EngineClient(ABC):
         )
 
 
-__all__ = ["EngineClient", "EngineError", "MODEL_PROBES"]
+__all__ = ["DEFAULT_BASE_URL", "EngineClient", "EngineError", "MODEL_PROBES"]

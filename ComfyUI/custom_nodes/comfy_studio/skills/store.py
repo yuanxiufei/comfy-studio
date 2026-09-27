@@ -20,6 +20,7 @@ import json
 import os
 import re
 from pathlib import Path
+from typing import Iterable
 
 from .loader import load_skill_file, load_skills, skill_to_json
 from .types import Skill
@@ -59,27 +60,36 @@ def load_user_skills(directory: str | Path) -> tuple[Skill, ...]:
     return tuple(load_skill_file(f) for f in files)
 
 
+def merge_unique_skills(*groups: Iterable[Skill]) -> tuple[Skill, ...]:
+    """把几组 skill 按给定顺序拼起来，id 撞车直接报错并指出两份来源。
+
+    这层查重 :func:`load_all_skills` 与
+    :class:`~comfy_studio.skills.registry.SkillRegistry` 都要用，所以只写一遍：
+    skill 是能被 agent 直接调用的名字，静默让一份盖掉另一份会让人分不清跑的是哪一份。
+    """
+    seen: dict[str, Skill] = {}
+    for group in groups:
+        for skill in group:
+            other = seen.get(skill.id)
+            if other is not None:
+                raise ValueError(
+                    f"skill id 冲突: {skill.id} 同时来自 {other.source} 与 {skill.source}；请改掉其中一个"
+                )
+            seen[skill.id] = skill
+    return tuple(seen.values())
+
+
 def load_all_skills(
     builtin_dir: str | Path | None = None,
     user_dir: str | Path | None = None,
 ) -> tuple[Skill, ...]:
     """内置 + 用户的全部 skill（内置在前，各自按文件名排序）。
 
-    id 撞车直接报错并指出两份文件：skill 是可被 agent 直接调用的名字，静默让用户那份
-    盖掉内置那份会让人分不清跑的到底是哪一份。``None`` 表示这个来源不参与。
+    ``None`` 表示这个来源不参与。
     """
     builtin = load_skills(builtin_dir) if builtin_dir is not None else ()
     user = load_user_skills(user_dir) if user_dir is not None else ()
-
-    seen: dict[str, Skill] = {}
-    for skill in (*builtin, *user):
-        other = seen.get(skill.id)
-        if other is not None:
-            raise ValueError(
-                f"skill id 冲突: {skill.id} 同时来自 {other.source} 与 {skill.source}；请改掉其中一个"
-            )
-        seen[skill.id] = skill
-    return (*builtin, *user)
+    return merge_unique_skills(builtin, user)
 
 
 def write_skill(skill: Skill, directory: str | Path) -> Path:
@@ -102,6 +112,7 @@ __all__ = [
     "check_skill_id",
     "load_all_skills",
     "load_user_skills",
+    "merge_unique_skills",
     "user_skills_dir",
     "write_skill",
 ]

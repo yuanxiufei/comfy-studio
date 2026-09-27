@@ -239,7 +239,12 @@ agent / skill / mcp 三件能力**前后端各有一份**，按各自项目里�
 它经 preload 桥 `window.__comfyDesktop2.ComfyStudio` 走 IPC 找主进程，
 主进程再按需 spawn 上面的宿主进程。抽屉顶部两个下拉：上面一行是模型，紧挨着的
 一行是智能体；一轮在跑时两个都禁用（换哪个都会把在飞的一轮搅乱）；
-旁边那个「停止」按钮走 `agent/cancel`——宿主立刻不再等模型与引擎，
+旁边那个「停止」按钮走 `agent/cancel`——宿主立刻不再等模型与引擎，同时按 MCP 的规矩
+补一条 `notifications/cancelled`；引擎侧认这条通知（`mcp/protocol.py` 的
+`_handle_notification` 转 `_cancel_inflight`），掐掉那条在跑的 `tools/call` 请求任务，
+于是不再轮询 `/history`、不再占着工具执行。**但已经提交进 ComfyUI 队列的活仍会自己
+跑完**：取消停下的是"等结果的那一侧"，不是队列本身（要从队列里撤下来得调 `/queue` 的
+delete 或 `/interrupt`，引擎侧目前没有做这件事）。
 这一轮回的是**正常结果**（`cancelled: true`）而不是错误，面板把它画成"已停止"，
 历史配对完整，接着聊下一句就行。
 

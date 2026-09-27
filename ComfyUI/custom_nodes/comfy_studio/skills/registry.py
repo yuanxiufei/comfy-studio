@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .loader import validate_skill
-from .store import check_skill_id, load_all_skills, load_user_skills, write_skill
+from .store import check_skill_id, load_user_skills, merge_unique_skills, write_skill
 from .types import Skill
 
 
@@ -53,20 +53,12 @@ class SkillRegistry:
 
             builtin = load_skills(self.builtin_dir)
         user = load_user_skills(self.user_dir) if self.user_dir is not None else ()
-        # 与 load_all_skills 同一套查重规则，这里手工拼是为了记住"哪些是内置的"。
-        self._install((*builtin, *user))
+        # 查重规则只有 store.merge_unique_skills 那一份；这里手工拼是为了记住"哪些是内置的"。
+        self._install(merge_unique_skills(builtin, user))
         self._builtin_ids = frozenset(s.id for s in builtin)
 
     def _install(self, skills: Iterable[Skill]) -> None:
-        loaded: dict[str, Skill] = {}
-        for skill in skills:
-            other = loaded.get(skill.id)
-            if other is not None:
-                raise ValueError(
-                    f"skill id 冲突: {skill.id} 同时来自 {other.source} 与 {skill.source}；请改掉其中一个"
-                )
-            loaded[skill.id] = skill
-        self._skills = loaded
+        self._skills = {skill.id: skill for skill in merge_unique_skills(skills)}
 
     def all(self) -> tuple[Skill, ...]:
         """全部 skill：内置在前、用户在后的稳定顺序。"""

@@ -12,11 +12,9 @@ from __future__ import annotations
 
 import os
 
-from .base import MODEL_PROBES, EngineClient, EngineError
+from .base import DEFAULT_BASE_URL, MODEL_PROBES, EngineClient, EngineError
 from .http import HttpEngine
 from .inprocess import InProcessEngine
-
-DEFAULT_BASE_URL = "http://127.0.0.1:8188"
 
 
 def in_engine_process() -> bool:

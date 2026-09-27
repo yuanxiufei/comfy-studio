@@ -15,7 +15,6 @@ from typing import Any, Awaitable, Callable
 
 from ..engine import EngineClient
 from ..mcp.tools import Tool
-from ..skills import SkillRegistry
 from .llm import LLMConfig, LLMError, OpenAIChatClient
 from .types import ChatMessage, ToolCall, system_message, tool_message, user_message
 
@@ -146,18 +145,6 @@ class AgentSession:
         await self.llm.close()
 
 
-def create_session(engine: EngineClient, registry: SkillRegistry | None = None) -> AgentSession:
-    """按需组装一个会话：加载 skill、生成工具集、读环境变量里的模型配置。"""
-    from ..mcp.server import default_registry
-    from ..mcp.tools import build_tools
-
-    resolved = registry if registry is not None else default_registry()
-    if registry is None:
-        resolved.reload()
-    tools = build_tools(engine, resolved)
-    return AgentSession(engine, tools)
-
-
 __all__ = [
     "AgentError",
     "AgentEvent",
@@ -166,7 +153,6 @@ __all__ = [
     "DEFAULT_SYSTEM_PROMPT",
     "EventListener",
     "LLMError",
-    "create_session",
     "tool_result_text",
     "tool_schemas",
 ]

@@ -17,10 +17,8 @@ from urllib.parse import quote
 
 import aiohttp
 
-from ..skills.runner import DEFAULT_TIMEOUT, StatusCallback
-from .base import EngineClient, EngineError
-
-_POLL_INTERVAL = 0.5
+from ..skills.runner import DEFAULT_TIMEOUT, POLL_INTERVAL, StatusCallback
+from .base import DEFAULT_BASE_URL, EngineClient, EngineError
 
 #: 老类别名 → 现用名。同一份表在引擎侧（``ComfyUI/folder_paths.py`` 的 ``map_legacy``）。
 #: 抄在这里是因为走 HTTP 的实现拿不到 ``folder_paths``：那个模块只在引擎进程里 import 得到，
@@ -31,7 +29,7 @@ FOLDER_NAME_ALIASES: dict[str, str] = {"unet": "diffusion_models", "clip": "text
 class HttpEngine(EngineClient):
     """通过 HTTP 访问一个已经在跑的 ComfyUI。"""
 
-    def __init__(self, base_url: str = "http://127.0.0.1:8188", request_timeout: float = 60.0) -> None:
+    def __init__(self, base_url: str = DEFAULT_BASE_URL, request_timeout: float = 60.0) -> None:
         self.base_url = base_url.rstrip("/")
         self._timeout = aiohttp.ClientTimeout(total=request_timeout)
         self._session: aiohttp.ClientSession | None = None
@@ -214,7 +212,7 @@ class HttpEngine(EngineClient):
 
             if deadline is not None and time.monotonic() > deadline:
                 raise EngineError(f"等待 prompt {prompt_id} 超时（{timeout} 秒）")
-            await asyncio.sleep(_POLL_INTERVAL)
+            await asyncio.sleep(POLL_INTERVAL)
 
     async def history(self, prompt_id: str) -> dict[str, Any] | None:
         data = await self._json("GET", f"/history/{prompt_id}")

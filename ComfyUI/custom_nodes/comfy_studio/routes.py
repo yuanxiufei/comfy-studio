@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -36,7 +37,11 @@ _sessions: dict[str, AgentSession] = {}
 
 
 def _skills_stamp() -> tuple[tuple[str, float], ...]:
-    """两个 skill 目录（内置 + 用户）的指纹：增删改任何一个文件都会变。"""
+    """两个 skill 目录（内置 + 用户）的指纹：增删改任何一个文件都会变。
+
+    同步函数，但会 stat 两个目录里的全部 ``.json``，所以调用方一律经
+    :func:`asyncio.to_thread` 丢到线程里 —— 这是 aiohttp 的事件循环，别在这里排 IO 队。
+    """
     entries: list[tuple[str, float]] = []
     for directory in (skills_dir(), user_skills_dir()):
         d = Path(directory)
@@ -48,26 +53,28 @@ def _skills_stamp() -> tuple[tuple[str, float], ...]:
     return tuple(entries)
 
 
-def _skill_registry() -> SkillRegistry:
+async def _skill_registry() -> SkillRegistry:
     """skill 目录视图：内容没变就复用上次加载结果。
 
     **只换内容、不换对象**（除非目录本身变了）：已经开着的会话把 registry 闭包进了工具集，
     每次请求都新建一个对象的话，"对话里刚存下的 skill"在同一个会话里就看不见了。
+
+    stat 指纹与重新加载都可能读很多文件（用户写坏的 JSON 会在这里报错），所以都走线程。
     """
     global _registry, _skill_stamp
     dirs = (Path(skills_dir()), Path(user_skills_dir()))
     if _registry is None or (_registry.builtin_dir, _registry.user_dir) != dirs:
         _registry = SkillRegistry(builtin_dir=dirs[0], user_dir=dirs[1])
         _skill_stamp = None
-    stamp = _skills_stamp()
+    stamp = await asyncio.to_thread(_skills_stamp)
     if _skill_stamp != stamp:
-        _registry.reload()
+        await asyncio.to_thread(_registry.reload)
         _skill_stamp = stamp
     return _registry
 
 
-def _skills() -> tuple[Skill, ...]:
-    return _skill_registry().all()
+async def _skills() -> tuple[Skill, ...]:
+    return (await _skill_registry()).all()
 
 
 def _error(status: int, message: str) -> web.Response:
@@ -90,7 +97,7 @@ async def _read_json(request: web.Request) -> dict[str, Any]:
     return body
 
 
-def _session(session_id: str, engine: Any, registry: SkillRegistry) -> AgentSession:
+async def _session(session_id: str, engine: Any, registry: SkillRegistry) -> AgentSession:
     """取（或建）一个对话会话；超出上限就淘汰最久未用的那个。"""
     existing = _sessions.get(session_id)
     if existing is not None:
@@ -101,8 +108,10 @@ def _session(session_id: str, engine: Any, registry: SkillRegistry) -> AgentSess
     while len(_sessions) >= MAX_SESSIONS:
         oldest_id, oldest = next(iter(_sessions.items()))
         _sessions.pop(oldest_id, None)
-        # 连接交给事件循环回收；这里只保证不泄漏 session 对象。
         oldest.messages.clear()
+        # 关掉它手里的模型连接：aiohttp 的 session 不会因为对象被 GC 就自己关，
+        # 只清 messages 会留下一堆没人管的连接（句柄泄漏 + "Unclosed client session"）。
+        await oldest.close()
 
     created = AgentSession(engine, build_tools(engine, registry), OpenAIChatClient(LLMConfig.from_env()))
     _sessions[session_id] = created
@@ -119,7 +128,7 @@ def register_routes() -> None:
     @router.get(f"{PREFIX}/skills")
     async def list_skills(_request: web.Request) -> web.Response:
         try:
-            loaded = _skills()
+            loaded = await _skills()
         except (ValueError, OSError) as err:  # 目录里混了坏文件：如实报出来，别给个空列表
             return _error(500, f"{type(err).__name__}: {err}")
         return web.json_response(
@@ -141,18 +150,26 @@ def register_routes() -> None:
 
     @router.get(f"{PREFIX}/queue")
     async def queue(_request: web.Request) -> web.Response:
-        return web.json_response(await engine.queue())
+        # 引擎不可达时 engine.queue() 会抛（HTTP 那条路会）：照本模块的约定回 JSON 错误，
+        # 别让 aiohttp 丢一个 HTML 错误页给按 JSON 解析的前端。
+        try:
+            return web.json_response(await engine.queue())
+        except EngineError as err:
+            return _error(500, str(err))
 
     @router.post(f"{PREFIX}/interrupt")
     async def interrupt(_request: web.Request) -> web.Response:
-        await engine.interrupt()
+        try:
+            await engine.interrupt()
+        except EngineError as err:
+            return _error(500, str(err))
         return web.json_response({"ok": True})
 
     @router.post(f"{PREFIX}/skills/{{skill_id}}/run")
     async def run_skill(request: web.Request) -> web.Response:
         skill_id = request.match_info["skill_id"]
         try:
-            skill = _skill_registry().get(skill_id)
+            skill = (await _skill_registry()).get(skill_id)
         except (ValueError, OSError) as err:
             return _error(500, f"{type(err).__name__}: {err}")
         if skill is None:
@@ -180,7 +197,7 @@ def register_routes() -> None:
                 "configured": True,
                 "model": config.model,
                 "base_url": config.base_url,
-                "tool_count": len(build_tools(engine, _skill_registry())),
+                "tool_count": len(build_tools(engine, await _skill_registry())),
             }
         )
 
@@ -196,9 +213,11 @@ def register_routes() -> None:
             return _bad_request(err)
 
         try:
-            session = _session(session_id, engine, _skill_registry())
+            session = await _session(session_id, engine, await _skill_registry())
         except LLMError as err:
             return _error(503, str(err))
+        except (ValueError, OSError) as err:  # skill 目录里混了坏文件 / 读不动
+            return _error(500, f"{type(err).__name__}: {err}")
 
         if body.get("reset"):
             session.reset()

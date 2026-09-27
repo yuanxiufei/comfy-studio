@@ -14,7 +14,6 @@ from .loop import (
     AgentEvent,
     AgentSession,
     EventListener,
-    create_session,
     tool_result_text,
     tool_schemas,
 )
@@ -33,7 +32,6 @@ __all__ = [
     "OpenAIChatClient",
     "Role",
     "ToolCall",
-    "create_session",
     "system_message",
     "tool_message",
     "tool_result_text",
