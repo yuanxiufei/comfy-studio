@@ -23,10 +23,16 @@ class EngineError(RuntimeError):
     """引擎侧的错误（校验失败、执行失败、连不上等）。"""
 
 
-#: 每类模型用哪个节点的枚举字段探测。
+#: **老引擎的回退探测表**：每类模型用哪个节点的枚举字段去问。
 #: 字段名核实自引擎自带节点：CheckpointLoaderSimple.ckpt_name、VAELoader.vae_name、
 #: LoraLoader.lora_name、CLIPLoader.clip_name、UNETLoader.unet_name、
 #: ControlNetLoader.control_net_name、UpscaleModelLoader.model_name。
+#:
+#: 新引擎（带了 ``GET /models`` 与 ``GET /models/{folder}`` 两个路由的版本，见
+#: ``ComfyUI/server.py`` 的 ``list_model_types`` / ``get_models``）不再需要它：类别全集
+#: 直接问 ``folder_paths.folder_names_and_paths``，第三方自定义节点注册的目录
+#: （例如 F5-TTS 那种）也在里面。这张表只在老引擎上兜底 —— 它只能覆盖引擎自带的
+#: 那几类，而且要求对应节点已注册，节点没装时会误报"没有这类模型"。
 MODEL_PROBES: dict[str, tuple[str, str]] = {
     "checkpoints": ("CheckpointLoaderSimple", "ckpt_name"),
     "vae": ("VAELoader", "vae_name"),
@@ -70,11 +76,21 @@ class EngineClient(ABC):
     async def interrupt(self) -> None:
         """中断当前执行。"""
 
+    async def list_model_folders(self) -> list[str]:
+        """本机**已注册的模型类别全集**（ComfyUI ``folder_paths`` 的那些键）。
+
+        默认只回退到探测表的键：老引擎没有 ``GET /models`` 这个路由，问不到全集。
+        带该路由的新引擎由子类覆写成真正的全集 —— 除引擎自带类别外，还包括第三方
+        自定义节点自己注册的目录（它们走 ``folder_paths.add_model_folder_path``）。
+        """
+        return list(MODEL_PROBES)
+
     async def list_models(self, folder: str) -> list[str]:
-        """按类别列出可用模型文件名。
+        """按类别列出可用模型文件名（**老引擎回退路径**）。
 
         做法与前端一致：读对应节点输入上的下拉枚举值，而不是自己去翻 models 目录，
-        这样多出来的 extra_model_paths 配置也能被算进去。
+        这样多出来的 extra_model_paths 配置也能被算进去。覆盖范围只有探测表那几类，
+        新引擎由子类覆写成直接按类别问 ``folder_paths``（第三方目录也能列）。
         """
         probe = MODEL_PROBES.get(folder)
         if probe is None:

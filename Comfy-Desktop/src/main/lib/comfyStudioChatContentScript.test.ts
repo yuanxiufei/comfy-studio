@@ -9,6 +9,7 @@ const INPUT_ID = 'comfy-desktop-studio-chat-input'
 const SEND_ID = 'comfy-desktop-studio-chat-send'
 const STOP_ID = 'comfy-desktop-studio-chat-stop'
 const MODEL_ID = 'comfy-desktop-studio-chat-model'
+const AGENT_ID = 'comfy-desktop-studio-chat-agent'
 const SESSION_ID = 'comfy-desktop-studio-chat-session'
 const SESSION_NEW_ID = 'comfy-desktop-studio-chat-session-new'
 const SESSION_CLOSE_ID = 'comfy-desktop-studio-chat-session-close'
@@ -42,6 +43,24 @@ describe('getComfyStudioChatContentScript', () => {
   const catalog = (models: string[], current: string, error: string | null = null): unknown => ({
     ok: true,
     result: { current, models, source: error ? 'config' : 'endpoint', error }
+  })
+
+  /** `agent/agents` 的回包；`extra` 用来塞 missing / problems / error 这些边角。 */
+  const agentsCatalog = (
+    list: Array<{ id: string; name: string; summary?: string }>,
+    current: string,
+    extra: Record<string, unknown> = {}
+  ): unknown => ({
+    ok: true,
+    result: {
+      current,
+      missing: null,
+      agents: list,
+      problems: [],
+      error: null,
+      dir: 'D:\\data\\agents',
+      ...extra
+    }
   })
 
   type RequestStub = (method: string, params: unknown) => unknown
@@ -381,6 +400,24 @@ describe('getComfyStudioChatContentScript', () => {
       expect(picker().options[0]?.textContent).toContain('（当前）')
     })
 
+    it('says so when the browser storage cannot be read', async () => {
+      // 隐私模式 / 被禁用：读不出来就说"这次记不住"，别拿默认那段冒充上次那段。
+      const spy = vi.spyOn(window.localStorage, 'getItem').mockImplementation(() => {
+        throw new Error('denied')
+      })
+      try {
+        installBridge({ request: host([row()]) })
+        setupDom()
+        new Function(script)()
+        await openPanel()
+
+        expect(state().session, '读不到记忆中那一段就退回默认那段').toBe('default')
+        expect(picker().title).toContain('浏览器存储用不了')
+      } finally {
+        spy.mockRestore()
+      }
+    })
+
     it('lists the conversations the host knows, current one included', async () => {
       installBridge({
         request: host([
@@ -442,6 +479,60 @@ describe('getComfyStudioChatContentScript', () => {
       expect(rows('agent')[0]?.textContent).toBe('这一段对话（存在这台机器上）')
     })
 
+    it('does not paint a conversation the user already left', async () => {
+      // 换段是异步的：手快的人点完 chat-3 又点 chat-2 时，chat-3 的"取历史"可能后回来。
+      // 照单全收就成了两段话混在一屏上，而下拉说的是 chat-2 —— 所以票对不上就一句都不画。
+      const parked: Array<(value: unknown) => void> = []
+      installBridge({
+        request: (method: string, params: unknown): unknown => {
+          if (method === 'agent/sessions') {
+            return {
+              ok: true,
+              result: {
+                sessions: [row(), row({ session_id: 'chat-2' }), row({ session_id: 'chat-3' })],
+                max_sessions: 8
+              }
+            }
+          }
+          if (method === 'agent/history') {
+            const asked = (params as { session_id?: string } | null)?.session_id
+            if (asked === 'chat-3') {
+              // 这一段慢：先挂着，等用户换走之后再放它回来（模拟"响应迟到"）。
+              return new Promise((resolve) => {
+                parked.push(resolve)
+              })
+            }
+            return {
+              ok: true,
+              result: { entries: [{ type: 'user', text: '这是 ' + asked + ' 的话' }] }
+            }
+          }
+          return { ok: true, result: { text: '答案在此' } }
+        }
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      expect(rows('user').map((r) => r.textContent)).toEqual(['这是 default 的话'])
+
+      picker().value = 'chat-3'
+      picker().dispatchEvent(new Event('change'))
+      await flush()
+      picker().value = 'chat-2'
+      picker().dispatchEvent(new Event('change'))
+      await flush()
+      expect(state().session).toBe('chat-2')
+      expect(rows('user').map((r) => r.textContent)).toEqual(['这是 chat-2 的话'])
+
+      // 迟到的 chat-3 现在回来了：不许画。
+      parked.forEach((resolve) =>
+        resolve({ ok: true, result: { entries: [{ type: 'user', text: '这是 chat-3 的话' }] } })
+      )
+      await flush()
+      expect(rows('user').map((r) => r.textContent)).toEqual(['这是 chat-2 的话'])
+      expect(rows('agent').map((r) => r.textContent)).toEqual(['这一段对话（存在这台机器上）'])
+    })
+
     it('says a switched-to conversation has nothing in it yet', async () => {
       installBridge({
         request: host([row(), row({ session_id: 'chat-2', title: '空的那段', messages: 0 })])
@@ -475,6 +566,41 @@ describe('getComfyStudioChatContentScript', () => {
       expect(broken?.textContent).toBe('读不了：deadbeef.json')
       expect(broken?.disabled).toBe(true)
       expect(broken?.title).toContain('deadbeef.json')
+    })
+
+    it('keeps the list it already showed when a refresh fails', async () => {
+      // 宿主抖一下、或它刚重启时刷新会失败：这时候把下拉清空，用户看到的就是"别的对话
+      // 都没了"——比"这一次没读到"吓人得多。留着上一份，把失败如实说出来。
+      let failing = false
+      installBridge({
+        request: (method: string): unknown => {
+          if (method === 'agent/sessions') {
+            if (failing) return { ok: false, error: { code: -32603, message: '宿主忙' } }
+            return {
+              ok: true,
+              result: {
+                sessions: [row(), row({ session_id: 'chat-2', title: '赛博朋克海报' })],
+                max_sessions: 8
+              }
+            }
+          }
+          return { ok: true, result: { entries: [] } }
+        }
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      expect(Array.from(picker().options).map((o) => o.value)).toEqual(['default', 'chat-2'])
+
+      failing = true
+      document.getElementById(SESSION_NEW_ID)?.click() // 新开会顺带刷新一次清单
+      await flush()
+
+      expect(
+        Array.from(picker().options).map((o) => o.value),
+        '别的对话还在下拉里'
+      ).toContain('chat-2')
+      expect(picker().title).toContain('读会话清单失败')
     })
 
     it('starts a new conversation with an id of its own and says so', async () => {
@@ -530,6 +656,48 @@ describe('getComfyStudioChatContentScript', () => {
       )
       expect(state().session).not.toBe('default')
       expect(rows('error')).toHaveLength(0)
+    })
+
+    it('can go back to a conversation it just closed', async () => {
+      // 关掉 = 腾位子，不是清对话：从下拉把它选回来，面板该让宿主把存档喂回来接着聊。
+      installBridge({
+        request: (method: string, params: unknown): unknown => {
+          if (method === 'host/info') {
+            return { ok: true, result: { history: true, memory: true, memory_entries: 0 } }
+          }
+          if (method === 'agent/sessions') {
+            return { ok: true, result: { sessions: [row()], max_sessions: 8 } }
+          }
+          if (method === 'agent/close') {
+            return { ok: true, result: { session_id: 'default', closed: true, history_kept: true } }
+          }
+          if (method === 'agent/history') {
+            const asked = (params as { session_id?: string } | null)?.session_id
+            return {
+              ok: true,
+              result:
+                asked === 'default'
+                  ? { entries: [{ type: 'user', text: '关掉前说的话' }] }
+                  : { entries: [] }
+            }
+          }
+          return { ok: true, result: { text: '答案在此' } }
+        }
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      document.getElementById(SESSION_CLOSE_ID)?.click()
+      await flush()
+      expect(state().session).not.toBe('default')
+
+      picker().value = 'default'
+      picker().dispatchEvent(new Event('change'))
+      await flush()
+
+      expect(state().session).toBe('default')
+      expect(rows('user').map((r) => r.textContent)).toEqual(['关掉前说的话'])
     })
 
     it('asks again before dropping a conversation when there is no archive', async () => {
@@ -1075,6 +1243,152 @@ describe('getComfyStudioChatContentScript', () => {
     input.value = '跑个 skill'
     document.getElementById(SEND_ID)?.click() // 不 await：这一轮在飞行中
     expect(picker.disabled, 'switching mid-turn would cut the turn off').toBe(true)
+
+    await flush()
+    expect(picker.disabled).toBe(false)
+  })
+
+  it('fills the agent picker from the host catalog when the drawer opens', async () => {
+    const request = vi.fn((method: string) =>
+      method === 'agent/agents'
+        ? agentsCatalog(
+            [
+              { id: 'general', name: '通用助手', summary: '什么都能问' },
+              { id: 'artist', name: '画师', summary: '只谈出图' }
+            ],
+            'artist'
+          )
+        : { ok: true, result: { text: '答案在此' } }
+    )
+    installBridge({ request })
+    setupDom()
+    new Function(script)()
+
+    expect(document.getElementById(AGENT_ID), 'picker is part of the drawer').toBeNull()
+
+    await openPanel()
+
+    // 开抽屉会连着问几样（模型、智能体、历史、会话…），只看问了没有，不认它排第几。
+    expect(request.mock.calls.map((call) => call[0])).toContain('agent/agents')
+    const picker = document.getElementById(AGENT_ID) as HTMLSelectElement
+    expect(Array.from(picker.options).map((o) => o.value)).toEqual(['general', 'artist'])
+    expect(Array.from(picker.options).map((o) => o.textContent)).toEqual(['通用助手', '画师'])
+    expect(picker.options[0]?.title, 'files carry their own summary').toBe('什么都能问')
+    expect(picker.value, 'current agent is preselected').toBe('artist')
+    expect(picker.disabled).toBe(false)
+    expect(picker.title, 'tooltip says where user agents live').toContain('D:\\data\\agents')
+  })
+
+  it('switches the agent through the host and names the new persona', async () => {
+    const request = vi.fn((method: string) => {
+      if (method === 'agent/agents')
+        return agentsCatalog([{ id: 'general', name: '通用' }, { id: 'artist', name: '画师' }], 'general')
+      if (method === 'agent/agent')
+        return { ok: true, result: { agent: 'artist', changed: true, name: '画师', error: null } }
+      return { ok: true, result: { text: '答案在此' } }
+    })
+    installBridge({ request })
+    setupDom()
+    new Function(script)()
+    await openPanel()
+
+    const picker = document.getElementById(AGENT_ID) as HTMLSelectElement
+    picker.value = 'artist'
+    picker.dispatchEvent(new Event('change'))
+    await flush()
+
+    expect(request).toHaveBeenCalledWith('agent/agent', { agent: 'artist' })
+    expect(document.getElementById(STATUS_ID)?.textContent).toContain('画师')
+    expect(document.getElementById(STATUS_ID)?.textContent).toContain('下一次提问')
+    expect(picker.value).toBe('artist')
+    expect(picker.disabled).toBe(false)
+    expect(rows('error'), 'a successful switch must not paint an error').toHaveLength(0)
+  })
+
+  it('rolls the agent picker back when the host rejects the switch', async () => {
+    const request = vi.fn((method: string) => {
+      if (method === 'agent/agents')
+        return agentsCatalog([{ id: 'general', name: '通用' }, { id: 'ghost', name: '幽灵' }], 'general')
+      if (method === 'agent/agent')
+        return { ok: false, error: { code: -32602, message: '没有这个智能体' } }
+      return { ok: true, result: { text: '答案在此' } }
+    })
+    installBridge({ request })
+    setupDom()
+    new Function(script)()
+    await openPanel()
+
+    const picker = document.getElementById(AGENT_ID) as HTMLSelectElement
+    picker.value = 'ghost'
+    picker.dispatchEvent(new Event('change'))
+    await flush()
+
+    expect(picker.value, 'selection falls back to the agent actually in use').toBe('general')
+    expect(rows('error').map((r) => r.textContent)).toEqual([
+      '换智能体失败: 没有这个智能体（错误码 -32602）'
+    ])
+    expect(picker.disabled).toBe(false)
+  })
+
+  it('draws unreadable agent files as disabled rows instead of dropping them', async () => {
+    const request = vi.fn((method: string) =>
+      method === 'agent/agents'
+        ? agentsCatalog([{ id: 'general', name: '通用' }], 'general', {
+            problems: [{ file: 'broken.md', error: '文件读不了: boom' }]
+          })
+        : { ok: true, result: { text: '答案在此' } }
+    )
+    installBridge({ request })
+    setupDom()
+    new Function(script)()
+    await openPanel()
+
+    const picker = document.getElementById(AGENT_ID) as HTMLSelectElement
+    const bad = picker.options[picker.options.length - 1]
+    expect(bad?.textContent).toBe('broken.md（读不了）')
+    expect(bad?.title).toBe('文件读不了: boom')
+    expect(bad?.disabled, 'a broken row must not be selectable').toBe(true)
+    expect(picker.title, 'the tooltip names the unreadable files').toContain('broken.md')
+  })
+
+  it('keeps a selected agent that vanished visibly unselected', async () => {
+    const request = vi.fn((method: string) =>
+      method === 'agent/agents'
+        ? agentsCatalog([{ id: 'general', name: '通用' }], 'ghost', {
+            missing: '选中的智能体 不在了（文件被删掉或改名了？）'
+          })
+        : { ok: true, result: { text: '答案在此' } }
+    )
+    installBridge({ request })
+    setupDom()
+    new Function(script)()
+    await openPanel()
+
+    const picker = document.getElementById(AGENT_ID) as HTMLSelectElement
+    expect(picker.value, 'pretending the gone agent is still selected would lie').toBe('')
+    expect(picker.selectedIndex).toBe(-1)
+    expect(picker.title).toContain('不在了')
+    expect(picker.disabled, 'the remaining agent is still selectable').toBe(false)
+  })
+
+  it('locks the agent picker while a turn is in flight', async () => {
+    const request = vi.fn((method: string) =>
+      method === 'agent/agents'
+        ? agentsCatalog([{ id: 'general', name: '通用' }], 'general')
+        : { ok: true, result: { text: '答案在此' } }
+    )
+    installBridge({ request })
+    setupDom()
+    new Function(script)()
+    await openPanel()
+
+    const picker = document.getElementById(AGENT_ID) as HTMLSelectElement
+    expect(picker.disabled).toBe(false)
+
+    const input = document.getElementById(INPUT_ID) as HTMLTextAreaElement
+    input.value = '跑个 skill'
+    document.getElementById(SEND_ID)?.click() // 不 await：这一轮在飞行中
+    expect(picker.disabled, 'swapping the persona mid-turn would be confusing').toBe(true)
 
     await flush()
     expect(picker.disabled).toBe(false)

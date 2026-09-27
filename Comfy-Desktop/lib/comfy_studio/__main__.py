@@ -124,6 +124,16 @@ def build_parser() -> argparse.ArgumentParser:
             "你的记性和聊过的内容不该跟着一起没"
         ),
     )
+    parser.add_argument(
+        "--agents-dir",
+        default=None,
+        help=(
+            "可切换的智能体里，用户自己写的那部分放哪；默认取数据目录下的 agents/"
+            "（也可用 COMFY_STUDIO_AGENTS_DIR）。一份 .md 一个智能体：一级标题是名字，"
+            "紧随其后的引用是一句说明，其余正文就是它的角色设定。"
+            "内置那几项在代码里，不受这个目录影响"
+        ),
+    )
     return parser
 
 
@@ -154,6 +164,7 @@ def main(argv: list[str] | None = None) -> int:
                 output_dir=args.output_dir or os.environ.get("COMFY_OUTPUT_DIR"),
                 memory=not args.no_memory,
                 memory_dir=args.memory_dir or os.environ.get("COMFY_STUDIO_MEMORY_DIR"),
+                agents_dir=args.agents_dir or os.environ.get("COMFY_STUDIO_AGENTS_DIR"),
                 history=not args.no_history,
             )
         )

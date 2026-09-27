@@ -3,6 +3,17 @@
 from __future__ import annotations
 
 from ..cancel import CancelToken, Cancelled
+from .catalog import (
+    AGENTS_SUBDIR,
+    BUILTIN_PROFILES,
+    GENERAL_AGENT_ID,
+    AgentCatalog,
+    AgentCatalogError,
+    AgentListing,
+    AgentProblem,
+    AgentProfile,
+    SUMMARY_CHARS,
+)
 from .llm import LLMConfig, LLMError, OpenAIChatClient
 from .loop import (
     BASE_SYSTEM_PROMPT,
@@ -21,10 +32,17 @@ from .loop import (
 from .types import ChatMessage, Role, ToolCall, system_message, tool_message, user_message
 
 __all__ = [
+    "AGENTS_SUBDIR",
+    "AgentCatalog",
+    "AgentCatalogError",
     "AgentError",
     "AgentEvent",
+    "AgentListing",
+    "AgentProblem",
+    "AgentProfile",
     "AgentSession",
     "BASE_SYSTEM_PROMPT",
+    "BUILTIN_PROFILES",
     "CLOSING_SYSTEM_PROMPT",
     "CancelToken",
     "Cancelled",
@@ -33,10 +51,12 @@ __all__ = [
     "DEFAULT_MAX_STEPS",
     "DEFAULT_SYSTEM_PROMPT",
     "EventListener",
+    "GENERAL_AGENT_ID",
     "LLMConfig",
     "LLMError",
     "OpenAIChatClient",
     "Role",
+    "SUMMARY_CHARS",
     "ToolCall",
     "compose_system_prompt",
     "create_session",

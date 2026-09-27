@@ -4,6 +4,7 @@ import fs from 'fs'
 import path from 'path'
 import { getBundledScriptPath } from './bundledScript'
 import { getActivePythonPath } from './pythonEnv'
+import * as settings from '../settings'
 import type { InstallationRecord } from '../installations'
 
 /**
@@ -63,9 +64,16 @@ interface PendingRequest {
 }
 
 /** `<Comfy-Desktop>/lib`: parent of the `comfy_studio` package, and the cwd that
- *  `-m comfy_studio` needs to resolve the package. */
+ *  `-m comfy_studio` needs to resolve the package.
+ *
+ *  Two levels up on purpose: the entry point is
+ *  `<lib>/comfy_studio/__main__.py`, so one `dirname` only gets as far as the
+ *  package directory itself — as a cwd that makes `-m comfy_studio` look for
+ *  `<lib>/comfy_studio/comfy_studio` and fail with "No module named
+ *  comfy_studio". */
 export function getBundledLibDir(): string {
-  return path.dirname(getBundledScriptPath(path.join('comfy_studio', '__main__.py')))
+  const entry = getBundledScriptPath(path.join('comfy_studio', '__main__.py'))
+  return path.dirname(path.dirname(entry))
 }
 
 /**
@@ -81,42 +89,80 @@ export function findComfyUIDir(installPath: string): string | null {
   return null
 }
 
+/**
+ * The `--input-directory` / `--output-directory` the engine is launched with, or
+ * null for "that launch injects no such flag".
+ *
+ * The host needs its own copy of this decision because `lib/comfy_studio/localfiles.py`
+ * falls back to `<comfyui-dir>/{input,output}`, while the launcher points the engine
+ * at the *shared* dirs from the global settings unless the install opts out — the
+ * storage branch of `lib/ipc/sessionActions/launch.ts`, which this mirrors. Left
+ * unconnected, `localfiles__import_file` would copy material into a folder the
+ * engine never reads and `localfiles__list_files` would report a wrong path.
+ *
+ * Precedence, again the launcher's: shared (global settings) → per-install field
+ * → null. Null is not a guess: both sides then fall back to ComfyUI's own
+ * `<base>/{input,output}`, and the host's `--comfyui-dir` *is* that base — so
+ * passing nothing keeps them equal.
+ */
+export function resolveEngineStorageDirs(installation: InstallationRecord): {
+  inputDir: string | null
+  outputDir: string | null
+} {
+  const pick = (
+    key: 'inputDir' | 'outputDir',
+    useShared: boolean | undefined,
+    perInstall: string | undefined
+  ): string | null => {
+    if (useShared !== false) {
+      return (settings.get(key) as string | undefined) || settings.defaults[key]
+    }
+    return perInstall || null
+  }
+  return {
+    inputDir: pick('inputDir', installation.useSharedInput, installation.inputDir),
+    outputDir: pick('outputDir', installation.useSharedOutput, installation.outputDir)
+  }
+}
+
 /** Launch recipe for the host, or null when this install has no python / ComfyUI. */
 export function resolveStudioCommand(installation: InstallationRecord): ComfyStudioCommand | null {
   const cmd = getActivePythonPath(installation)
   if (!cmd) return null
   const comfyuiDir = findComfyUIDir(installation.installPath)
   if (!comfyuiDir) return null
-  return {
-    cmd,
-    args: [
-      '-X',
-      'utf8',
-      '-m',
-      'comfy_studio',
-      '--comfyui-dir',
-      comfyuiDir,
-      '--request-timeout',
-      String(STUDIO_REQUEST_TIMEOUT_MS / 1000),
-      // Canvas tools need somebody to answer `canvas_call` (see
-      // `comfyStudioCanvasRelay`); this shell is that somebody, so the extra
-      // tool table is asked for here and nowhere else.
-      '--canvas',
-      // `review__ask_user` needs somebody to paint the question and carry the
-      // answer back — the injected panel does both. Same deal: this shell asks
-      // for that tool table, no other caller does.
-      '--review',
-      // Same for `plan__submit` / `plan__progress`: the panel paints the step
-      // list and posts the verdict back through `agent/plan_result`.
-      '--plan'
-      // Long-term memory is deliberately absent here: nobody has to answer it
-      // (it is a JSON file under the user's data dir), so the host turns it on
-      // by itself. `--memory-dir` / `--no-memory` exist for builds that need to
-      // move or drop it.
-    ],
-    cwd: getBundledLibDir(),
-    comfyuiDir
-  }
+  const { inputDir, outputDir } = resolveEngineStorageDirs(installation)
+  const args = [
+    '-X',
+    'utf8',
+    '-m',
+    'comfy_studio',
+    '--comfyui-dir',
+    comfyuiDir,
+    '--request-timeout',
+    String(STUDIO_REQUEST_TIMEOUT_MS / 1000),
+    // Canvas tools need somebody to answer `canvas_call` (see
+    // `comfyStudioCanvasRelay`); this shell is that somebody, so the extra
+    // tool table is asked for here and nowhere else.
+    '--canvas',
+    // `review__ask_user` needs somebody to paint the question and carry the
+    // answer back — the injected panel does both. Same deal: this shell asks
+    // for that tool table, no other caller does.
+    '--review',
+    // Same for `plan__submit` / `plan__progress`: the panel paints the step
+    // list and posts the verdict back through `agent/plan_result`.
+    '--plan'
+    // Long-term memory is deliberately absent here: nobody has to answer it
+    // (it is a JSON file under the user's data dir), so the host turns it on
+    // by itself. `--memory-dir` / `--no-memory` exist for builds that need to
+    // move or drop it.
+  ]
+  // Keep localfiles aligned with the engine's storage args (see
+  // `resolveEngineStorageDirs`); omitted exactly when the launch omits them, so
+  // both sides fall back to `<comfyui-dir>/{input,output}` together.
+  if (inputDir) args.push('--input-dir', inputDir)
+  if (outputDir) args.push('--output-dir', outputDir)
+  return { cmd, args, cwd: getBundledLibDir(), comfyuiDir }
 }
 
 export class ComfyStudioHost extends EventEmitter {

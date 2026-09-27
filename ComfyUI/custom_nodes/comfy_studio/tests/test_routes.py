@@ -199,7 +199,7 @@ class RouteContractTest(unittest.IsolatedAsyncioTestCase):
             status, body = await self.json_of("get", "/comfy-studio/agent/config")
         self.assertEqual(status, 200)
         self.assertEqual(body["model"], "qwen")
-        self.assertEqual(body["tool_count"], 9, "8 个通用工具 + 每 skill 一个")
+        self.assertEqual(body["tool_count"], 10, "9 个通用工具 + 每 skill 一个")
 
     async def test_agent_chat_validates_input_and_llm_config(self) -> None:
         for body in ({}, {"message": "   "}, {"message": 3}):

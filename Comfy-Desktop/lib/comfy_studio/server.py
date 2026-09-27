@@ -15,6 +15,8 @@
 ``agent/config``         模型是否配好（读环境变量，不回显密钥）
 ``agent/models``         面板下拉用：可选模型清单（问服务端 ``/models``）+ 当前模型
 ``agent/model``          ``{model?}`` → 读当前模型 / 切到指定模型（会话内当场生效）
+``agent/agents``         面板下拉用：可选智能体清单（内置 + 用户目录里的 md）+ 当前项
+``agent/agent``          ``{agent?}`` → 读当前智能体 / 切到指定智能体（所有会话下一轮生效）
 ``agent/chat``           ``{text, session_id?}`` → 最终回答；过程中推 ``agent/event`` 通知。
                          被 ``agent/cancel`` 叫停时回 ``cancelled: true``（不是错误）
 ``agent/cancel``         ``{session_id?}`` → 让正在跑的那一轮尽快停下（幂等）
@@ -45,8 +47,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .agent import (
+    AGENTS_SUBDIR,
     DEFAULT_SYSTEM_PROMPT,
+    GENERAL_AGENT_ID,
+    AgentCatalog,
+    AgentCatalogError,
     AgentError,
+    AgentProfile,
     AgentSession,
     ChatMessage,
     LLMConfig,
@@ -102,6 +109,21 @@ def _text(params: dict[str, Any], key: str) -> str:
     return value
 
 
+def _agent_json(profile: AgentProfile) -> dict[str, Any]:
+    """智能体清单里给面板看的那几个字段。
+
+    不发 ``prompt``：那是拼进系统提示词的人设正文，面板不显示它，每次刷新下拉都把它搬
+    一遍只是白费带宽（用户自己写的那种可能很长）。
+    """
+    return {
+        "id": profile.id,
+        "name": profile.name,
+        "summary": profile.summary,
+        "builtin": profile.builtin,
+        "file": profile.file,
+    }
+
+
 class StudioHost:
     """把 hub / skill 目录 / agent 会话收在一个对象里，并注册到 RPC server 上。"""
 
@@ -118,6 +140,7 @@ class StudioHost:
         local_files: LocalFilesClient | None = None,
         memory: MemoryClient | None = None,
         history: SessionHistoryStore | None = None,
+        agents: AgentCatalog | None = None,
     ) -> None:
         self.hub = hub
         self.catalog = catalog
@@ -138,8 +161,12 @@ class StudioHost:
         #: 对话存档（默认就有，`--no-history` 关掉）；None 时会话只活在内存里：宿主一退、
         #: 面板一重载，整段对话就没了。
         self.history = history
+        #: 智能体目录：内置那几项 + 用户目录里的 md（没配目录就只有内置那几项）。
+        self.agents = agents if agents is not None else AgentCatalog()
         #: 面板里切过的模型；None = 用环境变量里那个（进程内有效，不落盘）。
         self.default_model: str | None = None
+        #: 面板里切过的智能体；None = 用内置的通用助手（同样只在进程内有效）。
+        self.default_agent: str | None = None
         #: 活着的会话。顺序就是"最近用过"的顺序（用得越晚排得越靠后，见 :meth:`_session`），
         #: 到上限时淘汰队首那个 —— 所以这里得是 OrderedDict，普通 dict 改键不会挪位置。
         self._sessions: OrderedDict[str, AgentSession] = OrderedDict()
@@ -161,6 +188,8 @@ class StudioHost:
         self.server.on("agent/config", self.agent_config)
         self.server.on("agent/models", self.agent_models)
         self.server.on("agent/model", self.agent_model)
+        self.server.on("agent/agents", self.agent_agents)
+        self.server.on("agent/agent", self.agent_agent)
         self.server.on("agent/chat", self.agent_chat)
         self.server.on("agent/cancel", self.agent_cancel)
         self.server.on("agent/canvas_result", self.agent_canvas_result)
@@ -176,6 +205,7 @@ class StudioHost:
     def info(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
         _object(params, "host/info")
         memory_entries, memory_error = self._memory_status()
+        agent_id, agent_name, agent_error = self._agent_status()
         return {
             "name": SERVER_NAME,
             "version": SERVER_VERSION,
@@ -186,11 +216,27 @@ class StudioHost:
             "sessions": sorted(self._sessions),
             "skills_cached": len(self.catalog.entries),
             "default_model": self.default_model,
+            # 当前生效的智能体：id + 名字 + 它自己的毛病（选中的文件被删掉/改坏时会说话）。
+            # 目录整体读不了另走 agents_error —— 那时清单里只剩内置那几项。
+            "agent": agent_id,
+            "agent_name": agent_name,
+            "agent_error": agent_error,
+            "agents_dir": str(self.agents.directory) if self.agents.directory else None,
+            "agents_error": self.agents.scan().error,
             "busy": sorted(self._turns),
             "canvas": self.canvas is not None,
             "review": self.review is not None,
             "plan": self.plan is not None,
             "local_files": self.local_files is not None,
+            # 宿主认的素材/产出目录：引擎的 --input-directory / --output-directory 由桌面壳决定
+            # （共享存储下是 Shared/input、Shared/output），这里如实报出来，好让"指偏了"一眼可见
+            # —— 这一对目录对不上时，import_file 拷进去的素材引擎看不见、list_files 报的路径也是错的。
+            "input_dir": str(self.local_files.files.input_dir)
+            if self.local_files is not None
+            else None,
+            "output_dir": str(self.local_files.files.output_dir)
+            if self.local_files is not None
+            else None,
             "memory": self.memory is not None,
             "memory_file": str(self.memory.store.path) if self.memory is not None else None,
             "memory_entries": memory_entries,
@@ -304,6 +350,68 @@ class StudioHost:
             await session.use_model(name)
             applied.append(session_id)
         return {"model": name, "changed": True, "applied": sorted(applied), "skipped": sorted(skipped)}
+
+    async def agent_agents(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
+        """面板下拉用：可选智能体清单 + 当前项。
+
+        清单每次现扫用户目录（往里丢一份 md 不用重启宿主）。``current`` 是**实际生效**的
+        id；用户把自己加的那份删了、改名了或改坏了，``missing`` 写明原因，``problems`` 逐份
+        报出读不了的文件 —— 面板照实画，不无声无息地少几项。
+
+        目录整体读不了也不抛错：只回内置那几项 + ``error``，理由与 :meth:`agent_models`
+        一样 —— 下拉要是因此空掉，用户连正在用的那个都看不见了。
+        """
+        _object(params, "agent/agents")
+        listing = self.agents.scan()
+        current = self._selected_agent_id()
+        missing = None
+        if not any(profile.id == current for profile in listing.profiles):
+            missing = (
+                f"选中的智能体 {current!r} 不在了（文件被删掉或改名了？）；"
+                "换一个，或把文件放回原地"
+            )
+        return {
+            "current": current,
+            "missing": missing,
+            "agents": [_agent_json(profile) for profile in listing.profiles],
+            "problems": [
+                {"file": problem.file, "error": problem.error} for problem in listing.problems
+            ],
+            "error": listing.error,
+            "dir": str(self.agents.directory) if self.agents.directory else None,
+        }
+
+    async def agent_agent(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
+        """不带 ``agent`` 是读，带上就是切。
+
+        与 :meth:`agent_model` 有两点不同，都是有意的：
+
+        * 切换**不跳过任何会话**，所以没有 ``skipped``。模型切换要给每个空闲会话换掉 HTTP
+          客户端，跟正在飞的那一轮打架；智能体换的只是提示词里的角色段，而人设本来就是
+          **每轮重算**的（见 :meth:`_prompt_source`）—— 正在跑的那一轮开头已经把提示词算好
+          了，不受影响，下一轮自然用新的。
+        * 切之前先**验明这个 id 在不在清单里**。模型名可以随便写（合不合法服务端说了算），
+          智能体 id 就是我们自己那份目录，写错只会在聊天时才炸，不如当场拒绝。
+        """
+        args = _object(params, "agent/agent")
+        requested = args.get("agent")
+        if requested is None:
+            agent_id, agent_name, agent_error = self._agent_status()
+            return {
+                "agent": agent_id,
+                "changed": False,
+                "name": agent_name,
+                "error": agent_error,
+            }
+        if not isinstance(requested, str) or requested.strip() == "":
+            raise RpcError(INVALID_PARAMS, "agent 必须是非空字符串")
+        wanted = requested.strip()
+        try:
+            profile = self.agents.get(wanted)
+        except AgentCatalogError as err:
+            raise RpcError(INVALID_PARAMS, str(err)) from err
+        self.default_agent = wanted
+        return {"agent": profile.id, "changed": True, "name": profile.name, "error": None}
 
     async def agent_chat(self, params: Any, ctx: RpcContext) -> dict[str, Any]:
         args = _object(params, "agent/chat")
@@ -669,17 +777,54 @@ class StudioHost:
         except HistoryError as err:
             raise RpcError(INTERNAL_ERROR, str(err)) from err
 
-    def _prompt_source(self) -> str | Callable[[], str]:
-        """会话的人设来源。
+    def _selected_agent_id(self) -> str:
+        """当前生效的智能体 id。没切过就是内置的通用助手。"""
+        return self.default_agent or GENERAL_AGENT_ID
 
-        挂了记忆时给一个**每次重算**的零参函数（:meth:`AgentSession.ask` 每轮都会叫它）：
-        这一轮刚记下的偏好，下一轮就得出现在提示词里，否则模型得自己想起来去 recall。
-        没挂记忆时就是一份固定人设，行为与从前完全一样。
+    def _agent_status(self) -> tuple[str, str | None, str | None]:
+        """(当前智能体 id, 显示名, 毛病)，供 ``host/info`` 与 ``agent/agent`` 如实报出。
+
+        选中的那一项不在清单里（文件被删、改名或改坏了），名字给 None、毛病写清原因 ——
+        这一档下每问一句都会报错（见 :meth:`_agent_section`），别让界面停在旧名字上装作没事。
         """
-        if self.memory is None:
-            return DEFAULT_SYSTEM_PROMPT
-        store = self.memory.store
-        return lambda: compose_system_prompt(store.digest())
+        agent_id = self._selected_agent_id()
+        try:
+            return agent_id, self.agents.get(agent_id).name, None
+        except AgentCatalogError as err:
+            return agent_id, None, str(err)
+
+    def _agent_section(self) -> str:
+        """选中智能体的角色段。读不了就**当场报错**，不悄悄退回通用助手。
+
+        退回看着"更结实"，其实是把用户自己写的人设吞掉：他会以为那份文件生效了，直到某天
+        发现助手答得不对劲才回头查。处置口径与记忆文件坏掉时一致（见 :mod:`comfy_studio.memory`）
+        —— 说清是哪一份、怎么修：改好它、删掉它，或者在面板上换一个智能体。
+        """
+        agent_id = self._selected_agent_id()
+        try:
+            return self.agents.get(agent_id).prompt
+        except AgentCatalogError as err:
+            raise AgentError(f"选中的智能体 {agent_id!r} 用不了：{err}") from err
+
+    def _prompt_source(self) -> Callable[[], str]:
+        """会话的人设来源：一个**每次重算**的零参函数（:meth:`AgentSession.ask` 每轮都会叫它）。
+
+        提示词 = 底座规则 + 选中智能体的角色段 + 收尾要求（``compose_system_prompt``），
+        挂了记忆时再插一段"你记得什么"。所以这里有两件事值得每轮重算：用户可能刚换了个
+        智能体，也可能刚被记下一件新事，两个都得在下一轮就看见。
+
+        用的是通用助手（角色段是空串）、又没挂记忆时，拼出来就是 ``DEFAULT_SYSTEM_PROMPT``
+        一个字不差 —— ``compose_system_prompt("")`` 会把空段丢掉，默认行为与从前完全一样。
+        """
+        store = self.memory.store if self.memory is not None else None
+
+        def current() -> str:
+            sections = [self._agent_section()]
+            if store is not None:
+                sections.append(store.digest())
+            return compose_system_prompt(*sections)
+
+        return current
 
     async def _make_room(self) -> None:
         """会话位满了，腾一个出来：淘汰**最久没用过**的那个。
@@ -780,6 +925,7 @@ async def serve_stdio(
     output_dir: str | None = None,
     memory: bool = True,
     memory_dir: str | None = None,
+    agents_dir: str | None = None,
     history: bool = True,
 ) -> None:
     """拉起全部 MCP server，然后在 stdin/stdout 上服务到 EOF。
@@ -799,6 +945,9 @@ async def serve_stdio(
     下（``memory_dir`` 一并管着这两个落点 —— 它们是同一份"工作台在你用户目录里的数据"）：
     有了它，宿主重启 / 面板重载之后 ``agent/history`` 还能把上次的对话拉回来，接着聊。
     ``history=False`` 就退回内存里的会话，一退就没。它不影响工具表，只影响记忆。
+    智能体清单（:mod:`comfy_studio.agent.catalog`）也用这份数据目录：内置那几项写死在代码里，
+    用户自己写的 md 放 ``agents/`` 下（``agents_dir`` 换地方）。它只决定人设里的**角色段**，
+    既不进工具表也不需要谁接话，所以没有开关 —— 面板上永远有的选。
     """
     canvas_channel = CanvasChannel() if canvas else None
     review_channel = ReviewChannel() if review else None
@@ -815,6 +964,8 @@ async def serve_stdio(
     # 记忆是平铺的 memory.json，对话按会话分文件放在 sessions/ 下。
     data_root = memory_home() if memory_dir is None else Path(memory_dir).expanduser()
     history_store = SessionHistoryStore(data_root / SESSION_SUBDIR) if history else None
+    # 智能体清单也落在这份数据目录里：内置那几项 + agents/ 下用户自己写的 md。
+    agent_catalog = AgentCatalog(data_root / AGENTS_SUBDIR if agents_dir is None else agents_dir)
     extra: list[Any] = []
     if canvas_channel is not None:
         extra.append(CanvasClient(canvas_channel))
@@ -841,6 +992,7 @@ async def serve_stdio(
             local_files=local_files,
             memory=memory_client,
             history=history_store,
+            agents=agent_catalog,
         )
         # stdin 一关（面板退出）就先叫停在飞的轮次，别让退出卡在长任务上。
         host.server.on_close = lambda: host.cancel_turns("宿主退出")

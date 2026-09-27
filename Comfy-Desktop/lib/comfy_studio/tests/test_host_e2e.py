@@ -48,11 +48,21 @@ def _last_user_text(messages: list[dict]) -> str:
     return ""
 
 
+def _system_text(messages: list[dict]) -> str:
+    """取这次请求的 system 提示词（换智能体之后要能从它身上看出来）。"""
+    for item in messages:
+        if item.get("role") == "system":
+            return str(item.get("content") or "")
+    return ""
+
+
 class _FakeCompletions(BaseHTTPRequestHandler):
     """假 chat completions 服务：先要工具、再给结论；顺带提供 ``GET /models``。"""
 
     #: 每次 chat completions 请求体里的 model（验证切换真的落到了请求上）。
     seen_models: list[str] = []
+    #: 每次请求里的 system 提示词（验证换智能体真的落到了人设上）。
+    seen_systems: list[str] = []
     lock = threading.Lock()
 
     #: 用户话里带这个标记就让这次回答慢慢来：取消用例需要一个**真的在飞**的轮次。
@@ -104,10 +114,10 @@ class _FakeCompletions(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler 的接口
         length = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(length) or b"{}")
+        messages = body.get("messages") or []
         with self.lock:
             self.seen_models.append(str(body.get("model")))
-
-        messages = body.get("messages") or []
+            self.seen_systems.append(_system_text(messages))
         if self.SLOW_MARKER in _last_user_text(messages):
             # 慢回答期间不调工具：整轮就卡在这次模型请求上，取消才有东西可取消。
             time.sleep(self.SLOW_SECONDS)
@@ -490,6 +500,11 @@ class StudioHostE2ETest(unittest.TestCase):
         self.assertIs(info.get("plan"), True)
         # 本机文件那几张不用谁接话，只要 --comfyui-dir 给了就挂上。
         self.assertIs(info.get("local_files"), True)
+        # 宿主认的素材/产出目录要跟引擎那次启动的参数对得上（这里就是启动时给的临时目录）：
+        # 共享存储下引擎拿到的是 Shared/input、Shared/output，宿主不能自己按
+        # <comfyui-dir>/input 猜 —— 猜错的话接进去的素材引擎读不到。
+        self.assertEqual(info.get("input_dir"), str(self.input_dir.resolve()))
+        self.assertEqual(info.get("output_dir"), str(self.output_dir.resolve()))
         # 对话存档默认开着，且跟记忆落在同一个（这里是临时）数据目录下。
         self.assertIs(info.get("history"), True)
         self.assertEqual(info.get("history_dir"), str(self.memory_dir / SESSION_SUBDIR))
@@ -925,6 +940,56 @@ class StudioHostE2ETest(unittest.TestCase):
             for row in self.call(48, "agent/sessions").get("result", {}).get("sessions", [])
         }
         self.assertIs(rows[session].get("live"), True, "说话之后它又该活着")
+
+    def test_23_agents_can_be_listed_and_switched(self) -> None:
+        """面板那个下拉：``agent/agents`` 给清单，``agent/agent`` 换人。
+
+        换的是**人设里的角色段** —— 工具表没动、历史也没动，所以要验两件事：清单长得对，
+        以及下一轮请求的 system 里真的带上了这个角色的活儿。
+        """
+        listing = self.call(200, "agent/agents").get("result", {})
+        self.assertEqual(listing.get("current"), "general", listing)
+        self.assertIsNone(listing.get("missing"))
+        self.assertTrue(listing.get("dir"), "得告诉用户文件往哪放")
+        agents = {agent["id"]: agent for agent in listing.get("agents", [])}
+        self.assertIn("general", agents)
+        self.assertIn("storyboard", agents)
+        self.assertEqual(agents["storyboard"]["name"], "分镜导演助手")
+        self.assertIs(agents["storyboard"]["builtin"], True)
+        # 人设正文（prompt）不往面板搬：清单只说有哪些、叫什么。
+        self.assertTrue(all("prompt" not in agent for agent in agents.values()))
+
+        switched = self.call(201, "agent/agent", {"agent": "storyboard"}).get("result", {})
+        self.assertIs(switched.get("changed"), True, switched)
+        self.assertEqual(switched.get("name"), "分镜导演助手")
+        read = self.call(202, "agent/agent").get("result", {})
+        self.assertEqual(read.get("agent"), "storyboard")
+        self.assertIs(read.get("changed"), False)
+
+        # 真的落到了人设上：下一轮请求的 system 里带着这个角色的活儿。
+        with _FakeCompletions.lock:
+            _FakeCompletions.seen_systems.clear()
+        self.call(
+            203,
+            "agent/chat",
+            {"text": "把这段拆成分镜", "session_id": "agents-e2e"},
+            timeout=SKILLS_TIMEOUT,
+        )
+        with _FakeCompletions.lock:
+            systems = list(_FakeCompletions.seen_systems)
+        self.assertTrue(systems, "没收到任何 chat completions 请求")
+        self.assertIn("分镜导演", systems[0])
+
+        # 切回通用助手，别让后面的用例踩着一份角色设定跑。
+        back = self.call(204, "agent/agent", {"agent": "general"}).get("result", {})
+        self.assertIs(back.get("changed"), True, back)
+
+    def test_24_bad_agent_name_is_minus_32602(self) -> None:
+        for bad in ("no-such", "", "   ", 7, ["a"]):
+            response = self.call(210, "agent/agent", {"agent": bad})
+            self.assertEqual(response.get("error", {}).get("code"), -32602, response)
+        # 被拒的值不该改掉当前选择
+        self.assertEqual(self.call(211, "agent/agent").get("result", {}).get("agent"), "general")
 
 
 if __name__ == "__main__":

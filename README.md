@@ -12,44 +12,56 @@
 挪走（本机那份在 `.cache/upstream-git/<检出名>.git`，要恢复成独立检出就搬回去）。
 装自己人代码用的都是它们各自的**标准扩展位**
 （ComfyUI 认 `custom_nodes/`，桌面壳的 `lib/` 是它既有的 Python 脚本目录，会被打进 `extraResources`）。
-除此之外的打通胶水收在 `setup/` 里。
+除此之外的打通胶水（建环境 / 注册安装 / 单独起引擎 / 体检）也各自收在两侧自己代码的地盘里，
+**规则是脚本跟着它作用的那个进程走**：只碰引擎的（建 venv、单独起引擎、单独起引擎侧 MCP）住引擎包
+`custom_nodes/comfy_studio/tools/`；宿主与跨两侧的（注册安装、起宿主、清壳缓存、体检）住桌面壳自己的
+脚本区 `Comfy-Desktop/scripts/comfy-studio/` —— 注意不是 `lib/comfy_studio/`：上游 eslint 只给
+`./scripts/**` 的 js/mjs/cjs 配了 node 全局，`.mjs` 塞进 `lib/` 会被判成一片 `no-undef`。
+根上只剩一份 `package.json` 当入口清单（`npm run doctor` 之类），脚本本体一行都不在根目录。
 
-**自己人代码的源全部住在 `studio/`**（父仓库跟踪），由 `npm run attach` 装进上面那些扩展位：
+**自己人代码只有一份，就住在上面那两个扩展位里 —— 检出里的那份就是唯一事实源。**
+（早先还有一层 `studio/overlay/` 副本加 `npm run attach` 单向同步，2026-09-27 撤掉了：副本就是
+分叉源 —— 改了源忘了同步、或在下游就地改，两边会悄悄不一致。要翻那层旧账看 git 历史里的 `studio/`。）
 
-* `studio/overlay/ComfyUI/`、`studio/overlay/Comfy-Desktop/` —— 按检出名分两侧，树形与落点一一对应。
-* `studio/patches/Comfy-Desktop/0001-comfy-studio-wiring.patch` —— 对上游既有文件的接线改动
-  （桌面侧 5 个文件、121 行）。用补丁而不是覆盖整份文件：上游更新同一文件时 `git apply --check`
-  会当场失败并报错，而不是静默把上游的改动顶掉。
-* `studio/upstream.json` —— 入库内容对应的上游 commit / 分支 / 版本。已入库形态下没有检出 HEAD 可对，
-  上游有没有动过就看父仓的 `git diff`；若把 `.cache/upstream-git/<检出名>.git` 搬回去恢复成独立检出，
-  `attach` / `doctor` 会改用检出 HEAD 核对，漂移就拒绝执行，要显式跑 `npm run attach -- --rebaseline`
-  才重新对齐。
+每侧自己带一份**上游自述**，跟代码同处一地，人读的和脚本读的是同一份文件：
 
-自己人代码有两重身份：检出里的那份是「跑起来的样子」（父仓库跟踪），`studio/` 里的是它的源。
-改代码请改 `studio/`，再跑 `npm run attach` 同步（幂等）；直接在检出里改，`attach` 与 `npm run doctor`
-会把「被就地改过」显式报出来，不会静默覆盖。确认无误后把 `studio/` 与检出一起提交。
+* `ComfyUI/custom_nodes/comfy_studio/upstream-baseline.json`
+* `Comfy-Desktop/lib/comfy_studio/upstream-baseline.json`
+
+字段：`checkout` / `repo` / `version` / `branch` / `commit` / `subject` / `placement`，桌面侧多一个
+`patch`。`npm run seed` 靠引擎那份认出「这是哪份上游」（`ComfyUI/` 整份收在父仓里、自己没有 `.git`，
+身份只能从自述读）；`npm run doctor` 靠它核对落点文件是否都已入库、接线补丁还在不在。
+**上游升级后就改这两个文件里的基线。**
+
+对上游既有文件的接线改动只有一处，是**补丁**而不是整份覆盖：
+
+* `Comfy-Desktop/lib/comfy_studio/upstream-wiring.patch` —— 桌面侧 5 个文件、121 行
+  （`packages/comfyui-desktop-bridge-types/comfyDesktopBridge.d.ts`、`src/main/host/attach.ts`、
+  `src/main/lib/ipc/index.ts`、`src/preload/comfyPreload.ts`、`src/types/comfyDesktopBridge.ts`）。
+  父仓里那 5 个文件是**已打上**的样子，补丁本身是"上游升级时怎么重放"的唯一依据：整份覆盖会在
+  上游更新同一文件时静默把上游的改动顶掉，补丁在 `git apply --check` 阶段就失败、失败即报错。
+
+改代码就直接改扩展位里那份（父仓跟踪，`git diff` 看得见），不经过任何中间层。
 
 提交时留意检出里那些「藏着的」文件：引擎侧 `custom_nodes/` 被上游自己的 `.gitignore` 忽略，
-当初就是靠 `git add -f` 逐个加进父仓的 —— 也正因为上游默认忽略它，重建这棵树时最容易漏掉。
+当初就是靠 `git add -f` 逐个加进父仓的 —— 也正因为上游默认忽略它，`git status` 连新增文件都不显示，
+最容易漏掉。`npm run doctor` 会机械核对这一条。
 
 ## 快速开始
 
 ```powershell
 npm run setup          # 给 ComfyUI 建 .venv 并装依赖（GPU 版 torch）
 npm run setup:desktop  # 装 Comfy-Desktop 的 Electron 依赖
-npm run attach         # 校对自己人代码在检出里就位（幂等；改了 studio/ 之后跑它同步）
 npm run seed           # 把本仓 ComfyUI 注册成桌面的一个已有安装
 npm run dev            # 起桌面壳
 ```
 
-一条龙：`npm run setup:all && npm run attach && npm run dev`。
+一条龙：`npm run setup:all && npm run dev`。
 
 验证与排查：
 
 ```powershell
-npm run doctor         # 四段式体检：覆盖层 / 引擎 / 桌面壳 / 接线，逐项通过或给出下一步命令
-npm run attach -- --check   # 只看覆盖层现在是什么状态、会装什么，不动盘
-npm run detach         # 只对独立检出有效：把覆盖层与补丁撤出去（已入库形态会拒绝并给出替代命令）
+npm run doctor         # 四段式体检：自己人代码入库 / 引擎 / 桌面壳 / 接线，逐项通过或给出下一步命令
 npm run engine         # 不经桌面壳单独起引擎（默认 127.0.0.1:8188）
 npm run mcp            # 单独起引擎侧 MCP server（stdio），喂给外部 agent 客户端
 npm run studio         # 单独起桌面侧 comfy-studio 宿主（MCP 客户端 + skill 目录 + 对话 agent）
@@ -65,9 +77,12 @@ agent / skill / mcp 三件能力**前后端各有一份**，按各自项目里�
   （`params.py`）+ 执行器（`runner.py`：注入参数 → 入队 → 等完成 → 收图片）。
   目录视图是可热重载的 `SkillRegistry`（内置目录 + 用户目录），所以对话里刚用
   `comfy_save_skill` 沉淀下来的 skill **同一个进程里立刻能跑**，不用重启。
-* `mcp/` —— 把引擎能力开成 MCP server：8 个通用工具（模型列表 / 提交工作流 / 队列 /
-  历史 / 中断 / 列 skill / 跑 skill / 存 skill）外加每个 skill 一把 `skill__<id>`。
-  入口 `python -m comfy_studio.mcp`，cwd 必须是 `custom_nodes/`。
+* `mcp/` —— 把引擎能力开成 MCP server：9 个通用工具（模型类别 / 模型列表 / 提交工作流 /
+  队列 / 历史 / 中断 / 列 skill / 跑 skill / 存 skill）外加每个 skill 一把 `skill__<id>`。
+  模型那两把分工：`comfy_list_model_folders` 报本机注册了哪些类别（由引擎的
+  `folder_paths` 决定 —— 除自带那些，第三方节点自己注册的目录也在内，所以不写死清单），
+  `comfy_list_models` 拿类别名取具体文件。入口 `python -m comfy_studio.mcp`，
+  cwd 必须是 `custom_nodes/`。
 * `agent/` —— 对话式 agent 循环（OpenAI 兼容 tool calling），工具直接走进程内的引擎原语。
 * `routes.py` —— 挂在 `/comfy-studio/*` 上的 HTTP 接口（skills / models / queue / interrupt /
   agent chat），供画布前端调用。
@@ -78,7 +93,8 @@ agent / skill / mcp 三件能力**前后端各有一份**，按各自项目里�
   顺带支持用户自己配的 server（环境变量 `COMFY_STUDIO_MCP_SERVERS`，JSON 数组）。
 * `skills/` —— 走 MCP 读引擎的 skill 目录，变成面板能渲染的列表；不自己跑工作流。
 * `agent/` —— 同一套对话循环，但工具来自 MCP 工具表，所以「宿主能连到的能力」与
-  「对话能用的能力」永远一致。
+  「对话能用的能力」永远一致。`catalog.py` 是面板那个智能体下拉的清单（内置角色 + 用户放在
+  数据目录 `agents/` 里的 `*.md`，见下面的「智能体那一栏」）。
 * `server.py` / `rpc.py` / `__main__.py` —— 桌面壳拉起的进程接口：行分隔 JSON-RPC 2.0 over
   stdio（`stdout` 只跑协议，诊断走 `stderr`），`agent/chat` 过程中会推 `agent/event` 通知，
   让面板能边跑边画工具调用。
@@ -104,8 +120,12 @@ agent / skill / mcp 三件能力**前后端各有一份**，按各自项目里�
   ComfyUI 的 `input/`（返回能填进 `LoadImage.image` 那类字段的相对名 —— 加载类节点认不了
   磁盘绝对路径）、`localfiles__list_files` 报产出的**真实路径**（引擎的 history 只有
   filename）、`localfiles__read_text` 读本机文本。它不推事件、不等谁回话，只要
-  `--comfyui-dir` 给了就挂上；换过引擎的 `--input-directory` / `--output-directory` 时
-  用 `--input-dir` / `--output-dir`（或 `COMFY_INPUT_DIR` / `COMFY_OUTPUT_DIR`）跟着指。
+  `--comfyui-dir` 给了就挂上。这两个目录**由桌面壳按引擎自己的启动参数接上**
+  （`comfyStudioHost.ts` 的 `resolveEngineStorageDirs`，规则与 `launch.ts` 的存储分支同源）：
+  共享存储下引擎的 `--input-directory` 是 `Shared/input`，宿主要是自己按
+  `<comfyui-dir>/input` 猜，接进去的素材引擎看不见、报出来的产出路径也不对。单独拿
+  `run-mcp.mjs` 喂别的 MCP 客户端时才需要手动给 `--input-dir` / `--output-dir`
+  （或 `COMFY_INPUT_DIR` / `COMFY_OUTPUT_DIR`）。
 * `memory.py` —— 跨会话的长期记忆：对话正文会存盘（见下面的 `history.py`），但"我喜欢方形
   构图"、"这台是 24G 的 4090"这类**事实**不该指望别人去翻上一段对话，它们得是随叫随到的。
   这里用三张工具把它记下来：
@@ -128,8 +148,11 @@ agent / skill / mcp 三件能力**前后端各有一份**，按各自项目里�
   助手话 / 工具调用与结果，**人设（system）不存** —— 它每轮重算（记忆、在挂的通道都会变），
   存下来就是一份过期人设。写盘是原子的（临时文件 + `os.replace`），文件名取 session_id 的
   sha1 前 16 位（外面给的 id 拼不出 `../`）；读回来时只留**整轮**（第一条必须是用户话，不会
-  出现"结果还在、调用被裁掉"）、超长内容截断并写明截了多少、工具调用与结果必须成对 ——
-  对不上就整份拒绝并如实报错（假装"还没聊过"会让用户以为对话被吞了）。`agent/reset` 连存档
+  出现"结果还在、调用被裁掉"）、超长内容截断并写明截了多少、工具调用与结果必须成对 —— 一轮
+  里连着调好几次工具就一组一组地看（第二组来了第一组还欠着结果、末尾挂着没结果的调用，都算
+  不成对）、对不上就整份拒绝并如实报错（假装"还没聊过"会让用户以为对话被吞了）；写盘前也走
+  同一套检查，不成对的历史干脆不落盘（写下去等于亲手造一份下次打不开的存档，连更早那几个好
+  轮次一起赔进去；这一轮少存一截只是历史缺了尾巴，答案早就交给用户了）。`agent/reset` 连存档
   一起删（只清内存的话，下次重启会被原样复活；有一轮在跑时先拒绝，否则那一轮收尾会把刚删掉的
   存档原样写回来），`--no-history` 整个关掉，`host/info` 里报出 `history` 与 `history_dir`。
   存档目录本身就是那份"你有几段对话"的清单：`agent/sessions` 把**活着的会话**与**存档里的会话**
@@ -152,11 +175,30 @@ agent / skill / mcp 三件能力**前后端各有一份**，按各自项目里�
   已经建好的会话也当场换成新客户端（历史保留），但正忙的会话会跳过并在 `skipped` 里报出来
   ——那会儿换客户端会把在飞的一轮打断。重启宿主就回到环境变量里的那个模型。
 
+智能体那一栏换的是**角色段**，跟换模型是两件事（谁在答 / 用哪个模型答）：底座规则
+（`agent/loop.py` 的 `BASE_SYSTEM_PROMPT`）不动，`agent/catalog.py` 的 `AgentCatalog` 给清单：
+
+* `agent/agents` —— **内置**（`BUILTIN_PROFILES`：通用助手、分镜导演、短剧编剧、服化道、资产库、
+  声音设计、歌词创作）+ 用户自己放在工作台数据目录 `agents/`（`--agents-dir` 或
+  `COMFY_STUDIO_AGENTS_DIR`）里的 `*.md`。一份文件一个智能体，形状是 `# 名字` + 紧随其后
+  的 `> 一句说明` + 人设正文（文件名去掉 `.md` 就是 id，正文原样拼进系统提示词）。内置那几项
+  写的是**提要** —— 负责哪类活、产出是什么形态，具体风格/数量/平台交给用户当场定，不写死。
+  目录**每次现扫**，往里丢一份 md 不用重启宿主；单个文件读不了不会拖垮整份清单，它作为一条
+  带 `error` 的 `problems` 报出来（面板画成一条不可选的灰选项，免得用户以为自己那份文件没生效
+  而反复改它），目录整体读不了就只回内置那几项 + `error`。
+* `agent/agent` —— 不带 `agent` 是读，带上就是切。切之前先**验这个 id 在不在清单里**：不在就
+  当场回 -32602（模型名可以随便写、合不合法服务端说了算；智能体 id 就是我们自己那份目录，
+  写错只会在聊天时才炸）。切换**不跳过任何会话**，所以没有 `skipped` —— 人设是每轮重算的，
+  正在飞的那一轮开头已经把提示词算好了，下一轮自然用新的。
+* 换智能体**不动工具表、也不动对话历史**（历史里从来不含 system）：它换的是"这次是谁在干活"，
+  不是"它能干什么"。重启宿主回到 `general`（一个字的角色段都不插）。
+
 桌面壳里的入口：画布侧栏多一个 comfy-studio 按钮，点开是对话抽屉
 （`Comfy-Desktop/src/main/lib/comfyStudioChatContentScript.ts`），
 它经 preload 桥 `window.__comfyDesktop2.ComfyStudio` 走 IPC 找主进程，
-主进程再按需 spawn 上面的宿主进程。抽屉顶部就是上面那个模型下拉，
-一轮在跑时它是禁用的；旁边那个「停止」按钮走 `agent/cancel`——宿主立刻不再等模型与引擎，
+主进程再按需 spawn 上面的宿主进程。抽屉顶部两个下拉：上面一行是模型，紧挨着的
+一行是智能体；一轮在跑时两个都禁用（换哪个都会把在飞的一轮搅乱）；
+旁边那个「停止」按钮走 `agent/cancel`——宿主立刻不再等模型与引擎，
 这一轮回的是**正常结果**（`cancelled: true`）而不是错误，面板把它画成"已停止"，
 历史配对完整，接着聊下一句就行。
 
@@ -171,6 +213,9 @@ agent / skill / mcp 三件能力**前后端各有一份**，按各自项目里�
 只在存档里的标「（存档里）」，正在跑的标「（在跑）」；读不了的存档列成一行不可选的
 「读不了：<文件名>」（悬停给出原因），用户得先修或删它。切换会按那一段的存档重画（标题换成
 「这一段对话」，空的那段写一句"这一段还没说过话"——用户刚点过来，得知道自己站在哪一段上）；
+重画是异步的，手快点两下时前一段的历史可能后回来，所以每次清空都翻新一张"票"，回来对不上票
+就一句都不画 —— 否则两段话会混在一屏上而下拉说的是另一段；清单读失败（宿主抖一下、或它刚
+重启）时**保留上一份**、只在悬停里说明这次没读到，把下拉清空看着就是"别的对话都没了"；
 「＋」用时间戳生成一个新 id 并清空抽屉（新的一段在说出第一句话之前宿主里根本没有它，也不占位子）；
 「关掉」走 `agent/close`（腾位子，对话留在存档里，下次选它就能接着说），关掉之后面板接着开一段
 新的 —— 关掉的意思是"这一段我聊完了"，不是"我要看着它空着"。`--no-history` 那一档没有存档兜底，
@@ -224,11 +269,17 @@ agent / skill / mcp 三件能力**前后端各有一份**，按各自项目里�
 
 除了上面新增的扩展位，胶水本身靠的是 Comfy-Desktop 自己就支持「接管一份已有的引擎检出 + 目录里的 venv」这个能力：
 
-1. **引擎侧**：`setup/install-engine.ps1` 在 `ComfyUI/.venv` 建 Python 3.11 环境，装 CUDA 版 torch（本机有 N 卡时；否则回退 CPU 轮子）和上游 `requirements.txt` 的其余依赖。
-2. **接线侧**：`setup/seed-desktop.mjs` 往 Comfy-Desktop 的安装清单
-   （Windows：`%APPDATA%\comfyui-desktop-2\installations.json`）写一条 `sourceId: "git"` 的记录，指向本仓 `ComfyUI/` 与它的 `.venv`。
-   该来源插件的启动命令是 `<venvPath>/Scripts/python.exe -s main.py <launchArgs>`，cwd 取 `main.py`
-   所在目录 —— 这条路只用 `venvPath` 与 `main.py`，不读 `.git`，所以本仓这种已入库的检出照样能被拉起。
+1. **引擎侧**：`ComfyUI/custom_nodes/comfy_studio/tools/install-engine.ps1`（`npm run setup`）在 `ComfyUI/.venv` 建 Python 3.11 环境，装 CUDA 版 torch（本机有 N 卡时；否则回退 CPU 轮子）和上游 `requirements.txt` 的其余依赖。
+2. **接线侧**：`Comfy-Desktop/lib/comfy_studio/tools/seed-desktop.mjs`（`npm run seed`，`npm run dev` 会先跑它）往 Comfy-Desktop 的安装清单
+   （Windows：`%APPDATA%\comfyui-desktop-2\installations.json`）写一条 `sourceId: "git"` 的记录：
+   `installPath` 是**仓库根**，`venvPath` 指着 `ComfyUI/.venv` —— 壳认的布局是「安装根下套一个
+   `ComfyUI/` 子目录、venv 在 `ComfyUI/.venv`」，和上游 git 检出长得一样，于是本仓 `ComfyUI/` 与它的 `.venv` 都被认到。
+   起引擎那条路是 `<venvPath>/Scripts/python.exe -s main.py <launchArgs>`，cwd 取 `main.py`
+   所在目录 —— 只用 `venvPath` 与 `main.py`，不读 `.git`，所以本仓这种已入库的检出照样能被拉起。
+   注意 comfy-studio 宿主（`Comfy-Desktop/lib/comfy_studio`）不走这条路：它按 `<installPath>/ComfyUI/.venv`
+   派生 python（`Comfy-Desktop/src/main/lib/pythonEnv.ts` 的 `getVenvPythonPath`），不读 `venvPath`；
+   `installPath` 写偏一层时，引擎照起、面板却整片报「没有可用的 venv python」。`npm run doctor`
+   （脚本在 `Comfy-Desktop/lib/comfy_studio/tools/doctor.mjs`）的「接线」段会把这条路单独核一遍。
    上游源码里 `.git` 只被 `probeInstallation`（UI 里「添加已有安装」那条路）和详情页的 git 动作用到，
    我们直接写记录、不经过前者，代价是后者对本仓这个安装不可用。
    有了这条记录，首启的「用云端还是本地」向导也会被跳过（列表里已有非 cloud 安装）。
@@ -247,31 +298,45 @@ agent / skill / mcp 三件能力**前后端各有一份**，按各自项目里�
   它只影响「桌面内建 python 去 clone 新安装」那条路，跟我们这套「接管已有检出」无关，忽略即可。
 - **上游内容入库的代价**：`ComfyUI/` 与 `Comfy-Desktop/` 现在整份由父仓库跟踪（约 74 MB / 2200 个文件），
   clone 一次就自带、不依赖上游可达；代价是这两个检出不再是独立 git 检出 —— 不能在本仓里 `git pull`
-  上游，仓库历史里也没有上游的提交记录。要更新上游：另 clone 一份到临时目录，按需把内容搬进来，
-  改 `studio/upstream.json` 的基线，再跑 `npm run doctor` 核对补丁还合不合得上。
-- **`detach` 只对独立检出有效**：已入库形态下父仓里那份就是「装了覆盖层」的工作形态，撤出会把它删成
-  一片删改，所以脚本直接拒绝并给替代命令（要纯净上游就另 clone 到临时目录）。
+  上游，仓库历史里也没有上游的提交记录。
+- **上游升级的路径**（这两份检出没有 `.git`，不能就地 `git pull`）：另 clone 一份上游到临时目录，按需把
+  内容搬进来替换，改那一侧 `upstream-baseline.json` 的 `version` / `commit` / `branch` / `subject`，
+  再拿两条 `git apply` 试跑看补丁还合不合得上：
+
+  ```powershell
+  # 能退掉 = 补丁已经打上（应该这样）
+  git -C Comfy-Desktop apply --check --reverse Comfy-Desktop/lib/comfy_studio/upstream-wiring.patch
+  # 能打上 = 还没打（刚换过上游内容、还没重放补丁）
+  git -C Comfy-Desktop apply --check Comfy-Desktop/lib/comfy_studio/upstream-wiring.patch
+  ```
+
+  两条都失败 = 上游把那几个文件改过了：`git -C Comfy-Desktop diff -- <文件>` 看清哪几处是我们的，
+  人工并回那 5 个文件并更新补丁，最后跑 `npm run doctor`（它会把这个状态报成 `conflict`）。
+- **账本只有三个文件，全在自己人代码里**：两侧各自的 `upstream-baseline.json` 加桌面侧那份
+  `upstream-wiring.patch`。它们不参与运行，只在「换上游 + 重放补丁」这一刻兑现价值 ——
+  另开一层账本目录的代价，是多一份要跟着同步的东西。
 
 ## 目录
 
 ```
 comfy-studio/
-├─ studio/           # 自己人代码的源（父仓库跟踪，靠 npm run attach 装进检出）
-│  ├─ upstream.json                             # 入库内容对应的上游 commit / 分支 / 版本
-│  ├─ overlay/ComfyUI/custom_nodes/comfy_studio/  # 引擎侧：skills / mcp / agent + routes
-│  │  └─ tests/                                 # 引擎侧自检（skills / 工具表 / 组合 / 路由 / stdio 协议）
-│  ├─ overlay/Comfy-Desktop/lib/comfy_studio/     # 桌面侧：mcp（宿主）/ skills / agent + 宿主进程接口
-│  │  └─ tests/                                 # 宿主端到端测试（真进程 + 真 MCP 子进程）
-│  ├─ overlay/Comfy-Desktop/src/main/lib/       # 面板注入脚本 / 宿主拉起 / IPC 注册（新增的 TS）
-│  └─ patches/Comfy-Desktop/                    # 对上游既有文件的接线改动（补丁）
-├─ setup/            # 打通物料：attach / detach / 装环境 / 注册安装 / 体检 / 单独起引擎(engine) / mcp / studio
-│  └─ lib/overlay.mjs                           # 覆盖层装配与基线核对（attach / detach / doctor 共用）
-├─ ComfyUI/          # 上游引擎：工作树整份入库（自己人代码在 custom_nodes/comfy_studio/）
-├─ Comfy-Desktop/    # 上游桌面壳：工作树整份入库（自己人代码在 lib/comfy_studio/ 与 src/main/lib/）
-└─ .cache/           # 过滤清单、自检输出、安装日志、被顶掉/删除内容的备份，以及两份上游的 .git（父仓库忽略）
+├─ package.json      # 只有入口清单：npm run setup / setup:all / seed / dev / engine / mcp / studio / doctor
+├─ ComfyUI/          # 上游引擎：工作树整份入库
+│  └─ custom_nodes/comfy_studio/       # 引擎侧自己人代码：skills / mcp / agent + routes
+│     ├─ tools/                        # 只碰引擎的脚本：建 venv / 单独起引擎 / 单独起引擎侧 MCP
+│     ├─ upstream-baseline.json        # 这棵树上压的是哪份上游（seed / doctor 读它）
+│     └─ tests/                        # 引擎侧自检（skills / 工具表 / 组合 / 路由 / stdio 协议）
+├─ Comfy-Desktop/    # 上游桌面壳：工作树整份入库
+│  ├─ lib/comfy_studio/                # 桌面侧自己人代码：mcp（宿主）/ skills / agent / 通道 + 宿主进程接口
+│  │  ├─ upstream-baseline.json        # 这棵树上压的是哪份上游（placement 记着下面两处落点）
+│  │  ├─ upstream-wiring.patch         # 对上游既有文件的接线改动（5 个文件 / 121 行）
+│  │  └─ tests/                        # 宿主端到端测试（真进程 + 真 MCP 子进程）
+│  ├─ scripts/comfy-studio/            # 宿主与跨两侧的脚本：注册安装 / 起宿主 / 清壳缓存 / 体检
+│  └─ src/main/lib/                    # 面板注入脚本 / 宿主拉起 / IPC 注册（新增的 TS）
+└─ .cache/           # 过滤清单、自检输出、安装日志，以及两份上游的 .git（父仓库忽略）
 ```
 
-两组自检都要求自己人代码已经装进检出（没装会直接「找不到包」），先跑一次 `npm run attach`。
+两组自检都直接在检出里跑（自己人代码就住在那里），不需要先装什么。
 
 引擎侧（custom node）的自检，用引擎自己的 venv，不需要引擎在跑：
 
@@ -297,7 +362,10 @@ cd Comfy-Desktop/lib
 
 它用本地假模型服务顶替真 LLM（顺带提供 `GET /models`）：第一轮让模型要一次
 `comfy_list_skills`，第二轮给结论，以此确认「agent 真的经 MCP 工具拿了引擎的数据」，
-另外还验了模型清单与切换（切完之后请求体里的 `model` 真的变了），全程不联网。
+另外还验了模型清单与切换（切完之后请求体里的 `model` 真的变了）、智能体清单与切换
+（切完之后下一轮请求体里的 system 提示词真的换了那段角色，`test_agents_tools.py` 再把
+目录层钉住：内置项都在、md 的三块怎么读、空正文/重名/读不了各自怎么报、每次现扫看得见新文件、
+选中的那份文件不见了会在聊天时明确报错而不是悄悄退回），全程不联网。
 回程那三条通道各有端到端用例：审核（问完真的停住等人答）、本机素材进出（素材真落进
 `input/`、产出报回盘上的真实路径）、计划（一句想法拆成清单等人点头、点头后才逐步播报），
 测试自己就是那个"桌面壳"，收事件再按 RPC 把结果送回去。
@@ -310,8 +378,10 @@ e2e 壳启动宿主时给记忆目录一个临时目录（`--memory-dir`），�
 `compose_system_prompt` 里收尾要求永远在最后一条。
 对话存档也一样有端到端的那一半：一轮跑完后断言盘上真的多了一份这个会话的存档（人设不在里面）、
 `agent/history` 拿回的条目首尾对得上；`test_history.py` 再把存档自己的硬约束钉住 ——
-换个进程也读得到、`../` 拼不出目录、只留整轮、超长内容截断并写明、工具调用与结果必须成对、
-坏文件/旧版本/别的会话的档一律报错且原样留着、`agent/reset` 连存档一起清、写盘失败只 warning
+换个进程也读得到、`../` 拼不出目录、只留整轮、超长内容截断并写明、工具调用与结果必须成对
+（含"第二组调用来了、第一组还没结果"与"末尾挂着没结果的调用"这两种最像样的半截）、不成对的
+历史连写都不写（不落盘）、坏文件/旧版本/别的会话的档一律报错且原样留着、`agent/reset` 连存档
+一起清、写盘失败只 warning
 （答案已经给用户了，不该因为存档写不进去把这一轮判成失败）。会话位满了也有三条用例钉着：
 淘汰最久没用且空闲的那个（并且被淘汰的能从存档接回来）、正在跑的会话不动、`--no-history` 下
 宁可不建也不偷偷丢。多段对话那两下同样是两层：e2e 真起宿主问一次 `agent/sessions`（标题、条数、
@@ -322,13 +392,17 @@ e2e 壳启动宿主时给记忆目录一个临时目录（`--memory-dir`），�
 关掉一个本来就没开着的会话不算错、有一轮在跑时拒绝关掉、`--no-history` 下 `history_kept: false`。
 桌面壳自己的 TypeScript 侧测试走 `pnpm test`（新增面板脚本的用例在
 `src/main/lib/comfyStudioChatContentScript.test.ts`，含模型下拉：填充、切换、
-被拒时回滚、一轮在飞时禁用；以及审核卡与计划清单卡：画清单、点头/要改、进度打勾；
+被拒时回滚、一轮在飞时禁用；智能体下拉同一套（填充、切换并点明"下一次提问生效"、被拒时回滚、
+读不了的文件画成灰选项、选中的那份不见了就如实空着不假装选中、一轮在飞时禁用）；
+以及审核卡与计划清单卡：画清单、点头/要改、进度打勾；
 还有"回到上次的对话"：开抽屉时照存档重画、被裁条数的提示、档读不了画一行说明、抽屉里
 已经有内容就不再补一遍；以及"它记在哪"那一行：记着几条 + 存在这台机器上（路径在悬停里）、
 记忆读不了报红并写出文件、`--no-memory` / `--no-history` 各自写明、宿主没报的字段报"没说"、
 一轮收尾后重读条数；以及那行**会话**：开抽屉认回"上次停在哪一段"（并说清记不住的情况）、
 把宿主清单画成下拉（当前/存档里/在跑各自的标法、读不了的那行不可选）、换一段按存档重画、
 空的那段写一句"还没说过话"、新开一段换新 id 且下一句落到新 id 上、关掉之前先问一次
-（`--no-history` 下要点两下才真关）、关掉之后接着开一段新的、一轮在飞时三个控件都禁用；
+（`--no-history` 下要点两下才真关）、关掉之后接着开一段新的、一轮在飞时三个控件都禁用、
+换段时迟到的响应一句都不许画、刷新清单失败保留上一份、关掉之后还能从下拉选回来接着说、
+浏览器存储读不了时如实说明（退回默认那段而不是装作记得）；
 长期记忆没加面板代码：`memory__remember` / `__recall` / `__forget` 就是普通工具调用，
 抽屉里那套工具卡本来就会把参数与返回的 id 画出来 —— 另起一条提示条是同一份信息的重复）。

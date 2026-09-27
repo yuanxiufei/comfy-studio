@@ -1,0 +1,10 @@
+{
+  "checkout": "ComfyUI",
+  "repo": "https://github.com/Comfy-Org/ComfyUI.git",
+  "version": "0.37.0",
+  "branch": "master",
+  "commit": "79be670e2d9be63e238785af307369d2b9039ed1",
+  "subject": "Mention some ComfyUI optimization details in README. (#16576)",
+  "placement": "custom_nodes/comfy_studio",
+  "what": "引擎侧自己人代码（skills / mcp / agent / routes + tests）的落点，这段自述跟着代码一起走：ComfyUI/ 整份收在父仓里、自己没有 .git，认上游身份只能靠它（setup/seed-desktop.mjs 与 setup/doctor.mjs 读它）。坑：上游 .gitignore 第 8 行忽略 /custom_nodes/，这里新增文件必须 git add -f，否则 git status 连它都不显示。"
+}

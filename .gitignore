@@ -4,9 +4,10 @@ dist/
 *.log
 .DS_Store
 
-# ---- 两个上游仓库就位在根目录，各自带 .git ----
-# 父仓库整目录忽略：就地保持原样，不改上游一行。
-# 打通/集成所需的自己人代码一律放 setup/（以及后续新增的自有目录）里。
+# ---- 两个上游仓库就位在根目录 ----
+# 工作树整份由父仓库跟踪（它们自己没有 .git 了），除桌面侧那一处接线补丁外不改上游一行。
+# 自己人代码（含打通胶水）住在两份检出的标准扩展位里，根目录只留一份 package.json 作入口清单：
+# 引擎侧 ComfyUI/custom_nodes/comfy_studio/（脚本在 tools/），桌面侧 Comfy-Desktop/lib/comfy_studio/ 与 Comfy-Desktop/scripts/comfy-studio/。
 
 
 # ---- 参考仓库搬运池（后期整体可删）----

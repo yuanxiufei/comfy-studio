@@ -248,29 +248,54 @@ def _message_from_wire(raw: Any, index: int) -> ChatMessage:
     return ChatMessage(role=role, content=content, tool_calls=calls)
 
 
+def _pairing_problem(messages: Sequence[ChatMessage]) -> str | None:
+    """挑历史里"工具结果配不上调用"的刺：有问题返回一句描述（第几条、哪个工具），没问题返回 None。
+
+    读存档与写存档两边共用这一份（写那边不肯把不成对的历史落盘 —— 落下去的文件下次会被
+    整份拒绝，用户那段对话直接打不开，比这一轮没落盘糟得多）。
+
+    "欠着结果"这件事要**跨组**盯着：一次一轮里可以连着调好几次工具（模型一轮里发两次
+    tool_calls），所以碰上第二组调用时，得先看第一组是不是还没等到结果 —— 只用当前这一组
+    的 id 覆盖，等于把"上一组的结果全缺"从眼皮底下放过去，而那正是喂回模型会被打回的
+    那份历史。
+    """
+    pending: set[str] = set()
+    owed: int | None = None
+    for index, message in enumerate(messages):
+        if message.role == "assistant" and message.tool_calls:
+            if pending:
+                return (
+                    f"第 {index} 条又要调工具，可第 {owed} 条的那次调用还没等到结果"
+                )
+            ids = [call.id for call in message.tool_calls]
+            if len(set(ids)) != len(ids):
+                return f"第 {index} 条的 tool_calls 里有重复的调用 id"
+            pending = set(ids)
+            owed = index
+            continue
+        if message.role == "tool":
+            if not pending or message.tool_call_id not in pending:
+                return f"第 {index} 条工具结果（{message.name or '未知工具'}）配不上任何调用"
+            pending.discard(message.tool_call_id or "")
+            continue
+        if pending:
+            return f"第 {index} 条是 {message.role}，可第 {owed} 条的工具调用还没等到结果"
+    # 收尾也要看一眼：挂着一组没结果的调用就结束，是**最像样的**那种半截历史
+    # （后面没有别的消息来触发上面那个分支，不看就一路放过去）。
+    if pending:
+        return f"第 {owed} 条的调用一直没等到结果"
+    return None
+
+
 def _check_pairing(messages: Sequence[ChatMessage]) -> None:
-    """每个工具结果都得配得上前面的调用，否则这份历史喂回模型只会被服务端打回。
+    """读存档时挑刺：每个工具结果都得配得上前面的调用，否则这份历史喂回模型只会被服务端打回。
 
     这里宁可**拒绝**整份存档也不"修"它：少一条结果就少一条，模型看到的历史与真实发生的
     对不上，比报错更难查（报错至少指得出文件在哪）。
     """
-    pending: set[str] | None = None
-    for index, message in enumerate(messages):
-        if message.role == "assistant" and message.tool_calls:
-            pending = {call.id for call in message.tool_calls}
-            continue
-        if message.role == "tool":
-            if not pending or message.tool_call_id not in pending:
-                raise HistoryError(
-                    f"第 {index} 条工具结果（{message.name or '未知工具'}）配不上任何调用："
-                    "存档被改坏了"
-                )
-            pending.discard(message.tool_call_id or "")
-            continue
-        if pending:
-            raise HistoryError(
-                f"第 {index} 条是 {message.role}，可前面还有工具调用没等到结果：存档被改坏了"
-            )
+    problem = _pairing_problem(messages)
+    if problem:
+        raise HistoryError(f"{problem}：存档被改坏了")
 
 
 def entries(messages: Sequence[ChatMessage]) -> list[dict[str, Any]]:
@@ -432,6 +457,15 @@ class SessionHistoryStore:
         session_id = _clean_session_id(session_id)
         payload_messages = [message for message in messages if message.role != "system"]
         kept, _dropped = _trim(payload_messages)
+        # 不成对的历史一律不落盘：写下去的话，下次读它会被上面的 _check_pairing 整份拒绝，
+        # 用户那段对话（连更早那些好轮次）就全打不开了。这里拒掉只赔上这一轮不落盘 ——
+        # 答案已经在用户手里，宿主那边只记一行 stderr（见 server.py 的 _save_history）。
+        problem = _pairing_problem(kept)
+        if problem:
+            raise HistoryError(
+                f"这一轮的历史不成对，没写进存档：{problem}。"
+                "写下去会让整份存档下次读不了，所以宁可这一轮不落盘"
+            )
         body = {
             "version": HISTORY_VERSION,
             "session_id": session_id,

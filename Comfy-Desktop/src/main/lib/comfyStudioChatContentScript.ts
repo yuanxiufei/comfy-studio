@@ -26,6 +26,14 @@ let cachedScript: string | null = null
  * HTTP client behind each idle session, and doing that under a turn in flight
  * would cut it off.
  *
+ * Right below it sits the agent picker (`agent/agents` for the catalog, then
+ * `agent/agent` to switch) — the same shape for a different question: which
+ * persona is answering. It only swaps the role paragraph of the system prompt
+ * (lib/comfy_studio/agent/catalog.py), so the tool table and the transcript stay
+ * where they are and the next turn picks it up; entries the host could not read
+ * are drawn as disabled rows with the reason in their tooltip instead of quietly
+ * disappearing from the list.
+ *
  * Under it sits the session row: one conversation is one `session_id`, so the row
  * offers the host's list (`agent/sessions`), switching to another one (repainted
  * from that conversation's archive), starting a new one (the panel picks the id)
@@ -91,6 +99,7 @@ var INPUT_ID = 'comfy-desktop-studio-chat-input';
 var SEND_ID = 'comfy-desktop-studio-chat-send';
 var STOP_ID = 'comfy-desktop-studio-chat-stop';
 var MODEL_ID = 'comfy-desktop-studio-chat-model';
+var AGENT_ID = 'comfy-desktop-studio-chat-agent';
 var SESSION_ID = 'comfy-desktop-studio-chat-session';
 var SESSION_NEW_ID = 'comfy-desktop-studio-chat-session-new';
 var SESSION_CLOSE_ID = 'comfy-desktop-studio-chat-session-close';
@@ -288,6 +297,29 @@ function buildDrawer() {
   controls.appendChild(modelLabel);
   controls.appendChild(model);
 
+  // 智能体那一行：换的是**人设**（提示词里的角色段），不是工具表 —— 宿主那边见
+  // lib/comfy_studio/agent/catalog.py。它单独占一行，是因为"谁在答"和"用哪个模型答"是两件
+  // 事：挤在同一行里，两个下拉都会窄到看不清。
+  var agents = document.createElement('div');
+  agents.style.cssText = 'display:flex;align-items:center;gap:6px;padding:0 12px 8px;';
+
+  var agentLabel = document.createElement('label');
+  agentLabel.textContent = '智能体';
+  agentLabel.setAttribute('for', AGENT_ID);
+  agentLabel.style.cssText = 'color:' + MUTED + ';font-size:11px;white-space:nowrap;';
+
+  var agent = document.createElement('select');
+  agent.id = AGENT_ID;
+  agent.disabled = true;
+  agent.title = '正在读宿主的智能体清单…';
+  agent.style.cssText = model.style.cssText;
+  agent.addEventListener('change', function () {
+    switchAgent(agent.value);
+  });
+
+  agents.appendChild(agentLabel);
+  agents.appendChild(agent);
+
   // 会话那一行：一段对话 = 一个 session_id（宿主那边也这么认，见 lib/comfy_studio/server.py）。
   // 换一段、新开一段、关掉一段都在这一行里，省得再去翻文件。
   var sessions = document.createElement('div');
@@ -401,6 +433,7 @@ function buildDrawer() {
   header.appendChild(close);
   drawer.appendChild(header);
   drawer.appendChild(controls);
+  drawer.appendChild(agents);
   drawer.appendChild(sessions);
   drawer.appendChild(status);
   drawer.appendChild(storage);
@@ -448,6 +481,22 @@ function refreshModelEnabled() {
   var model = document.getElementById(MODEL_ID);
   if (!model) return;
   setModelEnabled(!STATE.busy && model.options.length > 0);
+}
+
+function setAgentEnabled(enabled) {
+  var agent = document.getElementById(AGENT_ID);
+  if (!agent) return;
+  agent.disabled = !enabled;
+  agent.style.opacity = enabled ? '1' : '0.5';
+  agent.style.cursor = enabled ? 'pointer' : 'not-allowed';
+}
+
+// 没清单、宿主不可用、或有一轮在飞时，都不该让用户去换智能体：人设是在每一轮开头算的，
+// 中途换会让"下拉里显示的那个"和"这一轮实际用的那个"对不上（下一轮才按新的来）。
+function refreshAgentEnabled() {
+  var agent = document.getElementById(AGENT_ID);
+  if (!agent) return;
+  setAgentEnabled(!STATE.busy && agent.options.length > 0);
 }
 
 function setSessionEnabled(enabled) {
@@ -726,6 +775,92 @@ function loadModels() {
   );
 }
 
+// ---- 智能体切换 --------------------------------------------------------
+//
+// 与模型那节几乎是同一套写法（宿主那两个方法也是照 agent/models、agent/model 的形状来的），
+// 差别只有一处：切的只是人设里的角色段，正在飞的那一轮不受影响 —— 换完下一次提问就按新角色
+// 答，不必等这一轮结束（见 lib/comfy_studio/server.py 的 agent_agent）。
+//
+// 读不了的文件也画进下拉（灰掉、原因写在 title 里）：从列表里悄悄抹掉，用户只会以为自己那份
+// 文件没生效，然后反复改它。
+
+function setAgentHint(text) {
+  var agent = document.getElementById(AGENT_ID);
+  if (!agent) return;
+  agent.title = text;
+}
+
+// 下拉的 tooltip：正常时说清换的是什么，出毛病时先报毛病。
+function agentHint(result) {
+  var parts = [];
+  if (result.missing) parts.push(String(result.missing));
+  if (result.error) parts.push('智能体目录读不了（' + result.error + '）；这里只有内置的那几个');
+  var broken = result.problems || [];
+  if (broken.length) {
+    var files = [];
+    for (var i = 0; i < broken.length; i++) files.push(String((broken[i] || {}).file || ''));
+    parts.push('这几份文件读不了，没进清单：' + files.join('、'));
+  }
+  if (parts.length === 0) parts.push('换一个智能体（只换人设，工具和历史都不动；下一次提问生效）');
+  if (result.dir) parts.push('自己写的智能体放这里：' + result.dir);
+  return parts.join('；');
+}
+
+function fillAgents(agents, current, problems) {
+  var agent = document.getElementById(AGENT_ID);
+  if (!agent) return;
+  var list = agents || [];
+  agent.textContent = '';
+  for (var i = 0; i < list.length; i++) {
+    var item = list[i] || {};
+    var option = document.createElement('option');
+    option.value = String(item.id || '');
+    option.textContent = item.name ? String(item.name) : String(item.id || '');
+    if (item.summary) option.title = String(item.summary);
+    agent.appendChild(option);
+  }
+  var broken = problems || [];
+  for (var j = 0; j < broken.length; j++) {
+    var bad = broken[j] || {};
+    var skipped = document.createElement('option');
+    skipped.value = '';
+    skipped.textContent = String(bad.file || '（没文件名）') + '（读不了）';
+    skipped.title = String(bad.error || '');
+    skipped.disabled = true;
+    agent.appendChild(skipped);
+  }
+  var wanted = String(current || '');
+  agent.value = wanted;
+  if (agent.value !== wanted) {
+    // 选中的那一项不在清单里（文件被删、改名或者改坏）：还留着上一个选中项，等于假装它还在。
+    agent.selectedIndex = -1;
+  }
+  STATE.agent = wanted;
+  refreshAgentEnabled();
+}
+
+function loadAgents() {
+  return Promise.resolve(bridge.request('agent/agents')).then(
+    function (response) {
+      if (!response || response.ok !== true) {
+        var error = (response && response.error) || {};
+        fillAgents([], STATE.agent, []);
+        setAgentHint('读智能体清单失败: ' + (error.message || '未知错误'));
+        return null;
+      }
+      var result = response.result || {};
+      fillAgents(result.agents, result.current, result.problems);
+      setAgentHint(agentHint(result));
+      return result;
+    },
+    function (err) {
+      fillAgents([], STATE.agent, []);
+      setAgentHint('读智能体清单失败: ' + message(err));
+      return null;
+    }
+  );
+}
+
 // ---- 上次的对话 ----------------------------------------------------------
 //
 // 面板和宿主是两份生命周期：这一屏一重载（切个画面、宿主重启过），抽屉里就空了，
@@ -741,8 +876,12 @@ function loadHistory(sessionId, options) {
   var emptyNote = (options && options.emptyNote) || '';
   var log = document.getElementById(LOG_ID);
   if (!log || log.childNodes.length > 0 || STATE.busy) return null;
+  // 这一趟的票：回来时票变了，说明用户已经换到别的段去了（clearLog 会把票翻新）。这时
+  // **一句都不许画** —— 画下去就是两段话混在一屏上，而下拉说你在另一段上，最难查的那种。
+  var ticket = STATE.paint || 0;
   return Promise.resolve(bridge.request('agent/history', { session_id: id })).then(
     function (response) {
+      if ((STATE.paint || 0) !== ticket) return 0;
       if (!response || response.ok !== true) {
         // 取不回来就说一句。不说的话用户只看到一段空白，会以为对话被吞了；
         // 宿主没在运行时状态栏也在报同一件事，两处并不矛盾。
@@ -930,22 +1069,14 @@ function loadSessions() {
     function (response) {
       if (!response || response.ok !== true) {
         var error = (response && response.error) || {};
-        STATE.sessions = null;
-        fillSessions([]);
-        sessionHint(
+        return keepLastSessions(
           '读会话清单失败: ' + (error.message || '未知错误') + '；这一段还能接着聊'
         );
-        refreshSessionEnabled();
-        return null;
       }
       var result = response.result || {};
       if (!(result.sessions instanceof Array)) {
         // 宿主的回话里没有清单（版本对不上之类）：别装作"你就这一段"，直说。
-        STATE.sessions = null;
-        fillSessions([]);
-        sessionHint('宿主没给会话清单：这一段还能接着聊，别处那几段看不到');
-        refreshSessionEnabled();
-        return null;
+        return keepLastSessions('宿主没给会话清单：这一段还能接着聊，别处那几段看不到');
       }
       STATE.sessions = result;
       fillSessions(result.sessions);
@@ -955,22 +1086,33 @@ function loadSessions() {
     },
     function () {
       // 传输层就没送到（宿主进程不在）：状态栏已经在报同一件事，这里不抢话。
-      STATE.sessions = null;
-      fillSessions([]);
-      sessionHint('宿主不在，看不到别的对话');
-      refreshSessionEnabled();
-      return null;
+      return keepLastSessions('宿主不在，看不到别的对话');
     }
   );
 }
 
+// 这一次没读到清单时走这里：**手上那份留着**，别清空。清空看起来就是"别的对话都没了"，
+// 而这正是这会话行最不该让人误会的事（宿主抖一下、或它刚重启，下拉就只剩当前这一段，
+// 用户会以为对话被吞了）。这份清单是上一次真读到的，"这次没读到"由提示那一句说清。
+function keepLastSessions(hint) {
+  var last =
+    STATE.sessions && STATE.sessions.sessions instanceof Array ? STATE.sessions.sessions : [];
+  fillSessions(last);
+  sessionHint(hint);
+  refreshSessionEnabled();
+  return null;
+}
+
 // 清空消息区，准备画另一段对话（换段与关掉之后都要清，别把上一段的答案留在屏幕上）。
+// 顺带把"正在画的那一次"作废（票号 +1）：换段是异步的，用户点得快时，前一段的"取历史"
+// 可能后回来 —— 不认票的话它会把上上段的话画进这一段的屏幕上（见 loadHistory）。
 function clearLog() {
   var log = logEl();
   if (log) log.textContent = '';
   STATE.pending = null;
   STATE.cards = {};
   STATE.planCard = null;
+  STATE.paint = (STATE.paint || 0) + 1;
 }
 
 // 新会话的 id 由面板挑：宿主只认"一个字符串"，没聊起来之前这一段在它那儿根本不存在
@@ -1165,6 +1307,40 @@ function switchModel(name) {
   ).then(settle, settle);
 }
 
+// 换智能体。与 switchModel 同一套写法，只是响应里没有 skipped：人设是每轮现算的，所有会话
+// 下一次提问就用新的（宿主 agent_agent 的说明里写了为什么不用跳过）。
+function switchAgent(id) {
+  var agent = document.getElementById(AGENT_ID);
+  if (!agent || STATE.busy || id === '' || id === STATE.agent) return;
+  var previous = STATE.agent;
+  setAgentEnabled(false);
+  setStatus('正在换成 ' + id + '…');
+
+  var settle = function () {
+    refreshAgentEnabled();
+  };
+  Promise.resolve(bridge.request('agent/agent', { agent: id })).then(
+    function (response) {
+      if (!response || response.ok !== true) {
+        var error = (response && response.error) || {};
+        agent.value = previous;
+        addError('换智能体失败: ' + (error.message || '未知错误'), error.code);
+        setStatus('智能体仍是 ' + (previous || '未知'), 'error');
+        return;
+      }
+      var result = response.result || {};
+      STATE.agent = String(result.agent || id);
+      agent.value = STATE.agent;
+      setStatus('智能体：' + (result.name || STATE.agent) + '（下一次提问按这个来）');
+    },
+    function (err) {
+      agent.value = previous;
+      addError('换智能体失败: ' + message(err));
+      setStatus('智能体仍是 ' + (previous || '未知'), 'error');
+    }
+  ).then(settle, settle);
+}
+
 // ---- 事件与请求 --------------------------------------------------------
 
 function onEvent(payload) {
@@ -1216,6 +1392,7 @@ function sendTurn() {
   setSendEnabled(false);
   setStopVisible(true);
   refreshModelEnabled(); // 一轮在飞时不换模型、不换会话，免得把这一轮打断或答到别的段上
+  refreshAgentEnabled();
   refreshSessionEnabled();
   input.value = '';
   addUser(text);
@@ -1235,9 +1412,12 @@ function sendTurn() {
     setSendEnabled(true);
     setStopVisible(false);
     refreshModelEnabled();
+    refreshAgentEnabled();
     refreshSessionEnabled();
     // 这一轮可能刚记下一条事或刚把记忆文件弄坏：再看一眼，别让那一行停在旧话上。
     loadStorage();
+    // 智能体清单是从盘上现读的：用户可能刚往里丢了一份 md，聊完这句就该看得见。
+    loadAgents();
     // 这一轮过后这段对话的样子也变了（第一句话成了它的标题、条数加了）：
     // 清单跟着刷新，用户才看得见"它现在叫什么"。
     loadSessions();
@@ -1325,6 +1505,7 @@ function refreshStatus() {
       setStatus(status.running ? 'MCP 宿主运行中' : '宿主待启动（发消息时自动拉起）');
       setSendEnabled(true);
       refreshModelEnabled();
+      refreshAgentEnabled();
       refreshSessionEnabled();
       return status;
     },
@@ -1349,6 +1530,7 @@ function openDrawer() {
   if (input) input.focus();
   refreshStatus();
   loadModels();
+  loadAgents();
   loadHistory();
   loadSessions();
   loadStorage();
@@ -1868,8 +2050,8 @@ export function getComfyStudioChatContentScript(): string {
     `if (!window.__comfyDesktop2.ComfyStudio) return;\n` +
     `if (window.__comfyStudioChat) return;\n` +
     `window.__comfyStudioChat = { started: false, open: false, busy: false, turn: null, ` +
-    `model: '', session: 'default', sessions: null, closeArmed: false, ` +
-    `remembered: '', archive: null, pending: null, cards: {}, planCard: null };\n` +
+    `model: '', agent: '', session: 'default', sessions: null, closeArmed: false, ` +
+    `remembered: '', archive: null, pending: null, paint: 0, cards: {}, planCard: null };\n` +
     STUDIO_CHAT_MAIN_JS +
     `})();\n`
   return cachedScript

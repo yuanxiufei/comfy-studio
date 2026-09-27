@@ -54,8 +54,15 @@ class FakeEngine(EngineClient):
         self.queue_snapshot: dict[str, Any] = {"queue_running": [], "queue_pending": []}
         self.interrupts = 0
         self.object_info_map: dict[str, Any] = {}
+        #: ``list_model_folders`` 的回话；None = 不覆写，走基类默认（探测表的键）。
+        self.model_folders: list[str] | None = None
         #: wait 期间要推的状态序列（默认跑一遍 running → done）。
         self.wait_states: tuple[str, ...] = ("running", "done")
+
+    async def list_model_folders(self) -> list[str]:
+        if self.model_folders is None:
+            return await super().list_model_folders()
+        return list(self.model_folders)
 
     async def object_info(self, node_class: str | None = None) -> dict[str, Any]:
         if node_class is None:

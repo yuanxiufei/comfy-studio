@@ -13,7 +13,7 @@ from typing import Any
 from ..skills.runner import DEFAULT_TIMEOUT, StatusCallback
 from ..skills.runner import submit_prompt as _submit_prompt
 from ..skills.runner import wait_for_prompt as _wait_for_prompt
-from .base import MODEL_PROBES, EngineClient, EngineError
+from .base import EngineClient, EngineError
 
 
 def _server():
@@ -80,21 +80,34 @@ class InProcessEngine(EngineClient):
                     out[name] = {"error": f"{type(err).__name__}: {err}"}
             return out
 
-    async def list_models(self, folder: str) -> list[str]:
-        """直接用 folder_paths 取列表。
+    async def list_model_folders(self) -> list[str]:
+        """直接问 ``folder_paths`` 要类别全集，与上游 ``GET /models`` 同一份数据。
 
-        走 HTTP 时是去读节点下拉枚举，这里直接问 folder_paths，两者同源
-        （节点的 INPUT_TYPES 也是调 ``folder_paths.get_filename_list``），
-        且能正确覆盖 extra_model_paths 里的额外目录。
+        上游那个路由就是 ``list(folder_paths.folder_names_and_paths.keys())``
+        （``ComfyUI/server.py`` 的 ``list_model_types``）。第三方节点注册的目录也在这份
+        键集里，所以这里不用（也不该）再维护一张白名单。
         """
         import folder_paths  # type: ignore[import-not-found]
 
-        if folder not in MODEL_PROBES:
-            raise EngineError(f"未知 folder: {folder}；可选: {', '.join(MODEL_PROBES)}")
-        try:
-            return [str(v) for v in folder_paths.get_filename_list(folder)]
-        except KeyError as err:
-            raise EngineError(f"folder_paths 里没有 {folder} 这一类：{err}") from err
+        return [str(name) for name in folder_paths.folder_names_and_paths]
+
+    async def list_models(self, folder: str) -> list[str]:
+        """按类别直接问 folder_paths 取列表。
+
+        走 HTTP 时是去读节点下拉枚举，这里直接问 folder_paths，两者同源
+        （节点的 INPUT_TYPES 也是调 ``folder_paths.get_filename_list``），
+        且能正确覆盖 extra_model_paths 里的额外目录。**不再过探测表白名单**：
+        类别算不算数由 folder_paths 说了算，第三方注册的目录（例如 F5-TTS 那种）
+        因此也列得出来。
+        """
+        import folder_paths  # type: ignore[import-not-found]
+
+        # 老名字先映射（``folder_paths.map_legacy`` 把 unet/clip 折到
+        # diffusion_models/text_encoders），再判类别在不在。
+        name = folder_paths.map_legacy(folder)
+        if name not in folder_paths.folder_names_and_paths:
+            raise EngineError(f"本机没有注册模型类别 {folder}")
+        return [str(v) for v in folder_paths.get_filename_list(name)]
 
     async def submit(self, workflow: dict[str, Any]) -> str:
         return await _submit_prompt(workflow)

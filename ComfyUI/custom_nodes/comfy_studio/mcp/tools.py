@@ -1,13 +1,17 @@
 """MCP 工具集。
 
 工具名字与语义对齐最初的 TS 实现（``packages/comfy-mcp/src/tools.ts``）：
-8 把通用工具，外加「每个 skill 各暴露一把 ``skill__<id>``」，
+9 把通用工具，外加「每个 skill 各暴露一把 ``skill__<id>``」，
 让 agent 不必先查一遍参数表再拼哈希，直接按 schema 填参即可。
 
 第 8 把是 ``comfy_save_skill``（"方法复用"那条路的入口）：把对话里打磨好的工作流当场
 沉淀成用户自己的 skill。skill 的读写都过 :class:`~comfy_studio.skills.registry.SkillRegistry`，
 所以存完立刻就能被 ``comfy_run_skill`` 跑起来；``skill__<id>`` 那类静态工具要等下次
 重建工具表（工具表是启动时拉的快照）。
+
+第 9 把是 ``comfy_list_model_folders``：模型类别是**引擎那边**决定的（``folder_paths``
+的键，第三方节点还能自己注册），写死在工具描述里必然落后，所以单独开一把工具让模型
+先问类别、再拿类别去 ``comfy_list_models`` 取文件。
 """
 
 from __future__ import annotations
@@ -16,7 +20,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
-from ..engine import EngineClient, EngineError, MODEL_PROBES
+from ..engine import EngineClient, EngineError
 from ..skills import PARAM_TYPES, Skill, SkillRegistry
 
 ToolHandler = Callable[[dict[str, Any]], Awaitable[Any]]
@@ -98,10 +102,13 @@ def build_tools(engine: EngineClient, registry: SkillRegistry) -> list[Tool]:
     ``comfy_run_skill`` / ``comfy_save_skill`` 则都走 ``registry``，看的是实时结果。
     """
 
+    async def list_model_folders(_args: dict[str, Any]) -> Any:
+        return text_result(await engine.list_model_folders())
+
     async def list_models(args: dict[str, Any]) -> Any:
         folder = args.get("folder", "checkpoints")
-        if not isinstance(folder, str):
-            raise ValueError("folder 必须是字符串")
+        if not isinstance(folder, str) or not folder:
+            raise ValueError("folder 必须是非空字符串（类别名见 comfy_list_model_folders）")
         return text_result(await engine.list_models(folder))
 
     async def list_skills(_args: dict[str, Any]) -> Any:
@@ -163,20 +170,33 @@ def build_tools(engine: EngineClient, registry: SkillRegistry) -> list[Tool]:
         Tool(
             name="comfy_list_models",
             description=(
-                "列出本机 ComfyUI 可用的模型文件。"
-                f"folder 可选值: {', '.join(MODEL_PROBES)}；默认 checkpoints"
+                "列出本机某个类别下已安装的模型文件名（例如 checkpoints 里的底模、loras 里的 LoRA）。"
+                "folder 取 comfy_list_model_folders 报出来的类别名，默认 checkpoints；"
+                "不确定类别名就先问那把工具，不要自己猜"
             ),
             input_schema={
                 "type": "object",
                 "properties": {
                     "folder": {
                         "type": "string",
-                        "enum": list(MODEL_PROBES),
-                        "description": "模型类别，默认 checkpoints",
+                        "description": (
+                            "模型类别名（例如 checkpoints / loras / vae / text_encoders），默认 checkpoints；"
+                            "不确定就先调 comfy_list_model_folders"
+                        ),
                     }
                 },
             },
             handler=list_models,
+        ),
+        Tool(
+            name="comfy_list_model_folders",
+            description=(
+                "列出本机 ComfyUI 已注册的**模型类别**。类别由引擎的 folder_paths 决定，"
+                "除自带那些（checkpoints / loras / vae / controlnet …）以外，第三方自定义节点"
+                "注册的目录也在里面。要查某个类别下究竟有哪些文件，拿这里的名字去调 comfy_list_models"
+            ),
+            input_schema={"type": "object", "properties": {}},
+            handler=list_model_folders,
         ),
         Tool(
             name="comfy_list_skills",

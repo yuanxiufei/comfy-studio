@@ -353,8 +353,13 @@ class HostMemoryTests(unittest.TestCase):
         self.assertIn("memory.json", info["memory_error"])
 
     def test_without_memory_the_prompt_is_the_plain_default(self) -> None:
+        # 没挂记忆、用的又是通用助手（角色段是空串）时，拼出来必须与那份默认人设一个字不差。
+        # 比的是**拼出来的结果**，不是形状 —— 形状是个每轮重算的零参函数，换智能体要立刻生效，
+        # 所以不能再拿它跟字符串直接比（见 test_agents_tools.py 里人设那几条）。
         host = _make_host(None)
-        self.assertEqual(host._prompt_source(), DEFAULT_SYSTEM_PROMPT)
+        source = host._prompt_source()
+        self.assertTrue(callable(source))
+        self.assertEqual(source(), DEFAULT_SYSTEM_PROMPT)
 
     def test_with_memory_the_prompt_is_recomputed_every_time(self) -> None:
         host = _make_host(MemoryClient(self.store))

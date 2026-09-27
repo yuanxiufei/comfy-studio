@@ -1,0 +1,11 @@
+{
+  "checkout": "Comfy-Desktop",
+  "repo": "https://github.com/Comfy-Org/Comfy-Desktop.git",
+  "version": "1.1.3",
+  "branch": "main",
+  "commit": "0b7c4185609e270eeaeebf5bba63bc6d6d71feb5",
+  "subject": "Add Create Build help tooltip (#1588)",
+  "placement": ["lib/comfy_studio", "scripts/comfy-studio"],
+  "patch": "upstream-wiring.patch",
+  "what": "桌面壳侧自己人代码的落点：lib/comfy_studio 是宿主进程本体（MCP 宿主 / skills / agent / 通道 + 宿主进程接口），scripts/comfy-studio 是宿主与跨两侧的胶水脚本（注册安装 / 起宿主 / 清壳缓存 / 体检）—— 那几个 .mjs 必须待在桌面壳自己的 scripts 区，上游 eslint 只给 ./scripts/** 的 js/mjs/cjs 配了 node 全局，塞进 lib/ 会被判成一片 no-undef。这段自述跟着代码一起走；同目录的 upstream-wiring.patch 是对上游既有文件的接线改动（5 个文件、121 行），父仓里那 5 个文件是已打上的样子，补丁本身是上游升级时唯一的重放依据。"
+}

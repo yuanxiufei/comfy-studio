@@ -2,8 +2,10 @@
 
 MCP server 被 Claude / Cursor 之类的宿主 spawn 出来时走这条路；用到的接口都是
 上游既有路由（``ComfyUI/server.py``）：``/object_info``、``/prompt``、``/history``、
-``/queue``、``/interrupt``。这些路由同时挂在 ``/`` 与 ``/api`` 前缀下
-（``ComfyUI/server.py:1231-1242`` 做的复制），这里用不带前缀的短路径。
+``/queue``、``/interrupt``，以及列模型清单用的 ``/models``、``/models/{folder}``。
+这些路由同时挂在 ``/`` 与 ``/api`` 前缀下（``ComfyUI/server.py:1231-1242`` 做的复制），
+这里用不带前缀的短路径。后两条是后加的路由，老引擎上没有 —— 见
+:meth:`HttpEngine.list_model_folders` 与 :meth:`HttpEngine.list_models` 的退路。
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import time
 from typing import Any
+from urllib.parse import quote
 
 import aiohttp
 
@@ -18,6 +21,11 @@ from ..skills.runner import DEFAULT_TIMEOUT, StatusCallback
 from .base import EngineClient, EngineError
 
 _POLL_INTERVAL = 0.5
+
+#: 老类别名 → 现用名。同一份表在引擎侧（``ComfyUI/folder_paths.py`` 的 ``map_legacy``）。
+#: 抄在这里是因为走 HTTP 的实现拿不到 ``folder_paths``：那个模块只在引擎进程里 import 得到，
+#: 而 HttpEngine 恰恰是"没活在引擎进程里"时才用的。
+FOLDER_NAME_ALIASES: dict[str, str] = {"unet": "diffusion_models", "clip": "text_encoders"}
 
 
 class HttpEngine(EngineClient):
@@ -61,6 +69,96 @@ class HttpEngine(EngineClient):
         if not isinstance(data, dict):
             raise EngineError(f"/object_info 返回了意外内容: {type(data).__name__}")
         return data
+
+    async def _get_json_soft(self, path: str) -> tuple[int, Any]:
+        """GET 一个 JSON 路由，**把状态码原样交回调用方**。
+
+        与 :meth:`_json` 的区别只有一个：``_json`` 把 4xx/5xx 直接当错误抛掉，而模型列表
+        这边要拿状态码去分辨"类别没注册"和"这个引擎还没有 ``/models`` 路由"（两者都是
+        404），所以单独走一条。网络层故障照旧抛 :class:`EngineError`。
+        """
+        session = await self._get_session()
+        url = f"{self.base_url}{path}"
+        try:
+            async with session.get(url) as resp:
+                status = resp.status
+                text = await resp.text()
+        except aiohttp.ClientError as err:
+            raise EngineError(f"连不上引擎 {url}: {err}") from err
+        if not text:
+            return status, None
+        try:
+            return status, _json_loads(text)
+        except ValueError as err:
+            # 4xx/5xx 的正文不一定是 JSON：引擎没这条路由时是 aiohttp 那段 "404: Not Found"
+            # 文本，而"这个类别没注册"恰恰是靠 404 认出来的 —— 所以错误状态码一律原样交回，
+            # 正文带着给人看（调用方只会截一小段塞进错误信息），只有 2xx 的非 JSON 才是异常。
+            if status >= 400:
+                return status, text
+            raise EngineError(f"GET {path} 返回的不是 JSON: {err}") from err
+
+    async def _model_folders_if_supported(self) -> list[str] | None:
+        """引擎带 ``/models`` 就回类别全集；比它老（404）就回 ``None``。"""
+        status, data = await self._get_json_soft("/models")
+        if status == 404:
+            return None
+        if status >= 400:
+            raise EngineError(f"GET /models 返回 {status}: {_short(str(data))}")
+        if not isinstance(data, list) or not all(isinstance(name, str) and name for name in data):
+            raise EngineError(f"/models 返回了意外内容: {str(data)[:200]}")
+        return list(data)
+
+    async def list_model_folders(self) -> list[str]:
+        """问引擎的 ``GET /models`` 要类别全集。
+
+        上游那个路由（``ComfyUI/server.py`` 的 ``list_model_types``）直接回
+        ``folder_paths.folder_names_and_paths`` 的键，所以第三方自定义节点注册的目录
+        （例如 F5-TTS 那种）也在清单里。老引擎没有这个路由，退回探测表的键 ——
+        那种机器上只能查引擎自带的那几类。
+        """
+        folders = await self._model_folders_if_supported()
+        if folders is None:
+            return await super().list_model_folders()
+        return folders
+
+    async def list_models(self, folder: str) -> list[str]:
+        """按类别问引擎的 ``GET /models/{folder}``。
+
+        该路由（``ComfyUI/server.py`` 的 ``get_models``）对没注册的类别回 404，于是 404
+        有两种含义，得靠 ``/models`` 在不在来分辨：在 = 类别确实没注册，显式报错；不在 =
+        这个引擎比 ``/models`` 还老，退回探测法（读节点下拉枚举）。
+
+        另外上游那个路由**不认老名字**（它直接拿类别名查 ``folder_names_and_paths``，不做
+        :func:`folder_paths.map_legacy`），而 ``folder_paths.get_filename_list`` 认 ——
+        进程内那条路因此列得出 ``unet``，走 HTTP 却会被回 404。为免同一台机器两条路答得
+        不一样，404 时拿 :data:`FOLDER_NAME_ALIASES` 里的新名字再问一次。
+        """
+        alias = FOLDER_NAME_ALIASES.get(folder)
+        files = await self._files_if_registered(folder)
+        if files is None and alias is not None:
+            files = await self._files_if_registered(alias)
+        if files is not None:
+            return files
+
+        folders = await self._model_folders_if_supported()
+        if folders is None:
+            return await super().list_models(folder)
+        available = ", ".join(folders) or "（无）"
+        if alias is None:
+            raise EngineError(f"本机没有注册模型类别 {folder}；可用: {available}")
+        raise EngineError(f"本机没有注册模型类别 {folder}（老名字 {alias} 也没有）；可用: {available}")
+
+    async def _files_if_registered(self, folder: str) -> list[str] | None:
+        """问 ``/models/{folder}``；类别没注册（404）就回 ``None``，其余异常照抛。"""
+        path = f"/models/{quote(folder, safe='')}"
+        status, data = await self._get_json_soft(path)
+        if status == 200:
+            if not isinstance(data, list) or not all(isinstance(name, str) for name in data):
+                raise EngineError(f"GET {path} 返回了意外内容: {str(data)[:200]}")
+            return list(data)
+        if status != 404:
+            raise EngineError(f"GET {path} 返回 {status}: {_short(str(data))}")
+        return None  # 404 = 这个类别名没注册（也可能这台引擎整条路由都没有，由调用方分辨）
 
     async def submit(self, workflow: dict[str, Any]) -> str:
         session = await self._get_session()

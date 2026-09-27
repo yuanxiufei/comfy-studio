@@ -21,6 +21,7 @@ def registry_of(skills: tuple[Any, ...]) -> SkillRegistry:
 
 GENERIC_TOOLS = [
     "comfy_list_models",
+    "comfy_list_model_folders",
     "comfy_list_skills",
     "comfy_run_skill",
     "comfy_save_skill",
@@ -109,9 +110,22 @@ class ToolSurfaceTest(unittest.IsolatedAsyncioTestCase):
         for tool in self.tools:
             self.assertTrue(tool.description.strip(), tool.name)
 
-    def test_list_models_enum_covers_every_known_folder(self) -> None:
-        schema = tool_by_name(self.tools, "comfy_list_models").input_schema
-        self.assertEqual(schema["properties"]["folder"]["enum"], list(MODEL_PROBES))
+    def test_list_models_folder_is_not_pinned_to_a_fixed_enum(self) -> None:
+        # 类别是引擎那边定的（第三方节点还能注册新的），硬写 enum 会把它们挡在门外；
+        # 所以 folder 是自由字符串，并且要指路 comfy_list_model_folders。
+        folder = tool_by_name(self.tools, "comfy_list_models").input_schema["properties"]["folder"]
+        self.assertNotIn("enum", folder)
+        self.assertIn("comfy_list_model_folders", folder["description"])
+
+    async def test_list_model_folders_reads_from_the_engine(self) -> None:
+        self.engine.model_folders = ["checkpoints", "loras", "f5_tts"]
+        self.assertEqual(
+            as_json(await self.call("comfy_list_model_folders")), ["checkpoints", "loras", "f5_tts"]
+        )
+
+        # 引擎没覆写时（老引擎）回探测表那几类，而不是回个空列表让人以为「没装模型」。
+        self.engine.model_folders = None
+        self.assertEqual(as_json(await self.call("comfy_list_model_folders")), list(MODEL_PROBES))
 
     async def test_list_models_reads_from_the_engine(self) -> None:
         self.engine.object_info_map["CheckpointLoaderSimple"] = {

@@ -24,6 +24,24 @@ class ModelProbesTest(unittest.TestCase):
                 self.assertTrue(all(isinstance(part, str) and part for part in probe))
 
 
+class ModelFoldersTest(unittest.IsolatedAsyncioTestCase):
+    """``list_model_folders``：基类只能回探测表，做得动的实现覆写成真正的全集。"""
+
+    async def test_default_is_the_probe_table(self) -> None:
+        # 基类手上没有"问引擎要类别全集"的手段（老引擎没那个路由），只能回探测表。
+        self.assertEqual(await FakeEngine().list_model_folders(), list(MODEL_PROBES))
+
+    async def test_subclass_can_report_third_party_folders(self) -> None:
+        engine = FakeEngine()
+        engine.model_folders = ["checkpoints", "loras", "f5_tts"]
+        self.assertEqual(await engine.list_model_folders(), ["checkpoints", "loras", "f5_tts"])
+
+        # 回的是副本：调用方改了不该影响引擎自己的那份。
+        listed = await engine.list_model_folders()
+        listed.append("nope")
+        self.assertEqual(await engine.list_model_folders(), ["checkpoints", "loras", "f5_tts"])
+
+
 class ListModelsTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.engine = FakeEngine()

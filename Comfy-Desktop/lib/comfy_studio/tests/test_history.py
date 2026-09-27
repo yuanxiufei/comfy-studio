@@ -386,6 +386,82 @@ class SessionHistoryStoreTests(unittest.TestCase):
             self.store.load("s1")
         self.assertIn("没等到结果", str(caught.exception))
 
+    def test_a_second_call_group_hides_a_missing_first_result(self) -> None:
+        # 一次一轮里可以连着调好几次工具：第一组调用还没等到结果，第二组就来了 —— 这时候
+        # 只看当前这组的 id 会把"上一组的结果全缺"放过去。喂回模型正是这份历史会被打回，
+        # 所以它必须被挑出来（宁可整份拒绝）。
+        _write_raw(
+            self.store,
+            "s1",
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"id": "call_1", "function": {"name": "t", "arguments": "{}"}}],
+                },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"id": "call_2", "function": {"name": "t", "arguments": "{}"}}],
+                },
+                {"role": "tool", "content": "第二组的结果", "tool_call_id": "call_2", "name": "t"},
+            ],
+        )
+        with self.assertRaises(HistoryError) as caught:
+            self.store.load("s1")
+        self.assertIn("没等到结果", str(caught.exception))
+
+    def test_duplicate_call_ids_in_one_group_are_refused(self) -> None:
+        # 同一组里两条调用共用一个 id：一条结果就能把两条调用都"销账"，剩下那条永远配不上。
+        _write_raw(
+            self.store,
+            "s1",
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "call_1", "function": {"name": "t", "arguments": "{}"}},
+                        {"id": "call_1", "function": {"name": "t", "arguments": "{}"}},
+                    ],
+                },
+                {"role": "tool", "content": "一条结果", "tool_call_id": "call_1", "name": "t"},
+            ],
+        )
+        with self.assertRaises(HistoryError) as caught:
+            self.store.load("s1")
+        self.assertIn("重复", str(caught.exception))
+
+    def test_a_trailing_call_group_without_results_is_refused(self) -> None:
+        # 末尾挂着一组没结果的调用：后面没有别的消息来触发"欠着结果"那条分支，最容易漏。
+        _write_raw(
+            self.store,
+            "s1",
+            [
+                {"role": "user", "content": "问"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{"id": "call_1", "function": {"name": "t", "arguments": "{}"}}],
+                },
+            ],
+        )
+        with self.assertRaises(HistoryError) as caught:
+            self.store.load("s1")
+        self.assertIn("一直没等到结果", str(caught.exception))
+
+    def test_an_unpaired_history_is_not_written_to_disk(self) -> None:
+        # 读的时候拒绝，写的时候也得拦住：把不成对的历史落盘，等于亲手造一份下次打不开的
+        # 存档（那时整份都读不了，连更早的好轮次一起赔进去）。这里 save 就该抛，且不落文件。
+        messages = [
+            ChatMessage(role="user", content="问"),
+            ChatMessage(role="assistant", content="", tool_calls=[ToolCall(id="call_1", name="t", arguments={})]),
+        ]
+        with self.assertRaises(HistoryError) as caught:
+            self.store.save("s1", messages)
+        self.assertIn("没写进存档", str(caught.exception))
+        self.assertFalse(self.store.path("s1").exists(), "拒掉的那次不该留下文件")
+
     def test_a_paired_call_and_result_read_back(self) -> None:
         _write_raw(
             self.store,
