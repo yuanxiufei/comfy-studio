@@ -20,6 +20,8 @@ __pycache__/
 
 # ---- 脚本临时产物（过滤后的依赖清单、自检输出、安装日志）----
 .cache/
+# playwright-cli 浏览器会话的产物（page-*.yml）—— 只删不挡，下次跑又会冒出来
+.playwright-cli/
 
 # ---- CodeBuddy 项目级子智能体（交付物，必须入库）----
 # 13 个漫剧 agent + 生成器/安装器（`.codebuddy/agents/manju-*.md`、`_build.py`、`_install_user.py`）。
