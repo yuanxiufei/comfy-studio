@@ -373,6 +373,8 @@ class RuleSource:
         """
         if "neg_scene" in self._cache:
             return self._cache["neg_scene"]  # type: ignore[return-value]
+        from .generic import has_cjk
+
         t = self.raw("turnaround")
         i = _find_heading(t, "场景负面词")
         terms: list[str] = []
@@ -380,7 +382,7 @@ class RuleSource:
             for part in b.split(","):
                 s = part.strip()
                 # 只取英文行（含中文的行整体跳过）
-                if s and not re.search(r"[\u4e00-\u9fa5]", s) and s not in terms:
+                if s and not has_cjk(s) and s not in terms:
                     terms.append(s)
         self._cache["neg_scene"] = terms
         return terms  # type: ignore[return-value]

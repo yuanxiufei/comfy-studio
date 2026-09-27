@@ -1,56 +1,39 @@
-# 项目骨架 · AI_DRAMA_PROJECT
+# 项目骨架 · 资产侧的字段与命名
 
-> 对应规格 §40｜最终项目结构
-> 用法：复制整个 `AI_DRAMA_PROJECT/` 文件夹为新剧项目目录，重命名为你的项目名，然后按各目录职责填充资产。
+> **本目录不再存实体项目骨架** —— 2026-09-27 移除了那份 24 文件的 `AI_DRAMA_PROJECT/`：
+> 它和 `python main.py project new <项目名>` 生成的东西**一模一样**，是同一份知识的两个副本，
+> 而且已经开始漂移。实体目录**只由命令生成**。
+>
+> | 你要找 | 去哪 |
+> |---|---|
+> | 目录建法 / 升法 | `08-项目管理/项目骨架/README.md` |
+> | **项目侧目录的唯一权威**（逐层职责 + 谁写谁读 + 命名 + 填充顺序） | ⭐ `08-项目管理/项目目录规范.md` |
+> | 阶段 → 落点 → 命令 → agent | `08-项目管理/流程与落点映射.md` |
+> | 资产卡从哪来 / ID 怎么命名 / 状态机怎么走 | **本文件**（下面 §二、§三） |
 
 ---
 
-## 一、目录职责
+## 一、资产侧的落点（全景在 08，这里只留资产那几层）
 
-```
-AI_DRAMA_PROJECT/
-│
-├── 00_PROJECT/                 项目管理
-│   ├── PROJECT_STATE            ← 复制 `模板/PROJECT_STATE.yaml`
-│   ├── VISUAL_BIBLE             ← 复制 `模板/VISUAL_BIBLE.md`
-│   ├── CHANGELOG                ← 复制 `模板/CHANGELOG.yaml`
-│   ├── ID-REGISTRY              ← ⭐ 复制 `01-剧本文本/模板/ID-REGISTRY.md`（**由 05 建纲时创建**）
-│   └── OPEN-ISSUES              ← ⭐ 复制 `01-剧本文本/模板/OPEN-ISSUES.md`（同上）
-│
-├── 01_WORLD/                   世界观
-│   ├── ERA                     时代
-│   ├── ARCHITECTURE            建筑
-│   ├── MATERIAL                材料
-│   ├── COLOR                   色彩
-│   └── LIGHTING                灯光
-│
-├── 02_CHARACTERS/              角色（每个角色一个子目录）
-│   └── CHARACTER_001/
-│       ├── ASSET_CARD          ← 复制 `模板/ASSET_CARD.yaml`
-│       ├── turnaround.png      三视图
-│       ├── expressions/        表情集
-│       └── poses/              动作集
-│
-├── 03_COSTUMES/                服装（独立资产，不依附角色）
-│   └── COSTUME_001/…
-│
-├── 04_PROPS/                   道具（独立资产）
-│   └── PROP_001/…
-│
-├── 05_ENVIRONMENTS/            场景
-│   └── ENV_001/…
-│
-├── 06_EXPRESSIONS/             表情总库
-│
-├── 07_POSES/                   动作总库
-│
-├── 08_STORYBOARDS/             分镜
-│
-├── 09_SHOTS/                   镜头
-│
-└── 10_CONSISTENCY/             一致性检查记录
-    └── REPORT_<日期>.md         ← 按 `引擎/CONSISTENCY-CHECKLIST.md` 格式
-```
+> ⚠️ **本文件不再维护目录树**。2026-09-27 之前目录树在本文件 §一、
+> `生产流程规范（S0-S7）.md` §七、`08-项目管理/项目目录规范.md` 三处各写一份，
+> 且互不一致（最要紧的是三处都缺 `06_对白/` 与 `11_AUDIO/`）。现全部收敛到 08。
+
+资产相关的那几层（其余层看 08）：
+
+| 层 | 放什么 | 命名 |
+|---|---|---|
+| `01_WORLD/` | 世界观：`ERA` 时代 · `ARCHITECTURE` 建筑 · `MATERIAL` 材料 · `COLOR` 色彩 · `LIGHTING` 灯光 | 固定五个子目录 |
+| `02_CHARACTERS/` | 每个角色一个子目录：`ASSET_CARD.yaml` + `turnaround.png` 三视图 + `expressions/` 表情集 + `poses/` 动作集 | `CHR_001/` |
+| `03_COSTUMES/` | 服装（独立资产，不依附角色） | `CST_001/` |
+| `04_PROPS/` | 道具（独立资产） | `PRP_001/` |
+| `05_ENVIRONMENTS/` | 场景 | `ENV_001/` |
+| `06_EXPRESSIONS/` | 表情总库（派生，不占号） | 跟随主 ID |
+| `07_POSES/` | 动作总库（派生，不占号） | 跟随主 ID |
+| `00_PROJECT/02_资产索引/` | 视觉圣经 + 四张索引 | 见 08 |
+
+> 完整的目录树、谁写谁读、填充顺序：⭐ `08-项目管理/项目目录规范.md`。
+> 「一个实体从 ID 到图片要经过哪些步骤」→ 本文件 §三。
 
 ---
 
@@ -94,12 +77,35 @@ RESERVED  →  DRAFT  →  LOCKED  →  （DEPRECATED）
 
 ## 三、初始化步骤
 
-1. 复制 `AI_DRAMA_PROJECT/` 到项目位置并重命名
-2. **先建两份共享文档**（`ID-REGISTRY` + `OPEN-ISSUES`）——这两份**由 01 剧本文本在建纲阶段创建**，若你从 02 阶段介入，先向用户索要或补建
-3. 把 `模板/` 下模板复制进 `00_PROJECT/` 并改名（PROJECT_STATE / VISUAL_BIBLE / CHANGELOG / ASSET_CARD / INDEX-TEMPLATES）
-4. 填写 `VISUAL_BIBLE` → 过世界观锁定
-5. 填写 `PROJECT_STATE` → 登记 `LOCK_WORLD`
-6. **核对 ID 注册表**：确认待生产资产 ID 均已登记（未登记 → 回报 05 补登）
-7. 开始按 `00-主控智能体.md` 的流程生产资产
+> **唯一走法**：`python main.py project new <项目名>` ——
+> 建全落点 + 写入口文件 + 写空表（含 `ID注册表（ID-REGISTRY）.md` 与 `未决项表（OPEN-ISSUES）.md`），
+> 且顺序不会漏。落点清单来自 `07-智能体运行时/src/project.py` 的 `PROJECT_DIRS`，
+> 与 `08-项目管理/项目目录规范.md` 由 `tests/test_project.py` 机械核对。
+>
+> ⚠️ **不要再手工复制一份骨架目录**（2026-09-27 已删除那种用法）——
+> 手工副本不会跟着规范升级，实测已经缺过 `06_对白/` 与 `11_AUDIO/`。
+
+1. `python main.py project new <项目名>`（已存在的老项目用 `--升级` 补新增落点，不覆盖已有文件）
+2. **先确认两份共享文档在位**：`00_PROJECT/03_台账/ID注册表（ID-REGISTRY）.md` + `未决项表（OPEN-ISSUES）.md`
+   —— 这两份**由 01 剧本文本在建纲阶段创建**；若你从 02 阶段介入，先向用户索要或补建
+3. 把 `02-服化道/模板/` 下的模板复制到**各自的家**（对照 08 的目录规范，不要一律堆进 `00_PROJECT/`）：
+
+   | 模板 | 落到哪 |
+   |---|---|
+   | `02-服化道/模板/PROJECT_STATE.yaml` | `00_PROJECT/项目状态（PROJECT_STATE.yaml）` |
+   | `02-服化道/模板/VISUAL_BIBLE.md` | `00_PROJECT/02_资产索引/视觉圣经（VISUAL_BIBLE）.md` |
+   | `02-服化道/模板/CHANGELOG.yaml` | `00_PROJECT/03_台账/变更记录（CHANGELOG）.yaml` |
+   | `02-服化道/模板/ASSET_CARD.yaml` | `02_CHARACTERS/<ID>/ASSET_CARD.yaml`（每个实体一份） |
+   | `02-服化道/模板/INDEX-TEMPLATES.md` | 拆成 `00_PROJECT/02_资产索引/` 下的五张索引 |
+
+4. 填写 `视觉圣经（VISUAL_BIBLE）` → 过世界观锁定
+5. 填写 `项目状态（PROJECT_STATE）` → 登记 `LOCK_WORLD`
+6. **核对 ID 注册表**：确认待生产资产 ID 均已登记（未登记 → 回报 01 剧本文本补登）
+7. 开始按 `02-服化道/00-主控智能体.md` 的流程生产资产
 
 > ⚠️ **跳过第 2 步的后果**：后续集新角色出现时号段冲突；版权问题拖到发布前才发现。
+
+### 目录里已有的参考文件
+
+`10_CONSISTENCY/REPORT_<日期>.md` 按 `02-服化道/引擎/CONSISTENCY-CHECKLIST.md` 的格式写；
+`11_AUDIO/` 一集一个子目录（`EP01/`）。这两处的字段要求见 08 与本模块对应引擎文件。

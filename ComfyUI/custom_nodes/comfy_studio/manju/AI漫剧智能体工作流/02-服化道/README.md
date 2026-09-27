@@ -35,9 +35,8 @@
 │   ├── CHANGELOG.yaml                   版本控制（§17）
 │   └── INDEX-TEMPLATES.md               五大索引模板（§26）
 │
-├── 项目骨架/                     ← 规格 §40 的项目结构
-│   ├── README.md
-│   └── AI_DRAMA_PROJECT/                00_PROJECT ~ 10_CONSISTENCY 空骨架
+├── 项目骨架/                     ← 资产侧的字段与命名（实体目录由 `project new` 生成）
+│   └── README.md                        ⭐ 项目侧目录的唯一权威在 `08-项目管理/项目目录规范.md`
 │
 ├── 示例演示/                     ← 完整走通示例（验证规格可执行）
 │   ├── README.md                        走通路线导览

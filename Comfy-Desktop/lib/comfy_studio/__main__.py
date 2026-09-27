@@ -108,6 +108,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--project-dir",
+        default=None,
+        help=(
+            "漫剧项目目录（面板「项目管理」那一页读写的落点，projects/* 那几张 RPC）："
+            "一剧一目录，落点清单来自身边工作流里的 src/project.py；"
+            "默认取 <comfyui-dir>/custom_nodes/comfy_studio/manju/projects（也可用 "
+            "COMFY_STUDIO_PROJECT_DIR）。不给 --comfyui-dir 又不给这个，就挂不上项目目录，"
+            "面板那一页会照实说"
+        ),
+    )
+    parser.add_argument(
         "--no-memory",
         action="store_true",
         help=(
@@ -174,6 +185,7 @@ def main(argv: list[str] | None = None) -> int:
                 input_dir=args.input_dir or os.environ.get("COMFY_INPUT_DIR"),
                 output_dir=args.output_dir or os.environ.get("COMFY_OUTPUT_DIR"),
                 novel_dir=args.novel_dir or os.environ.get("COMFY_STUDIO_NOVEL_DIR"),
+                project_dir=args.project_dir or os.environ.get("COMFY_STUDIO_PROJECT_DIR"),
                 memory=not args.no_memory,
                 memory_dir=args.memory_dir or os.environ.get("COMFY_STUDIO_MEMORY_DIR"),
                 agents_dir=args.agents_dir or os.environ.get("COMFY_STUDIO_AGENTS_DIR"),

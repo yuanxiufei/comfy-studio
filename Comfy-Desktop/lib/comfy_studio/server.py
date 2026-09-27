@@ -13,8 +13,9 @@
 ``skills/list``          从引擎刷新 skill 目录并返回
 ``skills/run``           ``{skill_id, params}`` → 运行结果（含图片 url）
 ``agent/config``         模型是否配好（读环境变量，不回显密钥）
-``agent/models``         面板下拉用：可选模型清单（问服务端 ``/models``）+ 当前模型
-``agent/model``          ``{model?}`` → 读当前模型 / 切到指定模型（会话内当场生效）
+``agent/settings``       面板里那份模型配置：不带键是读，带上就是写（落 settings.json 并当场生效）
+``agent/models``         面板下拉用：可选模型清单（每条源各问一遍 ``/models``）+ 当前模型
+``agent/model``          ``{model?}`` → 读当前模型 / 切到 ``源::模型名``（会话内当场生效）
 ``agent/agents``         面板下拉用：可选智能体清单（内置 + 用户目录里的 md）+ 当前项
 ``agent/agent``          ``{agent?}`` → 读当前智能体 / 切到指定智能体（所有会话下一轮生效）
 ``agent/chat``           ``{text, session_id?}`` → 最终回答；过程中推 ``agent/event`` 通知。
@@ -29,6 +30,8 @@
 ``agent/reset``          清空某个会话的历史与它的存档（这一轮在跑就拒绝，免得被收尾写回来）
 ``novels/list``          面板「管理小说」用：漫剧原文目录里有哪些小说
 ``novels/read``          ``{name, offset?, chars?}`` → 一篇原文的一页（按字符分页）
+``novels/chapters``      ``{name, limit?}`` → 一篇原文的章节目录（面板左栏那棵树）
+``novels/search``        ``{name, query, limit?}`` → 这串字在原文里的位置（面板据此跳过去）
 ``novels/import``        ``{path, name?, overwrite?}`` → 把本机一份 txt/md 接进原文目录
 ``novels/delete``        ``{name}`` → 删掉一篇原文（面板先问一次再调它）
 ======================  ==============================================
@@ -44,11 +47,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from collections import OrderedDict
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from .agent import (
     AGENTS_SUBDIR,
@@ -80,18 +85,41 @@ from .localfiles import LocalFiles, LocalFilesClient
 from .memory import MemoryClient, MemoryStore, MemoryStoreError, memory_home
 from .mcp import McpHub, McpServerConfig
 from .novels import (
+    DEFAULT_CHAPTER_LIMIT,
     DEFAULT_LIST_LIMIT,
     DEFAULT_READ_CHARS,
+    DEFAULT_SEARCH_LIMIT,
+    MAX_CHAPTER_LIMIT,
     MAX_LIST_LIMIT,
     MAX_READ_CHARS,
+    MAX_SEARCH_LIMIT,
     MAX_TEXT_BYTES,
     NovelLibrary,
     NovelsError,
     default_novel_dir,
 )
 from .plan import PlanChannel, PlanClient
+from .projects import (
+    DEFAULT_EPISODES,
+    DEFAULT_LIST_LIMIT as DEFAULT_PROJECTS_LIMIT,
+    DEFAULT_READ_CHARS as PROJECT_READ_CHARS,
+    MAX_LIST_LIMIT as MAX_PROJECTS_LIMIT,
+    MAX_READ_CHARS as MAX_PROJECT_READ_CHARS,
+    ProjectLibrary,
+    ProjectsClient,
+    ProjectsError,
+    default_project_dir,
+)
 from .review import ReviewChannel, ReviewClient
 from .rpc import INTERNAL_ERROR, INVALID_PARAMS, RpcContext, RpcError, StdioRpcServer
+from .settings import (
+    EXTRA_SOURCES_KEY,
+    SETTING_KEYS,
+    SOURCE_SEPARATOR,
+    ModelSource,
+    SettingsError,
+    SettingsStore,
+)
 from .skills import SkillCatalog, SkillsError
 
 SERVER_NAME = "comfy-studio-desktop"
@@ -100,6 +128,10 @@ SERVER_VERSION = "0.1.0"
 #: 同时最多留几个**活着**的对话会话（每个握着一条 HTTP 连接、一份对话内存），防止面板
 #: 反复点造成泄露。到上限不是硬墙：再开新的就淘汰最久没用的那个（见 :meth:`StudioHost._make_room`）。
 MAX_SESSIONS = 8
+
+#: 环境变量那条源在 ``源::模型名`` 里的 key。文件里挂的那几条用它自己的名字当 key，
+#: 所以这个名字不许被文件占用（:meth:`StudioHost._sources` 会挡下来）。
+DEFAULT_SOURCE = "default"
 
 #: 不指定 session_id 时用的会话。
 DEFAULT_SESSION = "default"
@@ -147,6 +179,15 @@ def _int_param(
     return raw
 
 
+def _source_label(base_url: str) -> str:
+    """主源在下拉里的分组标题：取地址的 host 部分（``http://127.0.0.1:11434/v1`` → ``127.0.0.1:11434``）。
+
+    为什么不用"本机"这类词：那是猜。地址是用户填的，是什么就显示什么；取不出 host（填了个
+    不像地址的值）就原样显示 —— 这样"填错了"一眼可见，而不是被一个和气的标题盖住。
+    """
+    return urlsplit(base_url).netloc or base_url
+
+
 def _agent_json(profile: AgentProfile) -> dict[str, Any]:
     """智能体清单里给面板看的那几个字段。
 
@@ -180,6 +221,8 @@ class StudioHost:
         history: SessionHistoryStore | None = None,
         agents: AgentCatalog | None = None,
         novels: NovelLibrary | None = None,
+        settings: SettingsStore | None = None,
+        projects: ProjectLibrary | None = None,
     ) -> None:
         self.hub = hub
         self.catalog = catalog
@@ -205,8 +248,17 @@ class StudioHost:
         #: 漫剧原文目录（``--novel-dir``，或由 ``--comfyui-dir`` 推出默认落点）；None 时
         #: ``novels/*`` 会明确说"宿主没挂原文目录"，而不是回一个空的列表让人以为书没了。
         self.novels = novels
-        #: 面板里切过的模型；None = 用环境变量里那个（进程内有效，不落盘）。
+        #: 面板里填过的模型配置（``settings.json``）；None = 这个宿主没挂它，配置只能靠环境变量。
+        self.settings = settings
+        #: 漫剧项目目录（一剧一目录，面板「项目管理」那一页）：``--project-dir``，或由
+        #: ``--comfyui-dir`` 推出默认落点（与原文同一个父目录下的 ``projects/``）。
+        #: None 时 ``projects/*`` 会明确说"宿主没挂项目目录"，而不是回一个空项目表。
+        self.projects = projects
+        #: 面板里切过的模型；None = 用当前那条源自己的默认模型（进程内有效，不落盘）。
         self.default_model: str | None = None
+        #: 面板里切过的模型**源**；None = 环境变量那条。它与 :attr:`default_model` 一起决定
+        #: "地址 / 密钥 / 模型名"这一整套，所以切换时两者总是一起改（见 :meth:`agent_model`）。
+        self.default_source: str | None = None
         #: 面板里切过的智能体；None = 用内置的通用助手（同样只在进程内有效）。
         self.default_agent: str | None = None
         #: 活着的会话。顺序就是"最近用过"的顺序（用得越晚排得越靠后，见 :meth:`_session`），
@@ -228,6 +280,7 @@ class StudioHost:
         self.server.on("skills/list", self.skills_list)
         self.server.on("skills/run", self.skills_run)
         self.server.on("agent/config", self.agent_config)
+        self.server.on("agent/settings", self.agent_settings)
         self.server.on("agent/models", self.agent_models)
         self.server.on("agent/model", self.agent_model)
         self.server.on("agent/agents", self.agent_agents)
@@ -243,8 +296,16 @@ class StudioHost:
         self.server.on("agent/reset", self.agent_reset)
         self.server.on("novels/list", self.novels_list)
         self.server.on("novels/read", self.novels_read)
+        self.server.on("novels/chapters", self.novels_chapters)
+        self.server.on("novels/search", self.novels_search)
         self.server.on("novels/import", self.novels_import)
         self.server.on("novels/delete", self.novels_delete)
+        self.server.on("projects/list", self.projects_list)
+        self.server.on("projects/tree", self.projects_tree)
+        self.server.on("projects/read", self.projects_read)
+        self.server.on("projects/create", self.projects_create)
+        self.server.on("projects/link_novel", self.projects_link_novel)
+        self.server.on("projects/brief", self.projects_brief)
 
     # ---- 方法 -----------------------------------------------------------
 
@@ -262,6 +323,7 @@ class StudioHost:
             "sessions": sorted(self._sessions),
             "skills_cached": len(self.catalog.entries),
             "default_model": self.default_model,
+            "default_source": self.default_source,
             # 当前生效的智能体：id + 名字 + 它自己的毛病（选中的文件被删掉/改坏时会说话）。
             # 目录整体读不了另走 agents_error —— 那时清单里只剩内置那几项。
             "agent": agent_id,
@@ -288,6 +350,12 @@ class StudioHost:
             # exists 字段如实说，不在这里当错误报。
             "novels": self.novels is not None,
             "novel_dir": str(self.novels.directory) if self.novels is not None else None,
+            # 漫剧项目目录：面板「项目管理」那一页读的就是它。同样"目录不存在也算挂上"，
+            # 由 projects/list 的 exists 说；但**落点清单载不上**要在这里就报出来 ——
+            # 那意味着面板少了一整份事实（整个项目页的格子都不准），不该等到点开才发现。
+            "projects": self.projects is not None,
+            "project_dir": str(self.projects.directory) if self.projects is not None else None,
+            "project_status": self.projects.status() if self.projects is not None else None,
             "memory": self.memory is not None,
             "memory_file": str(self.memory.store.path) if self.memory is not None else None,
             "memory_entries": memory_entries,
@@ -338,42 +406,170 @@ class StudioHost:
     def agent_config(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
         _object(params, "agent/config")
         tools = sorted(t.qualified_name for t in self.hub.tools)
-        try:
-            config = LLMConfig.from_env()
-        except LLMError as err:
-            return {"configured": False, "error": str(err), "tools": tools}
+        config, error = self._try_source_config(self.default_source or DEFAULT_SOURCE)
+        if config is None:
+            # 没配好不是错误，是一种要如实说出来的现状（面板照着它显示"还没配"）。
+            return {"configured": False, "error": error, "tools": tools}
         return {
             "configured": True,
-            "model": self._selected_model(config),
+            "model": self._selected_model(),
+            "source": self.default_source or DEFAULT_SOURCE,
             "base_url": config.base_url,
             "temperature": config.temperature,
             "tools": tools,
         }
 
+    async def agent_settings(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
+        """面板里那份模型配置：不带那三个键是读，带上就是写（并**当场**生效）。
+
+        为什么要有这一档：模型没配好时每一轮都回 ``-32603``，而这三项本来只在环境变量里 ——
+        面板只能照着报错、不能补救。写下来存进用户数据目录，下次启动由
+        :meth:`SettingsStore.apply_to_env` 注入，于是"在面板里填一次，以后都能聊"。
+
+        写完之后要把**已经建好的会话**也换过来：会话手里握着 HTTP 客户端，而客户端记着旧的
+        地址与密钥（``use_model`` 只换模型名、继承旧地址）。空闲的当场重建，正在跑一轮的跳过
+        —— 那一轮正 ``await`` 着它，换掉等于把活劈了（与 :meth:`agent_model` 同一套口径）。
+        """
+        args = _object(params, "agent/settings")
+        store = self.settings
+        if store is None:
+            raise RpcError(INTERNAL_ERROR, "这个宿主没挂配置存储：模型配置只能靠环境变量给")
+
+        given = {
+            key: value
+            for key, value in args.items()
+            if key in SETTING_KEYS or key == EXTRA_SOURCES_KEY
+        }
+        if not given:
+            return self._settings_status()
+        for key, value in given.items():
+            if key == EXTRA_SOURCES_KEY:
+                # 额外源是**一组对象**而不是字符串，所以不走下面那条字符串校验；形状由
+                # SettingsStore.save -> _parse_sources 把关（那儿报的错更具体：第几条、哪个字段）。
+                if not isinstance(value, list):
+                    raise RpcError(INVALID_PARAMS, f"{EXTRA_SOURCES_KEY} 必须是数组（要清空就传 []）")
+                continue
+            if not isinstance(value, str):
+                raise RpcError(INVALID_PARAMS, f"{key} 必须是字符串（要清掉这一项就传空串）")
+
+        try:
+            store.save(given)
+            store.apply_to_env()
+        except SettingsError as err:
+            raise RpcError(INTERNAL_ERROR, str(err)) from err
+
+        applied: list[str] = []
+        skipped: list[str] = []
+        for session_id, session in self._sessions.items():
+            if session_id in self._turns:
+                skipped.append(session_id)
+                continue
+            try:
+                await session.use_config(self._session_config())
+            except (LLMError, AgentError) as err:
+                raise RpcError(INTERNAL_ERROR, f"{type(err).__name__}: {err}") from err
+            applied.append(session_id)
+
+        result = self._settings_status()
+        result.update({"saved": True, "applied": sorted(applied), "skipped": sorted(skipped)})
+        return result
+
+    def _settings_status(self) -> dict[str, Any]:
+        """这份配置现在长什么样：文件存了什么、环境变量给了什么、真正生效的模型与地址是哪个。
+
+        两处错误分开报：``file_error`` 是那份文件的毛病（删掉它就回到只用环境变量），
+        ``error`` 是"照现在这份配置根本建不了会话"（多半是模型名还没填）。
+        """
+        store = self.settings
+        if store is None:
+            status: dict[str, Any] = {
+                "path": None,
+                "exists": False,
+                "saved": None,
+                "from_file": [],
+                "from_env": [],
+                "file_error": None,
+            }
+        else:
+            status = store.status()
+            status["file_error"] = status.pop("error", None)
+
+        configured = True
+        model: str | None = None
+        base_url: str | None = None
+        error: str | None = None
+        config, source_error = self._try_source_config(self.default_source or DEFAULT_SOURCE)
+        if config is None:
+            # 没配好不是这一档的失败：这一档的用途正是"把没配好的填上"。
+            configured = False
+            error = source_error
+        else:
+            model = self._selected_model()
+            base_url = config.base_url
+        status.update(
+            {"configured": configured, "model": model, "base_url": base_url, "error": error}
+        )
+        return status
+
     async def agent_models(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
         """面板下拉用：可选模型清单 + 当前值。
 
-        清单问服务端要（OpenAI 兼容的 ``GET {base_url}/models``）。拉不到**不抛错**，
-        而是只回当前这一个并带上 ``error`` 说明原因——下拉要是因此空掉，用户连
-        正在用的模型都看不见了。``source`` 标明这份清单从哪来。
+        清单问服务端要（OpenAI 兼容的 ``GET {base_url}/models``），而且**每条源问一遍**：
+        环境变量那条（本机 Ollama 之类）与 ``settings.json`` 里挂的那几条（DeepSeek 之类）
+        各成一组，面板按组分栏。某一组拉不到**不抛错**，只在该组里带上 ``error`` 说明原因
+        —— 下拉要是因此空掉，用户连正在用的模型都看不见了。组的 ``origin`` 标明清单从哪来。
+
+        顶层那三个 ``models`` / ``source`` / ``error`` 说的都是**主源**那一组，留着是为了
+        不破坏既有的面板与测试；新面板读 ``groups``（带 ``source`` 分组信息）。
         """
         _object(params, "agent/models")
-        config = self._llm_config()
-        current = self._selected_model(config)
+        current_source = self.default_source or DEFAULT_SOURCE
+        current = self._selected_model()
 
-        client = OpenAIChatClient(config)
-        try:
-            models = await client.list_models()
-            source, error = "endpoint", None
-        except LLMError as err:
-            models, source, error = [], "config", str(err)
-        finally:
-            await client.close()
+        views, extra_error = self._sources()
+        groups = list(await asyncio.gather(*(self._list_source_models(view) for view in views)))
+        primary = next((group for group in groups if group["source"] == DEFAULT_SOURCE), None)
+        if primary is None:  # pragma: no cover - _sources() 恒含主源
+            primary = {"models": [], "origin": "config", "error": "没有可用的主源"}
 
-        if current not in models:
-            # 环境变量指定的那个未必在服务端清单里（比如刚被删掉的别名）。
-            models = [current, *models]
-        return {"current": current, "models": models, "source": source, "error": error}
+        for group in groups:
+            if group["source"] == current_source and current and current not in group["models"]:
+                # 当前那个未必在服务端清单里（比如刚被删掉的别名）：补进去，好让面板的下拉
+                # 能定位到它 —— 定位不到就会显示成第一个，看着像"我自己换了模型"。
+                group["models"] = [current, *group["models"]]
+        models = list(primary["models"])
+        return {
+            "current": current,
+            "current_source": current_source,
+            "models": models,
+            "source": primary["origin"],
+            "error": primary["error"],
+            "groups": groups,
+            "extra_error": extra_error,
+        }
+
+    async def _list_source_models(self, view: dict[str, Any]) -> dict[str, Any]:
+        """问一条源要它的模型清单。拉不到**不抛**，把原因写在这一组里（见 :meth:`agent_models`）。"""
+        config = view["config"]
+        models: list[str] = []
+        origin, error = "endpoint", None
+        if config is None:
+            origin, error = "config", view["error"]
+        else:
+            client = OpenAIChatClient(config)
+            try:
+                models = await client.list_models()
+            except LLMError as err:
+                origin, error = "config", str(err)
+            finally:
+                await client.close()
+        return {
+            "source": view["key"],
+            "label": view["label"],
+            "models": models,
+            "origin": origin,
+            "error": error,
+        }
 
     async def agent_model(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
         """不带 ``model`` 是读，带上就是切。
@@ -383,24 +579,42 @@ class StudioHost:
         调用方决定是等它跑完、``agent/cancel`` 掉它，还是换个 session。
         """
         args = _object(params, "agent/model")
-        config = self._llm_config()
         requested = args.get("model")
         if requested is None:
-            return {"model": self._selected_model(config), "changed": False, "applied": [], "skipped": []}
+            return {
+                "model": self._selected_model(),
+                "source": self.default_source or DEFAULT_SOURCE,
+                "changed": False,
+                "applied": [],
+                "skipped": [],
+            }
         if not isinstance(requested, str) or requested.strip() == "":
             raise RpcError(INVALID_PARAMS, "model 必须是非空字符串")
 
-        name = requested.strip()
+        source_key, name = self._split_model_ref(requested.strip())
+        if not name:
+            raise RpcError(INVALID_PARAMS, f"{SOURCE_SEPARATOR} 后面要写模型名")
+        # 换源等于换地址 + 换密钥 + 换模型名，三样一起变 —— 所以走 use_config 而不是 use_model
+        # （后者只改名字、继承旧地址与旧密钥：那就把 deepseek-v4-pro 这个名字发去 Ollama 了）。
+        config = replace(self._source_config(source_key), model=name)
+        self.default_source = None if source_key == DEFAULT_SOURCE else source_key
         self.default_model = name
+
         applied: list[str] = []
         skipped: list[str] = []
         for session_id, session in self._sessions.items():
             if session_id in self._turns:
                 skipped.append(session_id)
                 continue
-            await session.use_model(name)
+            await session.use_config(config)
             applied.append(session_id)
-        return {"model": name, "changed": True, "applied": sorted(applied), "skipped": sorted(skipped)}
+        return {
+            "model": name,
+            "source": source_key,
+            "changed": True,
+            "applied": sorted(applied),
+            "skipped": sorted(skipped),
+        }
 
     async def agent_agents(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
         """面板下拉用：可选智能体清单 + 当前项。
@@ -808,6 +1022,45 @@ class StudioHost:
         except NovelsError as err:
             raise RpcError(INTERNAL_ERROR, str(err)) from err
 
+    def novels_chapters(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
+        """一篇原文的章节目录：切法见 :data:`comfy_studio.novels.CHAPTER_RE`。
+
+        目录得把整篇扫一遍，头一次点会等一下（就这一次 —— 正文随后留在缓存里，翻章是很快的）。
+        ``message`` 非空表示"这篇切不出章节"：面板照它显示一句话，而不是画一棵空树。
+        """
+        args = _object(params, "novels/chapters")
+        name = _text(args, "name")
+        limit = _int_param(
+            args,
+            "limit",
+            DEFAULT_CHAPTER_LIMIT,
+            low=1,
+            high=MAX_CHAPTER_LIMIT,
+            method="novels/chapters",
+        )
+        try:
+            return self._novels().chapters(name, limit)
+        except NovelsError as err:
+            raise RpcError(INTERNAL_ERROR, str(err)) from err
+
+    def novels_search(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
+        """在原文里找一串字：回每一处的位置，以及它前后各一小段字（面板显示那一列）。"""
+        args = _object(params, "novels/search")
+        name = _text(args, "name")
+        query = _text(args, "query")
+        limit = _int_param(
+            args,
+            "limit",
+            DEFAULT_SEARCH_LIMIT,
+            low=1,
+            high=MAX_SEARCH_LIMIT,
+            method="novels/search",
+        )
+        try:
+            return self._novels().search(name, query, limit)
+        except NovelsError as err:
+            raise RpcError(INTERNAL_ERROR, str(err)) from err
+
     def novels_import(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
         """把本机一份 txt/md 接进原文目录。
 
@@ -837,22 +1090,251 @@ class StudioHost:
         except NovelsError as err:
             raise RpcError(INTERNAL_ERROR, str(err)) from err
 
-    # ---- 生命周期 -------------------------------------------------------
+    # ---- 项目管理 -------------------------------------------------------
+    #
+    # 面板「项目管理」那一页的六件事。落点清单、建项目、阶段体检的活都在
+    # :mod:`comfy_studio.projects` 里（它又直接用 manju 那份 ``project.py``），这一层照旧
+    # 只管两件：参数形状（越界一律 INVALID_PARAMS，别把 Python 报错丢到界面上）与错误码。
+    # 建项目一律**只补不覆盖**（那份 ``create_project`` 的既定行为）；同名且非空时要加
+    # ``upgrade: true`` 才是"补齐新增落点"，否则按内部错误顶出来让面板问一次。
 
-    def _llm_config(self) -> LLMConfig:
-        """环境变量给的基配置；模型没配好就直接报错（切换也救不了没地址的情况）。"""
+    def _projects(self) -> ProjectLibrary:
+        if self.projects is None:
+            raise RpcError(
+                INTERNAL_ERROR,
+                "这个宿主没挂项目目录（既没 --comfyui-dir 也没 --project-dir）：项目管理这一页用不了",
+            )
+        return self.projects
+
+    def _novel_shelf(self) -> str | None:
+        """原文库的落点 —— 建项目时用来核对"这本原著真在库里"。
+
+        宿主没挂原文目录就回 None（不核对）：**登记来源**是版权相关的记录，
+        与其记一条没核对过的，不如只记名字。核对得住的时候才核对。
+        """
+        return str(self.novels.directory) if self.novels is not None else None
+
+    def projects_list(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
+        """项目根下有哪些剧、各自什么进度；``exists: false`` = 这个检出还没建过项目（不是错误）。"""
+        args = _object(params, "projects/list")
+        name = args.get("name")
+        if name is not None and not isinstance(name, str):
+            raise RpcError(INVALID_PARAMS, "name 必须是字符串")
+        limit = _int_param(
+            args,
+            "limit",
+            DEFAULT_PROJECTS_LIMIT,
+            low=1,
+            high=MAX_PROJECTS_LIMIT,
+            method="projects/list",
+        )
         try:
-            return LLMConfig.from_env()
-        except LLMError as err:
+            return self._projects().list(name, limit)
+        except ProjectsError as err:
             raise RpcError(INTERNAL_ERROR, str(err)) from err
 
-    def _selected_model(self, config: LLMConfig) -> str:
-        """当前生效的模型：面板切过就用切过的，否则用环境变量里的。"""
-        return self.default_model or config.model
+    def projects_tree(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
+        """一部剧的落点（按"围绕剧本"分好格）+ 阶段进度 + 原著登记。面板右侧那一屏就是它。"""
+        args = _object(params, "projects/tree")
+        name = _text(args, "name")
+        try:
+            return self._projects().tree(name)
+        except ProjectsError as err:
+            raise RpcError(INTERNAL_ERROR, str(err)) from err
+
+    def projects_read(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
+        """读项目里的一份文本资料；按字符分页，回来的 ``offset`` + ``chars`` 就是下一次的问法。
+
+        ``offset`` 的上限同样取 :data:`comfy_studio.novels.MAX_TEXT_BYTES`（汉字在 UTF-8 里
+        至少一个字节，字数不可能超过字节上限）—— 比它更大的 offset 一定是调用方算错了。
+        """
+        args = _object(params, "projects/read")
+        name = _text(args, "name")
+        rel = _text(args, "rel")
+        offset = _int_param(args, "offset", 0, low=0, high=MAX_TEXT_BYTES, method="projects/read")
+        chars = _int_param(
+            args, "chars", PROJECT_READ_CHARS, low=1, high=MAX_PROJECT_READ_CHARS, method="projects/read"
+        )
+        try:
+            return self._projects().read(name, rel, offset, chars)
+        except ProjectsError as err:
+            raise RpcError(INTERNAL_ERROR, str(err)) from err
+
+    def projects_create(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
+        """建一个项目（或给已有的补齐落点），建完立刻回一份体检。
+
+        ``novel`` 给了就在建完之后把"这一部改的是哪本原著"登记进 ``素材来源登记.md``：
+        原著库挂着时先核对这本真在库里（:meth:`_novel_shelf`），核对不住就**不登记**，
+        由返回的 ``novel.reason`` 说明为什么（``missing_novel`` / ``already`` / ...）。
+        """
+        args = _object(params, "projects/create")
+        name = _text(args, "name")
+        episodes = _int_param(
+            args, "episodes", DEFAULT_EPISODES, low=1, high=9999, method="projects/create"
+        )
+        upgrade = args.get("upgrade")
+        if upgrade is not None and not isinstance(upgrade, bool):
+            raise RpcError(INVALID_PARAMS, "upgrade 必须是布尔值")
+        novel = args.get("novel")
+        if novel is not None and not isinstance(novel, str):
+            raise RpcError(INVALID_PARAMS, "novel 必须是字符串（原著文件名）")
+        try:
+            return self._projects().create(
+                name,
+                episodes=episodes,
+                upgrade=bool(upgrade),
+                novel=novel,
+                novel_dir=self._novel_shelf(),
+            )
+        except ProjectsError as err:
+            raise RpcError(INTERNAL_ERROR, str(err)) from err
+
+    def projects_link_novel(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
+        """单独登记 / 换一次原著（建完项目之后又想起来来源是哪本时用）。
+
+        已经填过的那一行**不动**，回 ``already`` 与现值：这张表是来源记录，不能悄悄改。
+        """
+        args = _object(params, "projects/link_novel")
+        name = _text(args, "name")
+        novel = _text(args, "novel")
+        try:
+            return self._projects().link_novel(name, novel, novel_dir=self._novel_shelf())
+        except ProjectsError as err:
+            raise RpcError(INTERNAL_ERROR, str(err)) from err
+
+    def projects_brief(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
+        """把一部剧的现状写成人话（面板「发到对话」把它塞进输入框）。只写查得到的事实。"""
+        args = _object(params, "projects/brief")
+        name = _text(args, "name")
+        try:
+            return self._projects().brief(name)
+        except ProjectsError as err:
+            raise RpcError(INTERNAL_ERROR, str(err)) from err
+
+    # ---- 生命周期 -------------------------------------------------------
+
+    def _extra_sources(self) -> tuple[ModelSource, ...]:
+        """文件里挂的那几条额外模型源；宿主没挂配置就是空。
+
+        文件**读坏了会抛**（:class:`SettingsError`），不在这里吞掉："装作没有额外源"是静默错误
+        —— 用户会以为自己在 settings.json 里配的 DeepSeek 丢了，而这正是最不该发生的那种坏。
+        """
+        if self.settings is None:
+            return ()
+        return self.settings.load().extra_sources
+
+    def _sources(self) -> tuple[list[dict[str, Any]], str | None]:
+        """所有可选的模型源，每条 ``{key, label, config, error}``；外加"额外源读不了"的错误。
+
+        主源（key 恒为 :data:`DEFAULT_SOURCE`）就是环境变量 / 文件那三项；额外的来自
+        ``settings.json`` 的 ``extra_sources``，key 就是它自己的名字（那份文件里已保证
+        非空、不重名、不含分隔符）。
+
+        ``config`` 为 None 表示这条用不了（多半是主源没配好），这时 ``error`` 写着为什么 ——
+        但它**照样列出来**，好让面板显示"有这么一条，只是它坏了"，而不是干脆看不见。
+
+        额外源那份文件读不了**不在这里抛**：那会让整个下拉空掉，连正在用的模型都看不见；
+        改成把错误交回调用方（见 :meth:`agent_models`），主源照样列。
+        """
+        views: list[dict[str, Any]] = []
+        config, error = self._try_source_config(DEFAULT_SOURCE)
+        views.append(
+            {
+                "key": DEFAULT_SOURCE,
+                "label": _source_label(config.base_url) if config else "环境变量那条",
+                "config": config,
+                "error": error,
+            }
+        )
+
+        extra_error: str | None = None
+        try:
+            extra = self._extra_sources()
+        except SettingsError as err:
+            extra_error = str(err)
+        else:
+            for source in extra:
+                if source.name == DEFAULT_SOURCE:
+                    # 撞名会让"源::模型名"这个写法指向哪条说不清 —— 当场说清，不猜。
+                    extra_error = (
+                        f"settings.json 里有一条源叫 {DEFAULT_SOURCE!r}，这是主源占用的名字；"
+                        "给它换个名字"
+                    )
+                    break
+                views.append(
+                    {
+                        "key": source.name,
+                        "label": source.name,
+                        "config": LLMConfig(
+                            model=source.model,
+                            base_url=source.base_url,
+                            api_key=source.api_key or None,
+                        ),
+                        "error": None,
+                    }
+                )
+        return views, extra_error
+
+    def _try_source_config(self, key: str) -> tuple[LLMConfig | None, str | None]:
+        """按 key 取一条源的基配置（模型名是它自己的默认值，还没叠上面板选过的那个）。
+
+        取不到就回 ``(None, 原因)``，**不抛**。调用方分两类：``agent/config`` 与
+        ``agent/settings`` 是"如实汇报现状"的 —— 没配好本身就是一种要报出来的现状、不是错误；
+        而 ``agent/model`` 那种"用户点了名"的用 :meth:`_source_config`，点错了就该报错。
+        """
+        if key == DEFAULT_SOURCE:
+            try:
+                return LLMConfig.from_env(), None
+            except LLMError as err:
+                return None, str(err)
+        try:
+            sources = self._extra_sources()
+        except SettingsError as err:
+            return None, str(err)
+        for source in sources:
+            if source.name == key:
+                # 温度、超时这些暂时没法逐条源配（settings.json 里没这一档），用 LLMConfig 的
+                # 默认值；要改就改 SETTING_KEYS 那三个键，那是给主源的。
+                return (
+                    LLMConfig(
+                        model=source.model,
+                        base_url=source.base_url,
+                        api_key=source.api_key or None,
+                    ),
+                    None,
+                )
+        known = [DEFAULT_SOURCE, *(source.name for source in sources)]
+        return None, f"没有叫 {key!r} 的模型源（settings.json 里现在有：{'、'.join(known)}）"
+
+    def _source_config(self, key: str) -> LLMConfig:
+        """:meth:`_try_source_config` 的"要不到就抛"版本。"""
+        config, error = self._try_source_config(key)
+        if config is None:
+            raise RpcError(INVALID_PARAMS, error or f"取不到模型源 {key!r}")
+        return config
+
+    def _split_model_ref(self, ref: str) -> tuple[str, str]:
+        """把面板给的 ``源::模型名`` 拆成 (源 key, 模型名)。
+
+        没带分隔符就是主源 + 整串 —— 老面板（以及直接照着 RPC 调的人）传纯模型名那套照旧能用。
+        """
+        key, separator, model = ref.partition(SOURCE_SEPARATOR)
+        if not separator:
+            return DEFAULT_SOURCE, ref
+        return key.strip(), model.strip()
+
+    def _selected_model(self) -> str:
+        """当前生效的模型名（**不带来源前缀**：面板与 ``agent/config`` 要的就是这个）。"""
+        if self.default_model:
+            return self.default_model
+        return self._source_config(self.default_source or DEFAULT_SOURCE).model
 
     def _session_config(self) -> LLMConfig:
-        config = self._llm_config()
-        return replace(config, model=self._selected_model(config))
+        """新会话、以及"配置改了"时要交给会话的那一套：当前源的地址与密钥 + 当前模型名。"""
+        return replace(
+            self._source_config(self.default_source or DEFAULT_SOURCE),
+            model=self._selected_model(),
+        )
 
     def _memory_status(self) -> tuple[int | None, str | None]:
         """记忆的条数与读盘错误，供 ``host/info`` 如实报出。
@@ -1049,6 +1531,7 @@ async def serve_stdio(
     input_dir: str | None = None,
     output_dir: str | None = None,
     novel_dir: str | None = None,
+    project_dir: str | None = None,
     memory: bool = True,
     memory_dir: str | None = None,
     agents_dir: str | None = None,
@@ -1069,6 +1552,12 @@ async def serve_stdio(
     检出的 ``custom_nodes/comfy_studio/manju/`` 下，原文在它的 ``novel/`` 里
     （:func:`comfy_studio.novels.default_novel_dir`）。两个都没给就挂不上，``novels/*`` 会
     照实说 —— 那比回一个空书库好："目录还没建"和"没挂上"在面板上是两句不同的话。
+    漫剧项目（:mod:`comfy_studio.projects`，面板「项目管理」那一页的活）与原文同一处父目录：
+    ``project_dir`` 直接给，否则由 ``comfyui_dir`` 推出 ``manju/projects/``
+    （:func:`comfy_studio.projects.default_project_dir`）。它另外还要一份**落点清单**，
+    也就是工作流里那份 ``src/project.py`` —— 默认从项目根往上退一级去找
+    （:func:`comfy_studio.projects.default_spec_path`），找不到时 ``projects/*`` 会连路径
+    带修法一起报出来，而不是装作"这个项目一个文件都没有"。
     长期记忆（:mod:`comfy_studio.memory`）同样不需要谁接话，而且它是这个工作台该有的
     记性，所以**默认开着**：一份落在用户数据目录的 JSON，``memory_dir`` 换地方，
     ``memory=False`` 整个关掉（工具表里就没有 memory__* 了）。
@@ -1096,6 +1585,13 @@ async def serve_stdio(
         else (default_novel_dir(comfyui_dir) if comfyui_dir else None)
     )
     novels = NovelLibrary(novel_root) if novel_root is not None else None
+    # 漫剧项目目录（一剧一目录）：面板「项目管理」那一页读写的就是它。与原文同一处父目录。
+    project_root = (
+        Path(project_dir).expanduser()
+        if project_dir
+        else (default_project_dir(comfyui_dir) if comfyui_dir else None)
+    )
+    projects = ProjectLibrary(project_root) if project_root is not None else None
     memory_client = (
         MemoryClient(MemoryStore(memory_dir or memory_home())) if memory else None
     )
@@ -1103,6 +1599,21 @@ async def serve_stdio(
     # 记忆是平铺的 memory.json，对话按会话分文件放在 sessions/ 下。
     data_root = memory_home() if memory_dir is None else Path(memory_dir).expanduser()
     history_store = SessionHistoryStore(data_root / SESSION_SUBDIR) if history else None
+    # 面板里填过的模型配置（settings.json，与记忆 / 存档同一个数据目录）。**在开会话之前**注入
+    # 环境变量：LLMConfig.from_env() 是模型配置的唯一事实源，而它读的就是环境变量。
+    # 文件坏了只报一句就往下走 —— 为这个不让人用面板，比"退回只用环境变量"更糟。
+    settings_store = SettingsStore(data_root)
+    try:
+        injected = settings_store.apply_to_env()
+    except SettingsError as err:
+        print(f"[{SERVER_NAME}] 模型配置读不了，这次只用环境变量：{err}", file=sys.stderr, flush=True)
+        injected = []
+    if injected:
+        print(
+            f"[{SERVER_NAME}] 已用面板里存的模型配置：{', '.join(injected)}",
+            file=sys.stderr,
+            flush=True,
+        )
     # 智能体清单也落在这份数据目录里：内置那几项 + agents/ 下用户自己写的 md。
     agent_catalog = AgentCatalog(data_root / AGENTS_SUBDIR if agents_dir is None else agents_dir)
     extra: list[Any] = []
@@ -1116,6 +1627,9 @@ async def serve_stdio(
         extra.append(local_files)
     if memory_client is not None:
         extra.append(memory_client)
+    if projects is not None:
+        # 两张只读工具（查项目有什么、一部剧到什么程度）：模型据此接话，但不许替人建项目。
+        extra.append(ProjectsClient(projects))
     hub = McpHub(configs, request_timeout=request_timeout, extra_clients=extra)
     await hub.start()
     host: StudioHost | None = None
@@ -1133,6 +1647,8 @@ async def serve_stdio(
             history=history_store,
             agents=agent_catalog,
             novels=novels,
+            projects=projects,
+            settings=settings_store,
         )
         # stdin 一关（面板退出）就先叫停在飞的轮次，别让退出卡在长任务上。
         host.server.on_close = lambda: host.cancel_turns("宿主退出")

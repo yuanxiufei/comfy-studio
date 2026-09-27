@@ -486,8 +486,10 @@ def _en_safe(s: str) -> str:
     本闸的作用是把"**兜底失败**"从"静默夹中文"变成"**省略该词**"（不写胜过写无效内容）。
     词表里没有的词，应走 `OCCUPATION_EN` 补词，或由 LLM 翻译。
     """
+    from .generic import has_cjk
+
     t = tr(s or "")
-    return "" if re.search(r"[\u4e00-\u9fa5]", t) else t
+    return "" if has_cjk(t) else t
 
 
 def _en_name(card: AssetCard) -> str:
@@ -503,8 +505,10 @@ def _en_name(card: AssetCard) -> str:
     也挡不住用户给的中文真名如「艾米丽」）。
     现在判据更本质：**名字里有没有中文**。
     """
+    from .generic import has_cjk
+
     n = (card.name or "").strip()
-    return "" if re.search(r"[\u4e00-\u9fa5]", n) else n
+    return "" if has_cjk(n) else n
 
 
 def _scene_tail_block(rules, sd) -> str:
@@ -806,9 +810,11 @@ def build_prompts(card: AssetCard, rules, *, failures: list[str] | None = None
         # ⚠️ 原文该块是**中英双写**的；生图用英文行 → 只取不含中文的项，
         #    否则会把整段中文负面词塞进英文 negative。
         if card.layout_variant == "panorama360":
+            from .generic import has_cjk
+
             for t in (rules.panorama.get("negative") or "").split(","):
                 t = t.strip()
-                if t and not any("\u4e00" <= ch <= "\u9fff" for ch in t) and t not in neg:
+                if t and not has_cjk(t) and t not in neg:
                     neg = f"{neg}, {t}"
 
     # 表情 / 动作：追加库 §三 产线规范里的固定负面词

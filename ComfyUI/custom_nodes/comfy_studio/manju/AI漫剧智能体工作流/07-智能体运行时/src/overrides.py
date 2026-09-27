@@ -132,7 +132,9 @@ class Overrides:
             #    图像模型直接忽略（约束静默失效，比报错更难发现）。
             #    只提醒、不拦截 —— 也可能是有意为之（如给中文平台的版本）。
             if target in ("extra", "layout"):
-                cn = [ch for ch in text if "\u4e00" <= ch <= "\u9fff"]
+                from .generic import cjk_chars
+
+                cn = cjk_chars(text)
                 if cn:
                     self.problems.append(
                         f"{p.name}：内容含 {len(cn)} 个中文字符（{''.join(cn[:10])}…）—— "

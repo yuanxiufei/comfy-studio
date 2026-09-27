@@ -4,6 +4,8 @@
 
 ``novels/list``     原文目录里有哪些小说（名字、大小、改于何时）
 ``novels/read``     读一篇的正文（按字符分页，一页页往下翻）
+``novels/chapters`` 把一篇切成章节（面板左栏那棵目录树，点一章跳到那一章）
+``novels/search``   在原文里找一串字，回它出现的位置（面板据此跳过去）
 ``novels/import``   把本机一份 txt/md 接进原文目录（导入第一本时会把目录建出来）
 ``novels/delete``   删掉一篇（面板先问一次再调它）
 
@@ -33,7 +35,9 @@ from __future__ import annotations
 
 import codecs
 import os
+import re
 import shutil
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -65,6 +69,33 @@ MAX_LIST_LIMIT = 1000
 #: 判编码时最多看解出来的多少个字。乱码与正常中文的区别，开头一小段就足够看出来，
 #: 没必要为了判它把几十兆的整篇再扫一遍。
 SNIFF_CHARS = 64 * 1024
+
+#: 整篇解好的正文缓存几篇。翻页、看目录、搜索都要整篇解码，而一篇六兆多的原文每翻一页重解
+#: 一遍就是几秒的卡顿；缓存换篇时把旧的丢掉，别把书库长期占在内存里。
+#: 键里带 (路径, 大小, 改于何时)：文件被外面改了（编辑、重导一份）就自然失效，不会给出旧内容。
+CACHE_MAX_ENTRIES = 2
+
+#: 章节标题长什么样：**整行基本就是一个标题**才算。正文里"第 3 章里说过"这种句子极常见，
+#: 不要求"整行独占"就会切出一堆假章节，那种目录比没有目录更没用。
+#: 认的是中文网文里最常见的几种写法（第X章/节/回/卷/集 + 可选标题，另有 Chapter N）。
+CHAPTER_RE = re.compile(
+    r"^(?:第\s*[0-9０-９零〇一二三四五六七八九十百千万两]{1,12}\s*[章节回卷篇集]"
+    r"|Chapter\s+[0-9]{1,4}\b)"
+    r"[\s:：.、\-—－]*[^\n，。！？；：]{0,30}$",
+    re.IGNORECASE,
+)
+
+#: 标题行最长多少个字。超出这个长度就不像标题，而像"以'第一章'开头的一整段正文"。
+CHAPTER_TITLE_CHARS = 60
+
+#: 目录默认最多给几章、最多能给几章（两万章够长篇小说用了）。
+DEFAULT_CHAPTER_LIMIT = 5000
+MAX_CHAPTER_LIMIT = 20000
+
+#: 搜索默认最多回几处、最多能回几处，以及每处给前后各多少个字做上下文。
+DEFAULT_SEARCH_LIMIT = 100
+MAX_SEARCH_LIMIT = 1000
+SEARCH_WINDOW = 24
 
 #: 解出来的字里"不像正文"的（控制符、私用区、代理区）超过这个比例就判为乱码 —— 只看得见的
 #: 三种，认不出的码位（Python 的解码器不会往外吐）不在其中。留得很紧：正常中文原文里这些字符
@@ -114,6 +145,18 @@ def _cjk_ratio(text: str) -> float:
         ):
             cjk += 1
     return cjk / len(text)
+
+
+def _snippet(text: str, start: int, end: int, window: int = SEARCH_WINDOW) -> str:
+    """命中处前后那一段（给面板显示用）：折掉换行，两头该省略的地方标出来。
+
+    这种片段是给"这条是不是我要找的"看的，所以宁可两头都带一点上下文，
+    也不要把命中处裁到只剩几个字。
+    """
+    left = max(0, start - window)
+    right = min(len(text), end + window)
+    piece = text[left:right].replace("\r", " ").replace("\n", " ").strip()
+    return ("…" if left > 0 else "") + piece + ("…" if right < len(text) else "")
 
 
 def decode_text(raw: bytes, name: str) -> tuple[str, str]:
@@ -187,6 +230,8 @@ class NovelLibrary:
         # 目录还不存在是**合法状态**：这个检出从没导入过原文，或者干脆不是这份仓库。
         # 那不是"出错"，是"这里还没有书"——面板据此说人话（见 :meth:`list`）。
         self.directory = Path(directory).expanduser().resolve()
+        #: 最近解好的正文（LRU，见 :data:`CACHE_MAX_ENTRIES`）：翻页、看目录、搜索共用它。
+        self._cache: OrderedDict[tuple[str, int, int], tuple[str, str]] = OrderedDict()
 
     # ---- list -----------------------------------------------------------
 
@@ -287,12 +332,9 @@ class NovelLibrary:
                 f"{MAX_TEXT_BYTES / 1024 / 1024:.0f} MB：用编辑器看原文，或先切成几篇"
             )
 
-        try:
-            raw = path.read_bytes()
-        except OSError as err:
-            raise NovelsError(f"读不了 {path}: {err}") from err
-        # 编码是判出来的（见 decode_text）：中文网文多是 GB18030，只认 UTF-8 等于读不了用户的书。
-        text, encoding = decode_text(raw, name)
+        # 编码是判出来的（见 decode_text），整篇解一次之后还会被缓存住（见 _text）：
+        # 中文网文多是 GB18030，只认 UTF-8 等于读不了用户的书。
+        text, encoding = self._text(path, name)
 
         total = len(text)
         start = min(offset, total)
@@ -311,6 +353,112 @@ class NovelLibrary:
             "next_offset": next_offset,
             "at_end": next_offset >= total,
             "text": window,
+        }
+
+    # ---- chapters -------------------------------------------------------
+
+    def chapters(self, name: str, limit: int = DEFAULT_CHAPTER_LIMIT) -> dict[str, Any]:
+        """把一篇切成章节：面板左栏那棵目录树。
+
+        切法就是 :data:`CHAPTER_RE` 那条 —— **整行基本是个标题**才算一章，所以正文里提到
+        "第 3 章"的地方不会变成分界。标题一条都没认出来时，整篇算一章并在 ``message`` 里
+        说明白：硬凑一份目录，比直说"这篇切不出来"更耽误人。
+
+        每章带 ``offset``：面板拿它直接调 :meth:`read`，跳章就是跳字符。
+        """
+        if limit < 1:
+            raise NovelsError(f"limit 不能小于 1，给的是 {limit}")
+        path = self._resolve(name)
+        if not path.is_file():
+            raise NovelsError(f"原文目录里没有这一篇: {name}")
+        text, encoding = self._text(path, name)
+        total = len(text)
+
+        found: list[dict[str, Any]] = []
+        offset = 0
+        for line in text.splitlines(keepends=True):
+            stripped = line.strip()
+            if stripped and len(stripped) <= CHAPTER_TITLE_CHARS and CHAPTER_RE.match(stripped):
+                found.append({"title": stripped, "offset": offset})
+            offset += len(line)
+
+        heads = found
+        if found:
+            # 第一章之前通常还有书名、作者、简介：单独给一条，免得那段文字没有入口跳过去。
+            if found[0]["offset"] > 0:
+                heads = [{"title": "开头（章节之前）", "offset": 0}] + found
+        else:
+            heads = [{"title": "全文", "offset": 0}]
+
+        window = heads[:limit]
+        chapters: list[dict[str, Any]] = []
+        for index, head in enumerate(window):
+            start = head["offset"]
+            # 末章的结尾就是全篇结尾：拿"下一章的开头"当结尾，等于把它自己的标题也算进去。
+            end = window[index + 1]["offset"] if index + 1 < len(window) else total
+            chapters.append(
+                {
+                    "index": index + 1,
+                    "title": head["title"],
+                    "offset": start,
+                    "chars": max(0, end - start),
+                }
+            )
+        return {
+            "name": name,
+            "path": str(path),
+            "encoding": encoding,
+            "total_chars": total,
+            "count": len(heads),
+            "returned": len(chapters),
+            "truncated": len(heads) > limit,
+            "limit": limit,
+            "chapters": chapters,
+            "message": "" if found else "这篇没切出章节（整行标题一条也没认出来）：按页码翻，或搜一串字跳过去",
+        }
+
+    # ---- search ---------------------------------------------------------
+
+    def search(
+        self, name: str, needle: str, limit: int = DEFAULT_SEARCH_LIMIT
+    ) -> dict[str, Any]:
+        """在原文里找一串字，回它出现的位置（面板点一下就跳到那儿）。
+
+        只看字面，不分词、不忽略大小写：用户是从记得的那句话里挑几个字来跳转的，
+        把"张 三"当"张三"、或把大小写当同一回事，都会给出他没要的位置。
+        """
+        query = str(needle)
+        if query.strip() == "":
+            raise NovelsError("要搜的字符串不能是空白")
+        if limit < 1:
+            raise NovelsError(f"limit 不能小于 1，给的是 {limit}")
+        if limit > MAX_SEARCH_LIMIT:
+            raise NovelsError(f"limit 最多 {MAX_SEARCH_LIMIT}，给的是 {limit}")
+        path = self._resolve(name)
+        if not path.is_file():
+            raise NovelsError(f"原文目录里没有这一篇: {name}")
+        text, encoding = self._text(path, name)
+
+        hits: list[dict[str, Any]] = []
+        start = 0
+        while len(hits) < limit:
+            at = text.find(query, start)
+            if at < 0:
+                break
+            hits.append({"offset": at, "snippet": _snippet(text, at, at + len(query))})
+            start = at + len(query)
+        # 还要再试着找一处，才知道是"就这么多"还是"被 limit 截了"：多扫一次比谎报总数便宜。
+        truncated = bool(hits) and len(hits) >= limit and text.find(query, start) >= 0
+        return {
+            "name": name,
+            "path": str(path),
+            "encoding": encoding,
+            "total_chars": len(text),
+            "query": query,
+            "matched": len(hits),
+            "truncated": truncated,
+            "limit": limit,
+            "matches": hits,
         }
 
     # ---- import ---------------------------------------------------------
@@ -409,6 +557,39 @@ class NovelLibrary:
 
     # ---- 内部 -----------------------------------------------------------
 
+    def _text(self, path: Path, name: str) -> tuple[str, str]:
+        """整篇解好的正文，回 ``(text, 编码)``。翻页、目录、搜索都从这里拿。
+
+        解一遍要几百毫秒到几秒（得把整篇读完再判编码），而用户是一页一页翻的 —— 所以
+        最近读过的几篇留着（:data:`CACHE_MAX_ENTRIES`）。缓存键里带 (路径, 大小, 改于何时)：
+        文件被外面改了（编辑、重导一份）就自然失效，不会拿旧内容糊弄人。
+        上面那条大小线也在这里判：目录、搜索与分页走同一个门，免得"能翻页却搜不了"。
+        """
+        try:
+            info = path.stat()
+        except OSError as err:
+            raise NovelsError(f"读不了 {path}: {err}") from err
+        if info.st_size > MAX_TEXT_BYTES:
+            raise NovelsError(
+                f"{path.name} 有 {info.st_size / 1024 / 1024:.1f} MB，超过面板翻页的上限 "
+                f"{MAX_TEXT_BYTES / 1024 / 1024:.0f} MB：用编辑器看原文，或先切成几篇"
+            )
+
+        key = (str(path), info.st_size, info.st_mtime_ns)
+        hit = self._cache.get(key)
+        if hit is not None:
+            self._cache.move_to_end(key)
+            return hit
+        try:
+            raw = path.read_bytes()
+        except OSError as err:
+            raise NovelsError(f"读不了 {path}: {err}") from err
+        text, encoding = decode_text(raw, name)
+        self._cache[key] = (text, encoding)
+        while len(self._cache) > CACHE_MAX_ENTRIES:
+            self._cache.popitem(last=False)
+        return text, encoding
+
     def _resolve(self, name: str) -> Path:
         """把面板给的名字（``list`` 里那一列）还原成目录里的路径，并挡住越界。
 
@@ -432,17 +613,25 @@ class NovelLibrary:
 
 
 __all__ = [
+    "CACHE_MAX_ENTRIES",
+    "CHAPTER_RE",
+    "CHAPTER_TITLE_CHARS",
     "CJK_RATIO",
+    "DEFAULT_CHAPTER_LIMIT",
     "DEFAULT_LIST_LIMIT",
     "DEFAULT_READ_CHARS",
+    "DEFAULT_SEARCH_LIMIT",
     "GARBAGE_RATIO",
     "MANJU_REL",
+    "MAX_CHAPTER_LIMIT",
     "MAX_LIST_LIMIT",
     "MAX_READ_CHARS",
+    "MAX_SEARCH_LIMIT",
     "MAX_TEXT_BYTES",
     "NOVEL_SUBDIR",
     "NovelLibrary",
     "NovelsError",
+    "SEARCH_WINDOW",
     "SNIFF_CHARS",
     "TEXT_SUFFIXES",
     "decode_text",

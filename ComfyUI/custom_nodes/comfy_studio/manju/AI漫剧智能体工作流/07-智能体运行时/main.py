@@ -30,7 +30,7 @@ except Exception:
     pass
 
 from src import (batch, dispatcher, handover, module_loader,  # noqa: E402
-                 prompt_engine, registry)
+                 project, prompt_engine, registry)
 from src.agent import AgentConfig, DramaAssetAgent            # noqa: E402
 from src.consistency import check_required, check_text_risk   # noqa: E402
 from src.module_loader import ModuleLoader                    # noqa: E402
@@ -460,6 +460,48 @@ def _agent(name: str):
 
 
 # ─────────────────────────────────────────────────────────────
+# 项目管理（建项目 / 列项目 / 体检）
+# ─────────────────────────────────────────────────────────────
+
+def cmd_project(a: argparse.Namespace) -> int:
+    """项目管理：按规范建项目落点、列项目、体检。
+
+    落点清单与体检判据都在 `src/project.py`（唯一事实源），本函数只管打印。
+    """
+    try:
+        if a.action == "list":
+            hr("📁 项目")
+            root = project.projects_root()
+            print(f"  项目根：{root or '⚠️ 未探测到 projects/（设 VOIDE_PROJECTS_ROOT 指）'}")
+            for n in project.list_projects():
+                lack = project.scan_project(n)["missing"]
+                mark = f"⚠️ 缺 {len(lack)} 个落点" if lack else "✅ 落点齐"
+                print(f"  · {n:<20s} {mark}")
+            return 0
+
+        if not a.name:
+            print("❌ 要指定项目名：python main.py project new <项目名>")
+            return 2
+
+        if a.action == "check":
+            res = project.scan_project(a.name)
+            hr(f"🩺 项目体检 · {os.path.basename(res['path'])}")
+            print(project.format_report(res))
+            return 1 if res["missing"] else 0
+
+        hr(f"🏗️ {'预演（不落盘）' if a.dry else '新建'}项目 · {a.name}")
+        project.create_project(a.name, episodes=a.episodes,
+                               upgrade=a.upgrade, dry=a.dry)
+        if not a.dry:
+            print("\n下一步：填 00_PROJECT/07_素材归档/素材来源登记.md"
+                  "（原著授权是 BLOCKING 项，决定这片子能不能做）")
+        return 0
+    except project.ProjectError as e:
+        print(f"❌ {e}")
+        return 2
+
+
+# ─────────────────────────────────────────────────────────────
 # 全流程编排（小说 → 成片）
 # ─────────────────────────────────────────────────────────────
 
@@ -770,6 +812,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("doctor", help="环境自检")
 
+    # ── 项目管理（建项目 / 列项目 / 体检）──
+    pj = sub.add_parser("project", help="项目管理：建项目落点 / 列项目 / 体检",
+                        description="按 `08-项目管理/项目目录规范.md` 建全套落点与预置空表，"
+                                    "并体检「缺哪个落点 / 哪一阶段还没产物」。"
+                                    "新建项目**不覆盖任何已有文件**（幂等）。")
+    pj.add_argument("action", choices=["new", "list", "check"],
+                    help="new 按规范建项目 · list 列出项目 · check 落点与产物体检")
+    pj.add_argument("name", nargs="?", help="项目名（new / check 必给；也可给路径）")
+    pj.add_argument("--集数", dest="episodes", type=int, default=12,
+                    help="new：本剧集数（写进入口文件，默认 12）")
+    pj.add_argument("--升级", dest="upgrade", action="store_true",
+                    help="new：目标已存在时只补**缺的**落点与空表（不覆盖已有文件）")
+    pj.add_argument("--预演", dest="dry", action="store_true",
+                    help="new：只打印会建什么，不落盘")
+
     # ── 全流程编排 ──
     fl = sub.add_parser("flow", help="全流程：小说 → 剧本 → 资产 → 分镜 → 首帧 → 出片 → 成片",
                         description="一条流水线跑完 S0–S5。默认从「分镜」往后跑"
@@ -858,7 +915,7 @@ def main() -> int:
     if argv[0] not in ("ask", "probe", "batch", "panorama", "angles", "verify",
                        "drift", "list", "show", "rules", "export", "doctor",
                        "agents", "outline", "run", "init", "route", "handover",
-                       "gate", "doc", "flow", "-h", "--help"):
+                       "gate", "doc", "flow", "project", "-h", "--help"):
         argv = ["ask"] + argv
     a = parser.parse_args(argv)
     fn = {"ask": cmd_ask, "probe": cmd_probe, "batch": cmd_batch,
@@ -867,7 +924,8 @@ def main() -> int:
           "rules": cmd_rules, "export": cmd_export, "doctor": cmd_doctor,
           "agents": cmd_agents, "outline": cmd_outline, "run": cmd_run,
           "init": cmd_init, "route": cmd_route, "handover": cmd_handover,
-          "gate": cmd_gate, "doc": cmd_doc, "flow": cmd_flow}
+          "gate": cmd_gate, "doc": cmd_doc, "flow": cmd_flow,
+          "project": cmd_project}
     if not a.cmd:
         parser.print_help()
         return 0

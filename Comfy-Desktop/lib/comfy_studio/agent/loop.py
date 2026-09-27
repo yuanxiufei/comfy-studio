@@ -186,8 +186,16 @@ class AgentSession:
             raise AgentError("模型名不能是空字符串")
         if name == self.model:
             return self.model
+        return await self.use_config(replace(self.llm.config, model=name))
+
+    async def use_config(self, config: LLMConfig) -> str:
+        """整套配置换掉（地址 / 密钥 / 模型），**同一个会话、历史保留**。
+
+        面板上把地址或密钥改了之后走的就是这条：只换模型名的话（:meth:`use_model`）新客户端
+        会继承旧地址 —— 用户明明改了地址，看到的还是一模一样的失败，那种错最难查。
+        """
         previous = self.llm
-        self.llm = OpenAIChatClient(replace(previous.config, model=name))
+        self.llm = OpenAIChatClient(config)
         await previous.close()
         return self.model
 

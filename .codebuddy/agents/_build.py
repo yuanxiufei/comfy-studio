@@ -22,17 +22,50 @@
 工作流那套**与本仓库的代码联动**（ID 分配 / 一致性 Gate / 漂移检测由代码判）。
 
 ═══════════════════════════════════════════════════════════════════
+文件名有两种形态 —— **别用「带模块号」反推谁主谁次**
+═══════════════════════════════════════════════════════════════════
+| 文件名形态 | 是什么 | 谁维护 | 自动可调用 |
+|---|---|---|---|
+| `manju-0N-<职责>.md` | **联动型**：规则**只给路径**，确定性步骤调 `07-智能体运行时` 的代码 | 手写（不归本文件管） | 00 / 02 / 04 / 06 |
+| `manju-<职责>.md` | **移植型**：规则**全文内联**、自包含 | ⭐ **本文件生成** | 01 / 03 / 05 |
+
+⚠️ **带模块号 ≠ 该模块的自动入口**（反直觉，已实测踩过）：
+`manju-01-script` / `manju-03-storyboard` / `manju-05-audio` 都是 `manual` ——
+它们那个模块的**自动**入口是另一个**不带号**的移植型（两者职责重叠，
+若同时参与自动调用，同一句话会走两条路、产出不确定）。
+
+判「谁是自动入口」**只看每个文件的 `agentMode` 字段**（`agentic` = 自动）。
+唯一名册在 `AI漫剧智能体工作流/07-智能体运行时/tests/test_agents.py` 的 `EXPECTED_AUTO` ——
+新增/移动自动入口必须改那张表，测试会红。
+
+═══════════════════════════════════════════════════════════════════
+源规格有**两个**派生落点，本脚本一起管
+═══════════════════════════════════════════════════════════════════
+| 派生落点 | 谁读它 | 同步方式 |
+|---|---|---|
+| `.codebuddy/agents/manju-<职责>.md`（6 个移植型 agent） | CodeBuddy 主 Agent | 加一层 frontmatter，**正文逐字**（:func:`render`） |
+| `Comfy-Desktop/lib/comfy_studio/agent/presets/`（6 份快照） | 宿主的 `agent/catalog.py`（面板下拉） | **按字节**复制（:func:`sync_presets`） |
+
+⚠️ 两个落点**都必须跟上**，否则症状是"规则改了、实际部署的却没变"，而且不报错：
+前者靠 `tests/test_agents.py` 的「生成物 == 重算」抓，后者靠同文件里那条**逐字对拍**抓。
+所以不把它们留在"记得手复制"那一步 —— 改源 → 跑本脚本，两个落点一次到位。
+
+═══════════════════════════════════════════════════════════════════
 用法
 ═══════════════════════════════════════════════════════════════════
-    python .codebuddy/agents/_build.py            # 重新生成 6 个智能体
-    python .codebuddy/agents/_build.py --预览      # 只看清单，不写文件
+    python .codebuddy/agents/_build.py                # 生成 6 个智能体 + 同步宿主侧预置
+    python .codebuddy/agents/_build.py --预览          # 只看清单，一个字都不写
+    python .codebuddy/agents/_build.py --不同步预置     # 只更 agent，不动宿主那份快照
 
 校验：`python AI漫剧智能体工作流/07-智能体运行时/tests/test_agents.py`
+（宿主侧那一层另有一套：`cd Comfy-Desktop/lib` 后跑
+`python -m unittest comfy_studio.tests.test_agents_tools`）
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import re
 import sys
 from pathlib import Path
@@ -46,6 +79,15 @@ REPO_ROOT = HERE.parent.parent                     # comfy-studio 仓库根（wo
 MANJU_REL = "ComfyUI/custom_nodes/comfy_studio/manju"
 ROOT = REPO_ROOT / MANJU_REL                       # 漫剧数据根
 SRC_DIR = ROOT / "智能体搭建参考md"
+
+# ⚠️ 第二个派生落点：宿主侧的**随包预置快照**。这条相对落点在 `presets/README.md` 与
+#    07 的 `tests/test_agents.py` 里各有一份同源声明 —— 改布局时三处一起改。
+#    为什么由本脚本同步（而不是"记得手动复制"）：宿主包必须自带正文（它随桌面壳分发、
+#    cwd 是壳自带的 lib，猜不到用户的 ComfyUI 装在哪），而"改了源规格、面板下拉里还是旧
+#    人设"这件事**不报错、不复现**；唯一哨兵是 07 里那条逐字对拍，却要先有人想起来去跑。
+HOST_AGENT_REL = "Comfy-Desktop/lib/comfy_studio/agent"
+PRESETS = REPO_ROOT / HOST_AGENT_REL / "presets"    # 6 份规格快照（派生物）
+CATALOG = REPO_ROOT / HOST_AGENT_REL / "catalog.py"  # 宿主侧清单 PRESET_AGENTS 就在这份里
 
 # ⚠️ `description` 是**主 Agent 决定何时调用你**的唯一依据（官方文档），
 #    故每条都必须写清「**当…时使用**」。不要写成 "一个有用的助手"。
@@ -166,10 +208,55 @@ def build_one(item: dict, preview: bool) -> tuple[str, int, int]:
     return item["name"], n, secs
 
 
+def sync_presets(preview: bool) -> tuple[list[str], list[str]]:
+    """把 6 份源规格**按字节**同步到宿主侧随包预置目录。
+
+    返回 ``(本次同步的, 本来就是一致的)`` 两组文件名。
+
+    ⚠️ 必须走 `read_bytes` / `write_bytes`，**不要**用文本模式：宿主侧那条对拍比的是
+    **字节**（07 的 `test_agents.py` 里是 `read_bytes() == read_bytes()`），文本模式会
+    按平台把行尾换掉，于是"同步成功"却把对拍判红 —— 那是最难想通的一种失败。
+    """
+    synced: list[str] = []
+    same: list[str] = []
+    for item in SOURCES:
+        data = (SRC_DIR / item["src"]).read_bytes()      # 源不存在时这里就抛，不静默跳过
+        dst = PRESETS / item["src"]
+        if dst.is_file() and dst.read_bytes() == data:
+            same.append(item["src"])
+            continue
+        if not preview:
+            PRESETS.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(data)
+        synced.append(item["src"])
+    return synced, same
+
+
+def preset_filenames() -> set[str]:
+    """从宿主 `catalog.py` 里读出 ``PRESET_AGENTS`` 登记的文件名集合。
+
+    ⚠️ 用 `ast` 解析而不是 `import`：那是宿主包里的模块（相对导入、还牵着别的宿主模块），
+       单文件导入会失败；而这个检查不该以"宿主包能不能被导入"为前提。
+
+    为什么要在这里查一遍：预置的**目录**与宿主清单的**登记**是两份东西，
+    对不上时那个智能体会从面板下拉里**静默消失** —— 宿主侧自己的测试能抓，但它属于
+    另一个包、另一套跑法；在"改源 + 生成"的同一条路上顺手查掉，人工就少一个漏点。
+    """
+    tree = ast.parse(CATALOG.read_text(encoding="utf-8"))
+    for node in tree.body:
+        targets = [node.target] if isinstance(node, ast.AnnAssign) else getattr(node, "targets", [])
+        if not any(getattr(t, "id", None) == "PRESET_AGENTS" for t in targets):
+            continue
+        return {el.elts[3].value for el in node.value.elts}
+    raise LookupError(f"{CATALOG} 里找不到 PRESET_AGENTS")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="移植 智能体搭建参考md → CodeBuddy 子智能体")
     ap.add_argument("--预览", dest="preview", action="store_true",
                     help="只打印清单，不写文件")
+    ap.add_argument("--不同步预置", dest="no_sync", action="store_true",
+                    help="只更新 .codebuddy/agents/，不动宿主侧那份快照（默认会一并同步）")
     a = ap.parse_args()
 
     print(f"  源目录：{SRC_DIR}")
@@ -188,8 +275,48 @@ def main() -> int:
     auto = sum(1 for it in SOURCES if it["mode"] == "agentic")
     print(f"  自动可调用 {auto} 个 · 手动 {len(SOURCES) - auto} 个"
           f"（自动入口须与联动型一起对上「自动入口名册」，见 test_agents.py）")
-    print(f"  校验：python AI漫剧智能体工作流/07-智能体运行时/tests/test_agents.py")
-    return 0
+
+    # ── 派生落点之二：宿主侧随包预置快照（面板下拉读的就是它）──
+    print()
+    print("── 同步宿主侧随包预置（Comfy-Desktop/lib/comfy_studio/agent/presets/）──")
+    rc = 0
+    if a.no_sync:
+        print("  ··  --不同步预置：跳过（宿主侧那份**仍是旧内容**，改了源规格就得补跑）")
+    else:
+        synced, same = sync_presets(a.preview)
+        if synced:
+            verb = "待同步" if a.preview else "已同步"
+            for name in synced:
+                print(f"  ✅ {verb} {name}")
+            if same:
+                print(f"  ··  其余 {len(same)} 份本来就是一致的")
+        else:
+            print(f"  ✅ {len(same)} 份快照与源规格逐字节一致（无需同步）")
+
+    # ── 宿主侧清单有没有登记这 6 份（没登记 = 下拉里静默少一项）──
+    print()
+    print("── 宿主侧清单 PRESET_AGENTS 是否登记了这 6 份 ──")
+    try:
+        listed = preset_filenames()
+    except Exception as exc:                                    # noqa: BLE001
+        print(f"  ❌ 读不出 PRESET_AGENTS：{exc}")
+        rc = 1
+    else:
+        want = {it["src"] for it in SOURCES}
+        only_src, only_cat = sorted(want - listed), sorted(listed - want)
+        if only_src or only_cat:
+            print(f"  ❌ 不一致：清单里缺 {only_src}；清单里多 {only_cat}")
+            print(f"     修法：改 {CATALOG} 的 PRESET_AGENTS"
+                  "（id / 下拉显示名 / 说明 / 包内文件名的四项一组）")
+            rc = 1
+        else:
+            print(f"  ✅ {len(listed)} 份都登记了（与源规格同名）")
+
+    print()
+    print("  校验（源侧）：python AI漫剧智能体工作流/07-智能体运行时/tests/test_agents.py")
+    print("  校验（宿主侧）：cd Comfy-Desktop/lib && python -m unittest "
+          "comfy_studio.tests.test_agents_tools")
+    return rc
 
 
 if __name__ == "__main__":

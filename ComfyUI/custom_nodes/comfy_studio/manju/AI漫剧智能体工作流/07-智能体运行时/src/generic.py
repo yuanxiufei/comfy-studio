@@ -239,7 +239,30 @@ def _first(lst: list[str], default: str = "") -> str:
     return lst[0] if lst else default
 
 
-_HAS_CJK = re.compile(r"[\u4e00-\u9fa5]")
+_CJK_RE = re.compile(r"[\u4e00-\u9fa5]")
+
+
+def has_cjk(s: str) -> bool:
+    """**全项目唯一的「有没有中文」判据**。
+
+    ⚠️ 2026-09-27 之前这个判据有**三份**：本模块的 `_HAS_CJK`，加上
+    `prompt_engine.py` 里 `_en_safe()` 与 `_en_name()` **各自内联**的
+    `re.search(r"[\\u4e00-\\u9fa5]", …)`。三处写同一件事，改一处必漏两处
+    （同一个"中文漏进英文 prompt"的问题本项目已反复踩过 7 次）。
+    现统一到本函数；`prompt_engine` 侧改为函数内 `from .generic import has_cjk`
+    （不能顶层 import —— 本模块要调用它的 `tr()`，顶层会成环）。
+    """
+    return bool(_CJK_RE.search(s or ""))
+
+
+def cjk_chars(s: str) -> list[str]:
+    """取出文本里**所有中文字符**（原序，不去重）。
+
+    与 `has_cjk()` 同源 —— 用在需要**取证**的地方（报错得说清是哪几个字），
+    例如 `agent.py` 的「英文提示词无中文残留」、`overrides.py` 的覆盖层校验。
+    2026-09-27 之前这两处各自内联了 `"\\u4e00" <= ch <= "\\u9fff"` 的逐字比较。
+    """
+    return [ch for ch in (s or "") if _CJK_RE.match(ch)]
 
 
 def tr_safe(cn: str, generic_en: str) -> tuple[str, bool]:
@@ -248,10 +271,15 @@ def tr_safe(cn: str, generic_en: str) -> tuple[str, bool]:
     ⚠️ `tr()` 只认识词表里的词 —— 词表外的词它会**原样返回中文**。
     实测：`MATERIALS` 扩容前「丝」不在表里，`material_en = tr('丝') = '丝'`
     → 英文 prompt 又夹了中文（第 7 次同款的变体）。故所有"经 tr 进英文"的值都过这道闸。
+
+    ★ 与 `safe_en()` 的分工（两者都在"防中文进英文"，**不是重复实现**）：
+      · 本函数 —— 值**来自受控词表**（材质 / 颜色 / 配饰），**先查词表再验**；
+      · `safe_en()` —— 值**来自用户自由原话**（`抽取` 出来的名词短语），
+        **不查词表**（原话翻不准，宁可用通用英文 + 标记 `需补英文` 交给 LLM 精修）。
     """
     from .prompt_engine import tr
     t = tr(cn or "")
-    if not t or _HAS_CJK.search(t):
+    if not t or has_cjk(t):
         return generic_en, bool(cn)
     return t, False
 
@@ -265,13 +293,17 @@ def safe_en(cn: str, generic_en: str) -> tuple[str, bool]:
         `LAYOUT: ... the architecture of **废弃医院** (per the input)`
     —— 英文 prompt 里夹中文会被多数图像模型忽略（约束静默失效）。
 
+    ★ 与 `tr_safe()` 的分工见后者的 docstring：**本函数故意不查词表**，
+    因为入参是用户自由原话抽出来的词（如「密-码本」「废-弃医院」），
+    词表查不到就查不到，与其猜一个近似的词表值，不如用通用英文 + 标记交给 LLM。
+
     :return: `(英文短语, 是否需要补英文)`
              含中文时**不拼进英文**，改用与题材无关的英文表述，并标记需要补英文
              （配了 LLM 时由精修步骤翻译；也可在资产卡/本机覆盖层里手工补）。
     """
     if not cn:
         return generic_en, False
-    if _HAS_CJK.search(cn):
+    if has_cjk(cn):
         return generic_en, True
     return cn, False
 
@@ -279,7 +311,7 @@ def safe_en(cn: str, generic_en: str) -> tuple[str, bool]:
 def _en_of(words: list[str], generic_en: str) -> tuple[str, bool]:
     """取第一个**可安全进英文**的词；全含中文则回退通用英文并标记。"""
     for w in words:
-        if not _HAS_CJK.search(w):
+        if not has_cjk(w):
             return w, False
     return generic_en, bool(words)
 

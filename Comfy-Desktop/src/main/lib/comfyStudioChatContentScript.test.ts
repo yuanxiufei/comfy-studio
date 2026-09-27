@@ -13,6 +13,7 @@ const AGENT_ID = 'comfy-desktop-studio-chat-agent'
 const SESSION_ID = 'comfy-desktop-studio-chat-session'
 const SESSION_NEW_ID = 'comfy-desktop-studio-chat-session-new'
 const SESSION_CLOSE_ID = 'comfy-desktop-studio-chat-session-close'
+const SESSION_RESET_ID = 'comfy-desktop-studio-chat-session-reset'
 const STORAGE_ID = 'comfy-desktop-studio-chat-storage'
 const TABS_ID = 'comfy-desktop-studio-chat-tabs'
 const CHAT_VIEW_ID = 'comfy-desktop-studio-chat-view'
@@ -23,6 +24,43 @@ const NOVEL_FORM_ID = 'comfy-desktop-studio-novel-form'
 const NOVEL_PATH_ID = 'comfy-desktop-studio-novel-path'
 const NOVEL_READER_ID = 'comfy-desktop-studio-novel-reader'
 const NOVEL_PAGER_ID = 'comfy-desktop-studio-novel-pager'
+const NOVEL_SIDE_ID = 'comfy-desktop-studio-novel-side'
+const NOVEL_SIDE_LIST_ID = 'comfy-desktop-studio-novel-side-list'
+const NOVEL_SEARCH_ID = 'comfy-desktop-studio-novel-search'
+const NOVEL_TOC_ID = 'comfy-desktop-studio-novel-toc'
+const NOVEL_TOC_BACK_ID = 'comfy-desktop-studio-novel-toc-back'
+const QUOTE_BAR_ID = 'comfy-desktop-studio-quote-bar'
+const PROJECT_VIEW_ID = 'comfy-desktop-studio-project-view'
+const PROJECT_HINT_ID = 'comfy-desktop-studio-project-hint'
+const PROJECT_FORM_ID = 'comfy-desktop-studio-project-form'
+const PROJECT_FORM_NAME_ID = 'comfy-desktop-studio-project-form-name'
+const PROJECT_FORM_EPISODES_ID = 'comfy-desktop-studio-project-form-episodes'
+const PROJECT_FORM_NOVEL_ID = 'comfy-desktop-studio-project-form-novel'
+const PROJECT_FORM_UPGRADE_ID = 'comfy-desktop-studio-project-form-upgrade'
+const PROJECT_LIST_ID = 'comfy-desktop-studio-project-list'
+const PROJECT_HEAD_ID = 'comfy-desktop-studio-project-head'
+const PROJECT_SHELVES_ID = 'comfy-desktop-studio-project-shelves'
+const PROJECT_READER_ID = 'comfy-desktop-studio-project-reader'
+const PROJECT_PAGER_ID = 'comfy-desktop-studio-project-pager'
+const PROJECT_FIND_ID = 'comfy-desktop-studio-project-find'
+const PROJECT_FIND_COUNT_ID = 'comfy-desktop-studio-project-find-count'
+const PROJECT_OVERVIEW_ID = 'comfy-desktop-studio-project-overview'
+const PROJECT_FILE_FIND_ID = 'comfy-desktop-studio-project-file-find'
+const PROJECT_FILE_FIND_COUNT_ID = 'comfy-desktop-studio-project-file-find-count'
+const PROJECT_FILE_FIND_PREV_ID = 'comfy-desktop-studio-project-file-find-prev'
+const PROJECT_FILE_FIND_NEXT_ID = 'comfy-desktop-studio-project-file-find-next'
+const PROJECT_FILE_FIND_CLEAR_ID = 'comfy-desktop-studio-project-file-find-clear'
+const SKILL_ID = 'comfy-desktop-studio-chat-skill'
+const SKILL_RUN_ID = 'comfy-desktop-studio-chat-skill-run'
+const FIND_ID = 'comfy-desktop-studio-chat-find'
+const FIND_COUNT_ID = 'comfy-desktop-studio-chat-find-count'
+const FIND_PREV_ID = 'comfy-desktop-studio-chat-find-prev'
+const FIND_NEXT_ID = 'comfy-desktop-studio-chat-find-next'
+const FIND_CLEAR_ID = 'comfy-desktop-studio-chat-find-clear'
+const NOVEL_BATCH_ID = 'comfy-desktop-studio-novel-batch'
+const NOVEL_BATCH_ALL_ID = 'comfy-desktop-studio-novel-batch-all'
+const NOVEL_BATCH_NONE_ID = 'comfy-desktop-studio-novel-batch-none'
+const NOVEL_BATCH_DELETE_ID = 'comfy-desktop-studio-novel-batch-delete'
 
 interface StudioBridge {
   status: ReturnType<typeof vi.fn>
@@ -48,10 +86,32 @@ describe('getComfyStudioChatContentScript', () => {
     `
   }
 
-  /** Catalog the picker reads on open; a per-method stub can override it. */
+  /**
+   * Catalog the picker reads on open; a per-method stub can override it.
+   *
+   * 宿主 agent/models 的形状是**按来源分组**的：`groups` 里一组一条源，下拉里 option 的值
+   * 是「来源::模型名」（换源等于换地址+密钥，只发模型名会把请求发去错的那一家）。顶层的
+   * `models` / `source` / `error` 说的仍是主源那一组，宿主照样发着，这里一并给全。
+   */
   const catalog = (models: string[], current: string, error: string | null = null): unknown => ({
     ok: true,
-    result: { current, models, source: error ? 'config' : 'endpoint', error }
+    result: {
+      current,
+      current_source: 'default',
+      models,
+      source: error ? 'config' : 'endpoint',
+      error,
+      groups: [
+        {
+          source: 'default',
+          label: '127.0.0.1:11434',
+          models,
+          origin: error ? 'config' : 'endpoint',
+          error
+        }
+      ],
+      extra_error: null
+    }
   })
 
   /** `agent/agents` 的回包；`extra` 用来塞 missing / problems / error 这些边角。 */
@@ -120,6 +180,17 @@ describe('getComfyStudioChatContentScript', () => {
 
   const rows = (kind: string): Element[] =>
     Array.from(document.querySelectorAll(`#${LOG_ID} [data-kind="${kind}"]`))
+
+  // 用户那一行里躺着两个按钮（复制 / 改一下，见面板 userActions）：说"这个气泡里说的话是哪句"，
+  // 得先把动作条摘掉 —— 不摘读到的是「复制改一下」缀在话尾巴上。面板自己也这么摘
+  // （findRowText）。
+  const saidOf = (row: Element | null | undefined): string => {
+    if (!row) return ''
+    const copy = row.cloneNode(true) as Element
+    copy.querySelector('.cs-user-actions')?.remove()
+    return copy.textContent ?? ''
+  }
+  const said = (kind: string): string[] => rows(kind).map((row) => saidOf(row))
 
   beforeEach(() => {
     vi.useFakeTimers()
@@ -226,7 +297,7 @@ describe('getComfyStudioChatContentScript', () => {
       text: '帮我把这张图放大两倍',
       session_id: 'default'
     })
-    expect(rows('user').map((r) => r.textContent)).toEqual(['帮我把这张图放大两倍'])
+    expect(said('user')).toEqual(['帮我把这张图放大两倍'])
     expect(rows('assistant').map((r) => r.textContent)).toEqual(['答案在此'])
     const input = document.getElementById(INPUT_ID) as HTMLTextAreaElement
     expect(input.value, 'composer is cleared after sending').toBe('')
@@ -297,7 +368,7 @@ describe('getComfyStudioChatContentScript', () => {
       expect(bridge.request).toHaveBeenCalledWith('agent/history', { session_id: 'default' })
       const log = document.getElementById(LOG_ID)
       expect(log?.firstElementChild?.textContent).toBe('上次的对话（存在这台机器上）')
-      expect(rows('user').map((r) => r.textContent)).toEqual(['帮我把这张图放大两倍'])
+      expect(said('user')).toEqual(['帮我把这张图放大两倍'])
       expect(rows('assistant').map((r) => r.textContent)).toEqual(['先查一下可用的 skill', '已经好了'])
       expect(rows('assistant')[0]?.getAttribute('data-variant')).toBe('intermediate')
       expect(rows('assistant')[1]?.getAttribute('data-variant')).toBe('final')
@@ -360,7 +431,7 @@ describe('getComfyStudioChatContentScript', () => {
 
       const asked = bridge.request.mock.calls.filter((call) => call[0] === 'agent/history')
       expect(asked, 'history is only worth asking for an empty drawer').toHaveLength(1)
-      expect(rows('user').map((r) => r.textContent)).toEqual(['上次问的', '这一轮问的'])
+      expect(said('user')).toEqual(['上次问的', '这一轮问的'])
     })
   })
 
@@ -474,7 +545,7 @@ describe('getComfyStudioChatContentScript', () => {
       setupDom()
       new Function(script)()
       await openPanel()
-      expect(rows('user').map((r) => r.textContent)).toEqual(['这张图放大两倍'])
+      expect(said('user')).toEqual(['这张图放大两倍'])
 
       picker().value = 'chat-2'
       picker().dispatchEvent(new Event('change'))
@@ -483,7 +554,7 @@ describe('getComfyStudioChatContentScript', () => {
       expect(state().session).toBe('chat-2')
       const asked = bridge.request.mock.calls.filter((call) => call[0] === 'agent/history')
       expect(asked[asked.length - 1]).toEqual(['agent/history', { session_id: 'chat-2' }])
-      expect(rows('user').map((r) => r.textContent)).toEqual(['赛博朋克海报'])
+      expect(said('user')).toEqual(['赛博朋克海报'])
       // 换过来画的是**这一段**，不是"上次的"：标签得跟着变，别让人以为串了。
       expect(rows('agent')[0]?.textContent).toBe('这一段对话（存在这台机器上）')
     })
@@ -522,7 +593,7 @@ describe('getComfyStudioChatContentScript', () => {
       setupDom()
       new Function(script)()
       await openPanel()
-      expect(rows('user').map((r) => r.textContent)).toEqual(['这是 default 的话'])
+      expect(said('user')).toEqual(['这是 default 的话'])
 
       picker().value = 'chat-3'
       picker().dispatchEvent(new Event('change'))
@@ -531,14 +602,14 @@ describe('getComfyStudioChatContentScript', () => {
       picker().dispatchEvent(new Event('change'))
       await flush()
       expect(state().session).toBe('chat-2')
-      expect(rows('user').map((r) => r.textContent)).toEqual(['这是 chat-2 的话'])
+      expect(said('user')).toEqual(['这是 chat-2 的话'])
 
       // 迟到的 chat-3 现在回来了：不许画。
       parked.forEach((resolve) =>
         resolve({ ok: true, result: { entries: [{ type: 'user', text: '这是 chat-3 的话' }] } })
       )
       await flush()
-      expect(rows('user').map((r) => r.textContent)).toEqual(['这是 chat-2 的话'])
+      expect(said('user')).toEqual(['这是 chat-2 的话'])
       expect(rows('agent').map((r) => r.textContent)).toEqual(['这一段对话（存在这台机器上）'])
     })
 
@@ -706,7 +777,7 @@ describe('getComfyStudioChatContentScript', () => {
       await flush()
 
       expect(state().session).toBe('default')
-      expect(rows('user').map((r) => r.textContent)).toEqual(['关掉前说的话'])
+      expect(said('user')).toEqual(['关掉前说的话'])
     })
 
     it('asks again before dropping a conversation when there is no archive', async () => {
@@ -777,6 +848,141 @@ describe('getComfyStudioChatContentScript', () => {
       expect(select.disabled).toBe(true)
       expect(add.disabled).toBe(true)
       expect(close.disabled).toBe(true)
+    })
+
+    it('clears this conversation only after a second click, and says what it erased', async () => {
+      const bridge = installBridge({
+        request: (method: string): unknown => {
+          if (method === 'agent/reset') {
+            return { ok: true, result: { session_id: 'default', reset: true, history_cleared: true } }
+          }
+          return { ok: true, result: { text: '答案在此' } }
+        }
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await send('这句待会儿要被清掉')
+
+      const reset = document.getElementById(SESSION_RESET_ID) as HTMLButtonElement
+      expect(reset.textContent, '跟「关掉」并排，得让人一眼分得清').toBe('清空')
+
+      reset.click()
+      await flush()
+
+      // 第一下只是问一句：清空连存档一起抹，撤不回来。
+      expect(
+        bridge.request.mock.calls.filter((call) => call[0] === 'agent/reset'),
+        '还只是问了一句'
+      ).toHaveLength(0)
+      expect(document.getElementById(STATUS_ID)?.textContent).toContain('撤不回来')
+      expect(rows('user'), '没真清之前屏上的话一个字都不能少').toHaveLength(1)
+
+      reset.click()
+      await flush()
+
+      expect(bridge.request).toHaveBeenCalledWith('agent/reset', { session_id: 'default' })
+      // 屏上那些行现在是"已经不存在的话"，留着就是给一段空对话背书。
+      expect(rows('user')).toHaveLength(0)
+      expect(document.getElementById(STATUS_ID)?.textContent).toBe(
+        '已清空这一段：说过的话连存档一起抹掉了'
+      )
+      expect(rows('error')).toHaveLength(0)
+    })
+
+    it('says so when clearing had nothing to erase', async () => {
+      installBridge({
+        request: (method: string): unknown => {
+          if (method === 'agent/reset') {
+            return { ok: true, result: { session_id: 'default', reset: false, history_cleared: false } }
+          }
+          return { ok: true, result: { text: '答案在此' } }
+        }
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      document.getElementById(SESSION_RESET_ID)?.click()
+      await flush()
+      document.getElementById(SESSION_RESET_ID)?.click()
+      await flush()
+
+      // 两个字段都是 false：内存里没这一段、磁盘上也没东西可删。别报成"已清空"。
+      expect(document.getElementById(STATUS_ID)?.textContent).toBe('这一段本来就空着，没什么可清的')
+    })
+
+    it('says the archive was the only thing left when history is off', async () => {
+      installBridge({
+        request: (method: string): unknown => {
+          if (method === 'agent/reset') {
+            return { ok: true, result: { session_id: 'default', reset: true, history_cleared: false } }
+          }
+          return { ok: true, result: { text: '答案在此' } }
+        }
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      document.getElementById(SESSION_RESET_ID)?.click()
+      await flush()
+      document.getElementById(SESSION_RESET_ID)?.click()
+      await flush()
+
+      expect(document.getElementById(STATUS_ID)?.textContent).toBe(
+        '已清空这一段：它没有存档，只清了内存里这一份'
+      )
+    })
+
+    it('reports a failed clear instead of pretending the screen is empty', async () => {
+      installBridge({
+        request: (method: string): unknown => {
+          if (method === 'agent/reset') {
+            return { ok: false, error: { code: 'EIO', message: '存档删不掉' } }
+          }
+          return { ok: true, result: { text: '答案在此' } }
+        }
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await send('这句话还在')
+
+      document.getElementById(SESSION_RESET_ID)?.click()
+      await flush()
+      document.getElementById(SESSION_RESET_ID)?.click()
+      await flush()
+
+      expect(document.getElementById(STATUS_ID)?.textContent).toBe('这一段没清掉')
+      expect(rows('error')).toHaveLength(1)
+      expect(rows('user'), '没清成就不能把屏上的话抹掉').toHaveLength(1)
+    })
+
+    it('takes the armed clear back when the drawer is reopened', async () => {
+      const bridge = installBridge({
+        request: (): unknown => ({
+          ok: true,
+          result: { session_id: 'default', reset: true, history_cleared: true }
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      document.getElementById(SESSION_RESET_ID)?.click()
+      await flush()
+      await openPanel() // 关
+      await openPanel() // 再开
+
+      document.getElementById(SESSION_RESET_ID)?.click()
+      await flush()
+
+      expect(
+        bridge.request.mock.calls.filter((call) => call[0] === 'agent/reset'),
+        '隔了半天再点一下，不该把一段对话清掉'
+      ).toHaveLength(0)
+      expect(document.getElementById(STATUS_ID)?.textContent).toContain('撤不回来')
     })
   })
 
@@ -1153,9 +1359,136 @@ describe('getComfyStudioChatContentScript', () => {
 
     expect(request.mock.calls[0]?.[0]).toBe('agent/models')
     const picker = document.getElementById(MODEL_ID) as HTMLSelectElement
-    expect(Array.from(picker.options).map((o) => o.value)).toEqual(['a:3b', 'b:7b'])
-    expect(picker.value, 'current model is preselected').toBe('b:7b')
+    expect(Array.from(picker.options).map((o) => o.value)).toEqual([
+      'default::a:3b',
+      'default::b:7b'
+    ])
+    expect(picker.value, 'current model is preselected').toBe('default::b:7b')
     expect(picker.disabled).toBe(false)
+  })
+
+  it('keeps each model source in a group of its own, and switches the one that was picked', async () => {
+    // 本机 Ollama 与云端 DeepSeek 并列：两串模型名混在一列里，用户分不清哪个要花钱。
+    const request = vi.fn((method: string, params: unknown) => {
+      if (method === 'agent/models') {
+        return {
+          ok: true,
+          result: {
+            current: 'deepseek-v4-pro',
+            current_source: 'DeepSeek',
+            models: ['qwen2.5:7b'],
+            source: 'endpoint',
+            error: null,
+            groups: [
+              {
+                source: 'default',
+                label: '127.0.0.1:11434',
+                models: ['qwen2.5:7b'],
+                origin: 'endpoint',
+                error: null
+              },
+              {
+                source: 'DeepSeek',
+                label: 'DeepSeek',
+                models: ['deepseek-v4-pro', 'deepseek-flash'],
+                origin: 'endpoint',
+                error: null
+              }
+            ],
+            extra_error: null
+          }
+        }
+      }
+      if (method === 'agent/model') {
+        return {
+          ok: true,
+          result: {
+            model: 'qwen2.5:7b',
+            changed: true,
+            applied: [],
+            skipped: [],
+            params
+          }
+        }
+      }
+      return { ok: true, result: { text: '答案在此' } }
+    })
+    installBridge({ request })
+    setupDom()
+    new Function(script)()
+    await openPanel()
+
+    const picker = document.getElementById(MODEL_ID) as HTMLSelectElement
+    expect(Array.from(picker.querySelectorAll('optgroup')).map((g) => g.label)).toEqual([
+      '127.0.0.1:11434',
+      'DeepSeek'
+    ])
+    expect(Array.from(picker.options).map((o) => o.value)).toEqual([
+      'default::qwen2.5:7b',
+      'DeepSeek::deepseek-v4-pro',
+      'DeepSeek::deepseek-flash'
+    ])
+    expect(picker.value, 'the model in use is selected, not the first one listed').toBe(
+      'DeepSeek::deepseek-v4-pro'
+    )
+
+    picker.value = 'default::qwen2.5:7b'
+    picker.dispatchEvent(new Event('change'))
+    await flush()
+
+    expect(request).toHaveBeenCalledWith('agent/model', { model: 'default::qwen2.5:7b' })
+    expect(document.getElementById(STATUS_ID)?.textContent).toContain('qwen2.5:7b')
+    expect(picker.value, 'the picker stays on the source that was picked').toBe(
+      'default::qwen2.5:7b'
+    )
+  })
+
+  it('says which source could not hand over a model list, and keeps the others', async () => {
+    const request = vi.fn(() => ({
+      ok: true,
+      result: {
+        current: 'a:3b',
+        current_source: 'default',
+        models: ['a:3b'],
+        source: 'endpoint',
+        error: null,
+        groups: [
+          {
+            source: 'default',
+            label: '127.0.0.1:11434',
+            models: ['a:3b'],
+            origin: 'endpoint',
+            error: null
+          },
+          {
+            source: 'DeepSeek',
+            label: 'DeepSeek',
+            models: [],
+            origin: 'config',
+            error: '连不上 https://api.deepseek.com/v1/models: boom'
+          }
+        ],
+        extra_error: null
+      }
+    }))
+    installBridge({ request })
+    setupDom()
+    new Function(script)()
+    await openPanel()
+
+    const picker = document.getElementById(MODEL_ID) as HTMLSelectElement
+    expect(Array.from(picker.options).map((o) => o.value), 'the broken source is not dropped').toEqual(
+      ['default::a:3b']
+    )
+    // 坏掉的那家照样画在分组里（点不了），标题上写清是它、为什么 —— 悄悄抹掉的话，
+    // 用户只会以为自己刚配的那一家没生效，然后反复改它。
+    const broken = Array.from(picker.querySelectorAll('optgroup')).find(
+      (g) => g.label === 'DeepSeek'
+    )
+    expect(broken, 'the source that failed is still listed').toBeTruthy()
+    expect(broken?.title).toContain('boom')
+    expect(picker.title).toContain('DeepSeek')
+    expect(picker.title).toContain('没给模型列表')
   })
 
   it('switches the model through the host and reports it in the status line', async () => {
@@ -1170,13 +1503,14 @@ describe('getComfyStudioChatContentScript', () => {
     await openPanel()
 
     const picker = document.getElementById(MODEL_ID) as HTMLSelectElement
-    picker.value = 'b:7b'
+    picker.value = 'default::b:7b'
     picker.dispatchEvent(new Event('change'))
     await flush()
 
-    expect(request).toHaveBeenCalledWith('agent/model', { model: 'b:7b' })
+    // 发的是整串：宿主靠它决定换哪条源的地址与密钥
+    expect(request).toHaveBeenCalledWith('agent/model', { model: 'default::b:7b' })
     expect(document.getElementById(STATUS_ID)?.textContent).toContain('b:7b')
-    expect(picker.value).toBe('b:7b')
+    expect(picker.value, 'after the switch the picker still knows the source').toBe('default::b:7b')
     expect(picker.disabled).toBe(false)
     expect(rows('error'), 'a successful switch must not paint an error').toHaveLength(0)
   })
@@ -1193,11 +1527,11 @@ describe('getComfyStudioChatContentScript', () => {
     await openPanel()
 
     const picker = document.getElementById(MODEL_ID) as HTMLSelectElement
-    picker.value = 'b:7b'
+    picker.value = 'default::b:7b'
     picker.dispatchEvent(new Event('change'))
     await flush()
 
-    expect(picker.value, 'selection falls back to the model actually in use').toBe('a:3b')
+    expect(picker.value, 'selection falls back to the model actually in use').toBe('default::a:3b')
     expect(rows('error').map((r) => r.textContent)).toEqual([
       '切换模型失败: 没有这个模型（错误码 -32602）'
     ])
@@ -1220,8 +1554,11 @@ describe('getComfyStudioChatContentScript', () => {
     await openPanel()
 
     const picker = document.getElementById(MODEL_ID) as HTMLSelectElement
-    expect(Array.from(picker.options).map((o) => o.value)).toEqual(['only:1'])
-    expect(picker.title).toContain('服务端没给模型列表')
+    expect(Array.from(picker.options).map((o) => o.value)).toEqual(['default::only:1'])
+    // 这份桩是老宿主的形状（没有 groups）：退回主源那一组，组名就是主源的源名。
+    // 提示语要说清"是哪一家 + 为什么"，只说其中一半，用户不知道该改地址、改密钥还是重启。
+    expect(picker.title).toContain('default')
+    expect(picker.title).toContain('没给模型列表')
     expect(picker.title).toContain('boom')
   })
 
@@ -1903,6 +2240,224 @@ describe('getComfyStudioChatContentScript', () => {
     expect(planCards()).toHaveLength(0)
   })
 
+  describe('说过的话：复制 / 改一下 / 在这一段里找字', () => {
+    const findBox = (): HTMLInputElement => document.getElementById(FIND_ID) as HTMLInputElement
+    const findCount = (): HTMLElement => document.getElementById(FIND_COUNT_ID) as HTMLElement
+    /** 被标上的行。只有"说过的话"参与，所以工具卡、错误行不在这儿。 */
+    const hitRows = (): HTMLElement[] =>
+      Array.from(document.querySelectorAll<HTMLElement>(`#${LOG_ID} [data-hit]`))
+    const saidRow = (index = 0): Element | undefined => rows('user')[index]
+    const actionButton = (text: string, row: Element | undefined = saidRow()): HTMLButtonElement =>
+      Array.from(row?.querySelectorAll('button') ?? []).find((b) => b.textContent === text) as HTMLButtonElement
+    /** 敲进找字框里（面板听的是 input 事件，不是 change）。 */
+    const typeFind = (query: string): void => {
+      const box = findBox()
+      box.value = query
+      box.dispatchEvent(new Event('input'))
+    }
+    const keyFind = (key: string, shiftKey = false): void => {
+      findBox().dispatchEvent(new KeyboardEvent('keydown', { key, shiftKey }))
+    }
+
+    it('offers copy and 改一下 on my lines, and only on mine', async () => {
+      installBridge()
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await send('帮我起个标题')
+
+      expect(
+        Array.from(saidRow()?.querySelectorAll('.cs-user-actions button') ?? []).map((b) => b.textContent)
+      ).toEqual(['复制', '改一下'])
+      // 模型说的话没有"改一下"这回事：宿主没有"改掉某一条历史"的口子（agent/chat 只接一段话）。
+      expect(rows('assistant')[0]?.querySelector('.cs-user-actions')).toBeNull()
+    })
+
+    it('puts my line back in the composer when I ask to change it', async () => {
+      const bridge = installBridge()
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await send('帮我起个标题')
+
+      actionButton('改一下').click()
+      await flush()
+
+      expect((document.getElementById(INPUT_ID) as HTMLTextAreaElement).value).toBe('帮我起个标题')
+      expect(document.getElementById(STATUS_ID)?.textContent, '得说清这不是改历史').toContain('另起一轮')
+      expect(said('user'), '原来那一轮还留在这段对话里').toEqual(['帮我起个标题'])
+      expect(
+        bridge.request.mock.calls.filter((call: unknown[]) => call[0] === 'agent/chat'),
+        '面板不替人把改完的话发出去'
+      ).toHaveLength(1)
+    })
+
+    describe('把这一段拷到剪贴板', () => {
+      afterEach(() => {
+        Reflect.deleteProperty(navigator, 'clipboard')
+      })
+
+      it('copies the line, and says so on the button for a while', async () => {
+        const writeText = vi.fn(() => Promise.resolve())
+        Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
+        installBridge()
+        setupDom()
+        new Function(script)()
+        await openPanel()
+        await send('拷我这一段')
+
+        const copy = actionButton('复制')
+        copy.click()
+        await flush()
+
+        expect(writeText).toHaveBeenCalledWith('拷我这一段')
+        expect(copy.textContent).toBe('已复制')
+
+        await vi.advanceTimersByTimeAsync(2000)
+        expect(copy.textContent, '两秒后自己回到「复制」').toBe('复制')
+      })
+
+      it('selects the words and says why when the clipboard refuses the write', async () => {
+        // 沙箱里的 webview 不许写剪贴板时就是这样：接口在，writeText 直接打回失败。
+        const writeText = vi.fn(() => Promise.reject(new Error('NotAllowedError')))
+        Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
+        installBridge()
+        setupDom()
+        new Function(script)()
+        await openPanel()
+        await send('拷我这一段')
+
+        const copy = actionButton('复制')
+        copy.click()
+        await flush()
+
+        expect(writeText).toHaveBeenCalledWith('拷我这一段')
+        expect(copy.textContent, '没拷上就不许说「已复制」').toBe('复制')
+        expect(document.getElementById(STATUS_ID)?.textContent).toContain('Ctrl+C')
+        expect(document.getElementById(STATUS_ID)?.getAttribute('data-tone')).toBe('error')
+        // 补救：那一段得真的被选亮，人才按得动 Ctrl+C（选的是话本身，不含动作条）。
+        const selection = window.getSelection()
+        expect(selection?.rangeCount).toBe(1)
+        expect(selection?.getRangeAt(0).toString()).toBe('拷我这一段')
+      })
+    })
+
+    it('finds a phrase in this conversation, walking and wrapping between the hits', async () => {
+      installBridge()
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await send('雪落下来')
+      await send('又一场雪')
+
+      typeFind('雪')
+      await flush()
+
+      expect(findCount().textContent).toBe('1/2 处')
+      expect(hitRows()).toHaveLength(2)
+      expect(hitRows()[0]?.dataset.hit).toBe('current')
+      expect(hitRows()[1]?.dataset.hit, '命中了但不是当前那一处').toBe('true')
+
+      document.getElementById(FIND_NEXT_ID)?.click()
+      expect(findCount().textContent).toBe('2/2 处')
+      expect(hitRows()[1]?.dataset.hit).toBe('current')
+
+      document.getElementById(FIND_NEXT_ID)?.click()
+      expect(findCount().textContent, '到最后一处再往下就绕回第一处').toBe('1/2 处')
+
+      document.getElementById(FIND_PREV_ID)?.click()
+      expect(findCount().textContent, '在第一处往上就绕回最后一处').toBe('2/2 处')
+
+      keyFind('Enter')
+      expect(findCount().textContent).toBe('1/2 处')
+      keyFind('Enter', true)
+      expect(findCount().textContent).toBe('2/2 处')
+
+      document.getElementById(FIND_CLEAR_ID)?.click()
+      expect(findCount().textContent).toBe('')
+      expect(hitRows(), '清空时标记一起摘掉').toHaveLength(0)
+      expect(findBox().value).toBe('')
+
+      typeFind('没这一串字')
+      expect(findCount().textContent).toBe('没找到')
+      expect(findCount().dataset.tone).toBe('error')
+
+      keyFind('Escape')
+      expect(findBox().value).toBe('')
+      expect(findCount().textContent).toBe('')
+    })
+
+    it('searches what was said, not the buttons on the line', async () => {
+      installBridge()
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await send('随便一句')
+
+      // 每一行自己那条动作条上就写着"复制"，连它一起找的话每一行都会命中。
+      typeFind('复制')
+
+      expect(findCount().textContent).toBe('没找到')
+    })
+
+    it('counts the hits again when the conversation grows', async () => {
+      installBridge()
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await send('雪落下来')
+
+      typeFind('雪')
+      expect(findCount().textContent).toBe('1/1 处')
+
+      await send('又一场雪')
+
+      expect(findCount().textContent, '刚发的那一句也得算进来').toBe('1/2 处')
+      expect(hitRows()).toHaveLength(2)
+    })
+
+    it('puts the failed round back in the composer', async () => {
+      installBridge({ request: { ok: false, error: { code: -32603, message: '模型没配' } } })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      await send('这句话别丢')
+
+      expect(rows('error')).toHaveLength(1)
+      expect((document.getElementById(INPUT_ID) as HTMLTextAreaElement).value).toBe('这句话别丢')
+      expect(document.getElementById(STATUS_ID)?.textContent).toContain('还回输入框')
+      expect(document.getElementById(STATUS_ID)?.getAttribute('data-tone')).toBe('error')
+    })
+
+    it('leaves what I have typed since alone when a slow round fails', async () => {
+      let fail: (value: unknown) => void = () => {}
+      installBridge({
+        request: (method: string): unknown =>
+          method === 'agent/chat'
+            ? new Promise((resolve) => {
+                fail = resolve
+              })
+            : { ok: true, result: { text: '答案在此' } }
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      const input = document.getElementById(INPUT_ID) as HTMLTextAreaElement
+      input.value = '第一句'
+      document.getElementById(SEND_ID)?.click()
+      await flush()
+
+      input.value = '我已经在写第二句了'
+      fail({ ok: false, error: { message: '宿主忙' } })
+      await flush()
+
+      expect(input.value, '覆盖掉刚写的更糟，那就一个字都别动').toBe('我已经在写第二句了')
+      expect(document.getElementById(STATUS_ID)?.textContent).toBe('这一轮失败了')
+    })
+  })
+
   describe('管理小说', () => {
     /** 原文目录是宿主给的（见 lib/comfy_studio/novels.py）：面板一个路径都不拼，只照着用。 */
     const novelDir = 'D:/comfy/custom_nodes/comfy_studio/manju/novel'
@@ -1964,6 +2519,79 @@ describe('getComfyStudioChatContentScript', () => {
       tab('管理小说')?.click()
       await flush()
     }
+
+    const sideList = (): HTMLElement => view(NOVEL_SIDE_LIST_ID)
+    const sideRows = (): HTMLElement[] =>
+      Array.from(document.querySelectorAll<HTMLElement>(`#${NOVEL_SIDE_LIST_ID} .cs-novel-side-row`))
+    /** 第几行。列表里没有那么多行时直接炸出来 —— 断言里少了一行不该静默地变成 undefined。 */
+    const sideRow = (index: number): HTMLElement => {
+      const row = sideRows()[index]
+      if (!row) throw new Error(`左栏里没有第 ${index} 行`)
+      return row
+    }
+    /** 一行里第一个 span 是标题（搜索结果那几行没有 span：整行就是一段上下文）。 */
+    const sideTitles = (): (string | null)[] =>
+      sideRows().map((row) => row.querySelector('span')?.textContent ?? null)
+
+    /** 宿主 novels/chapters 的回包：两章。第二段从第 5000 字起 —— 跳章跳的就是这个数。 */
+    const chapterList = (over: Record<string, unknown> = {}): unknown => ({
+      ok: true,
+      result: {
+        name: '长夜.txt',
+        encoding: 'utf-8',
+        total_chars: 9000,
+        count: 2,
+        returned: 2,
+        truncated: false,
+        limit: 5000,
+        message: '',
+        chapters: [
+          { index: 1, title: '第一章 雪', offset: 0, chars: 5000 },
+          { index: 2, title: '第二章 火', offset: 5000, chars: 4000 }
+        ],
+        ...over
+      }
+    })
+
+    /** 宿主 novels/read 的**一段**（引用要的就是一段）：位置与长度照参数回。 */
+    const sliceAt = (offset: number, chars: number, text?: string): unknown => ({
+      ok: true,
+      result: {
+        name: '长夜.txt',
+        offset,
+        chars,
+        requested_chars: chars,
+        total_chars: 9000,
+        at_end: offset + chars >= 9000,
+        bytes: 2048,
+        mtime: 1758900000,
+        encoding: 'utf-8',
+        text: text === undefined ? '原文' + offset + '-' + chars : text
+      }
+    })
+
+    /** 把 novels/read 接成"照参数回一段"：正文那种整页读法也走它。 */
+    const readsOnDemand = (text?: string): RequestStub => (_method: string, params: unknown) => {
+      const asked = (params ?? {}) as { offset?: number; chars?: number }
+      return sliceAt(asked.offset ?? 0, asked.chars ?? 0, text)
+    }
+
+    /** 宿主 novels/read 的一页：把 offset 写进正文，好在断言里认出跳到了哪儿。 */
+    const readAt = (offset: number): unknown => ({
+      ok: true,
+      result: {
+        name: '长夜.txt',
+        offset,
+        chars: 4000,
+        requested_chars: 4000,
+        total_chars: 9000,
+        at_end: offset >= 5000,
+        bytes: 2048,
+        mtime: 1758900000,
+        encoding: 'utf-8',
+        text: '第 ' + offset + ' 字'
+      }
+    })
 
     it('only asks the host for novels once that page is opened', async () => {
       const bridge = installBridge({ request: host({ 'novels/list': listing([]) }) })
@@ -2286,13 +2914,2110 @@ describe('getComfyStudioChatContentScript', () => {
       await openPanel()
       await openNovels()
 
-      lineButton('长夜.txt', '拿去对话')?.click()
+      lineButton('长夜.txt', '发到对话')?.click()
 
       expect(view(CHAT_VIEW_ID).style.display).toBe('flex')
       expect(view(NOVEL_VIEW_ID).style.display).toBe('none')
       const input = document.getElementById(INPUT_ID) as HTMLTextAreaElement
       expect(input.value).toBe('用原文「长夜.txt」开工')
       expect(novelCalls(bridge, 'agent/chat'), '发不发由用户自己按').toHaveLength(0)
+    })
+
+    it('cuts the novel into chapters and jumps to the chapter that was clicked', async () => {
+      const bridge = installBridge({
+        request: host({
+          'novels/list': listing([novelRow()]),
+          'novels/chapters': chapterList(),
+          'novels/read': (_method: string, params: unknown) =>
+            readAt((params as { offset: number }).offset)
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openNovels()
+
+      expect(view(NOVEL_SIDE_ID).dataset.open, '还没打开哪一篇，左栏没有意义').toBe('0')
+
+      lineButton('长夜.txt', '读')?.click()
+      await flush()
+
+      expect(bridge.request).toHaveBeenCalledWith('novels/chapters', { name: '长夜.txt' })
+      expect(view(NOVEL_SIDE_ID).dataset.open).toBe('1')
+      expect(sideTitles()).toEqual(['第一章 雪', '第二章 火'])
+      expect(sideRow(0).dataset.current, '正读的是第一章').toBe('true')
+      expect(sideRow(1).dataset.current).toBeUndefined()
+
+      // 点第二章：位置由宿主给（章里那个 offset），面板一个数都不自己算。
+      sideRow(1).click()
+      await flush()
+
+      expect(bridge.request).toHaveBeenCalledWith('novels/read', {
+        name: '长夜.txt',
+        offset: 5000
+      })
+      expect(view(NOVEL_READER_ID).textContent).toBe('第 5000 字')
+      expect(sideRow(1).dataset.current).toBe('true')
+      expect(sideRow(0).dataset.current, '标记是挪过去，不是又多一个').toBeUndefined()
+
+      // 翻页也要把标记挪回去：不然读完第二章，目录里还指着第二章。
+      button(NOVEL_PAGER_ID, '上一页')?.click()
+      await flush()
+
+      expect(view(NOVEL_READER_ID).textContent).toBe('第 1000 字')
+      expect(sideRow(0).dataset.current).toBe('true')
+      expect(sideRow(1).dataset.current).toBeUndefined()
+    })
+
+    it('finds a phrase in the open novel and jumps to a hit', async () => {
+      const bridge = installBridge({
+        request: host({
+          'novels/list': listing([novelRow()]),
+          'novels/chapters': chapterList(),
+          'novels/search': (_method: string, params: unknown) => ({
+            ok: true,
+            result: {
+              name: '长夜.txt',
+              query: (params as { query: string }).query,
+              matched: 1,
+              truncated: false,
+              limit: 100,
+              matches: [{ offset: 4321, snippet: '…他想起那一夜…' }]
+            }
+          }),
+          'novels/read': (_method: string, params: unknown) =>
+            readAt((params as { offset: number }).offset)
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openNovels()
+
+      lineButton('长夜.txt', '读')?.click()
+      await flush()
+
+      const input = document.getElementById(NOVEL_SEARCH_ID) as HTMLInputElement
+      input.value = ' 那一夜 '
+      button(NOVEL_SIDE_ID, '找')?.click()
+      await flush()
+
+      // 原样搜，连首尾空格都不动：宿主那边只看字面（novels.py），面板"顺手" trim 一下
+      // 就会给出一个用户没要的位置。
+      expect(bridge.request).toHaveBeenCalledWith('novels/search', {
+        name: '长夜.txt',
+        query: ' 那一夜 '
+      })
+      expect(sideRows()).toHaveLength(1)
+      expect(sideRow(0).textContent, '片段是宿主给的，面板不自己裁正文').toBe('…他想起那一夜…')
+      expect(view(NOVEL_SIDE_ID).querySelector('.cs-novel-side-title')?.textContent).toContain('1 处')
+      expect(
+        document.getElementById(NOVEL_TOC_BACK_ID)?.style.display,
+        '搜索结果这一屏才有「返回目录」'
+      ).not.toBe('none')
+
+      sideRow(0).click()
+      await flush()
+
+      expect(bridge.request).toHaveBeenCalledWith('novels/read', {
+        name: '长夜.txt',
+        offset: 4321
+      })
+      expect(view(NOVEL_READER_ID).textContent).toBe('第 4321 字')
+
+      document.getElementById(NOVEL_TOC_BACK_ID)?.click()
+      await flush()
+
+      expect(sideTitles()).toEqual(['第一章 雪', '第二章 火'])
+      expect(document.getElementById(NOVEL_TOC_BACK_ID)?.style.display).toBe('none')
+    })
+
+    it('keeps an empty search local instead of asking the host for nothing', async () => {
+      const bridge = installBridge({
+        request: host({ 'novels/list': listing([novelRow()]), 'novels/chapters': chapterList() })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openNovels()
+
+      lineButton('长夜.txt', '读')?.click()
+      await flush()
+
+      const input = document.getElementById(NOVEL_SEARCH_ID) as HTMLInputElement
+      input.value = '   '
+      button(NOVEL_SIDE_ID, '找')?.click()
+      await flush()
+
+      expect(novelCalls(bridge, 'novels/search'), '搜空白宿主也会报错，别白跑一趟').toHaveLength(0)
+      expect(hintLine().textContent).toContain('不能是空的')
+      expect(hintLine().getAttribute('data-tone')).toBe('error')
+      // 还没开始找，目录照旧摆在那儿。
+      expect(sideTitles()).toEqual(['第一章 雪', '第二章 火'])
+    })
+
+    it('hides the side column on request, and does not re-cut what it already has', async () => {
+      const bridge = installBridge({
+        request: host({
+          'novels/list': listing([novelRow()]),
+          'novels/chapters': chapterList(),
+          'novels/read': (_method: string, params: unknown) =>
+            readAt((params as { offset: number }).offset)
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openNovels()
+
+      lineButton('长夜.txt', '读')?.click()
+      await flush()
+
+      const toc = document.getElementById(NOVEL_TOC_ID) as HTMLButtonElement
+      toc.click()
+      expect(view(NOVEL_SIDE_ID).dataset.open, '收起来给正文让地方').toBe('0')
+      expect(toc.dataset.active).toBe('false')
+
+      toc.click()
+      await flush()
+
+      expect(view(NOVEL_SIDE_ID).dataset.open).toBe('1')
+      expect(toc.dataset.active).toBe('true')
+      // 切目录得把整篇扫一遍：同一篇关掉再开是同一个答案，不该再问一遍宿主。
+      expect(novelCalls(bridge, 'novels/chapters')).toHaveLength(1)
+    })
+
+    it('re-cuts the tree for whichever novel is open now', async () => {
+      const chaptersOf = (name: string): unknown => ({
+        ok: true,
+        result: {
+          name,
+          encoding: 'utf-8',
+          total_chars: 100,
+          count: 1,
+          returned: 1,
+          truncated: false,
+          limit: 5000,
+          message: '',
+          chapters: [{ index: 1, title: name + ' 的第一章', offset: 0, chars: 100 }]
+        }
+      })
+      installBridge({
+        request: host({
+          'novels/list': listing([novelRow(), novelRow({ name: '另一本.md', bytes: 1024 })]),
+          'novels/chapters': (_method: string, params: unknown) =>
+            chaptersOf((params as { name: string }).name),
+          'novels/read': (_method: string, params: unknown) =>
+            readAt((params as { offset: number }).offset)
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openNovels()
+
+      lineButton('长夜.txt', '读')?.click()
+      await flush()
+      expect(sideTitles()).toEqual(['长夜.txt 的第一章'])
+
+      // 换一篇：左栏必须跟着换。留着上一本那棵树，点下去跳的是别的书里的位置。
+      lineButton('另一本.md', '读')?.click()
+      await flush()
+
+      expect(sideTitles()).toEqual(['另一本.md 的第一章'])
+    })
+
+    it('says in the side column why a novel has no chapters', async () => {
+      installBridge({
+        request: host({
+          'novels/list': listing([novelRow()]),
+          'novels/chapters': chapterList({
+            count: 1,
+            returned: 1,
+            message: '这篇没切出章节（整行标题一条也没认出来）：按页码翻，或搜一串字跳过去',
+            chapters: [{ index: 1, title: '全文', offset: 0, chars: 9000 }]
+          }),
+          'novels/read': (_method: string, params: unknown) =>
+            readAt((params as { offset: number }).offset)
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openNovels()
+
+      lineButton('长夜.txt', '读')?.click()
+      await flush()
+
+      expect(sideList().textContent).toContain('没切出章节')
+      // 但路没断：还留着「全文」一条，照样翻得下去。
+      expect(sideTitles()).toEqual(['全文'])
+    })
+
+    it('writes the host reason into the side column when it cannot cut chapters', async () => {
+      installBridge({
+        request: host({
+          'novels/list': listing([novelRow()]),
+          'novels/chapters': {
+            ok: false,
+            error: { code: -32603, message: '长夜.txt 认不出编码：试过 utf-8 与 gb18030 都不成' }
+          },
+          'novels/read': (_method: string, params: unknown) =>
+            readAt((params as { offset: number }).offset)
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openNovels()
+
+      lineButton('长夜.txt', '读')?.click()
+      await flush()
+
+      // 眼睛就在那一栏上，而失败之后它是空的：空着不说为什么，等于让人再点一遍。
+      expect(sideList().textContent).toContain('切不出目录')
+      expect(sideList().textContent).toContain('认不出编码')
+      expect(view(NOVEL_READER_ID).textContent, '目录切不出来不代表正文读不了').toBe('第 0 字')
+    })
+
+    it('quotes the page it is reading and sends it as a block in front of the words', async () => {
+      const bridge = installBridge({
+        request: host({
+          'novels/list': listing([novelRow()]),
+          'novels/chapters': chapterList(),
+          'novels/read': readsOnDemand()
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openNovels()
+
+      lineButton('长夜.txt', '读')?.click()
+      await flush()
+
+      button(NOVEL_PAGER_ID, '引用')?.click()
+      await flush()
+
+      // 要多少字由面板说，回多少字由宿主说：面板一个数都不自己算（位置、字数都认宿主的）。
+      const asked = novelCalls(bridge, 'novels/read')
+      expect(asked[asked.length - 1]).toEqual(['novels/read', { name: '长夜.txt', offset: 0, chars: 800 }])
+      expect(view(CHAT_VIEW_ID).style.display, '卡片在对话页那一边，切过去才看得见').toBe('flex')
+      expect(view(NOVEL_VIEW_ID).style.display).toBe('none')
+      const card = view(QUOTE_BAR_ID).querySelector('.cs-quote')
+      expect(card?.querySelector('.cs-quote-title')?.textContent).toBe('引用 长夜.txt · 第 0 字起 800 字')
+      expect(card?.querySelector('.cs-quote-drop'), '还没发出去，能去掉').not.toBeNull()
+      expect(document.getElementById(STATUS_ID)?.textContent).toContain('可以去掉')
+
+      await send('照这个写')
+
+      // 发出去的是"引用块 + 空一行 + 用户自己的话"：块里带位置，模型要自己去翻全文时有入口。
+      expect(bridge.request).toHaveBeenCalledWith('agent/chat', {
+        text: '[引用 长夜.txt 0 800]\n原文0-800\n[/引用]\n\n照这个写',
+        session_id: 'default'
+      })
+      expect(view(QUOTE_BAR_ID).style.display, '发出去了，卡就不再挂着').toBe('none')
+      const bubble = rows('user')[0]
+      expect(bubble?.querySelector('.cs-quote')).not.toBeNull()
+      expect(bubble?.querySelector('.cs-user-words')?.textContent).toBe('照这个写')
+      expect(bubble?.querySelector('.cs-quote-drop'), '发出去的那张没有 ×').toBeNull()
+    })
+
+    it('quotes the passage selected in the reader instead of the whole page', async () => {
+      const bridge = installBridge({
+        request: host({
+          'novels/list': listing([novelRow()]),
+          'novels/chapters': chapterList(),
+          // 正文得够长，好在里面真的取一段选区（一页的文本节点就是它）。
+          'novels/read': readsOnDemand('一二三四五六七八九十甲乙丙丁戊己')
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openNovels()
+
+      lineButton('长夜.txt', '读')?.click()
+      await flush()
+
+      const reader = view(NOVEL_READER_ID)
+      const range = document.createRange()
+      range.setStart(reader.firstChild as Node, 4)
+      range.setEnd(reader.firstChild as Node, 9)
+      const selection = window.getSelection()
+      selection?.removeAllRanges()
+      selection?.addRange(range)
+
+      button(NOVEL_PAGER_ID, '引用')?.click()
+      await flush()
+
+      // 页起点 0 + 节点内偏移 4，一共 5 个字 —— 这就是"选中的那段在原文里的位置"。
+      const asked = novelCalls(bridge, 'novels/read')
+      expect(asked[asked.length - 1]).toEqual(['novels/read', { name: '长夜.txt', offset: 4, chars: 5 }])
+      const card = view(QUOTE_BAR_ID).querySelector('.cs-quote')
+      expect(card?.querySelector('.cs-quote-title')?.textContent).toBe('引用 长夜.txt · 第 4 字起 5 字')
+      expect(document.getElementById(STATUS_ID)?.textContent).toContain('引用了选中的 5 字')
+    })
+
+    it('drops a card that is not wanted any more', async () => {
+      const bridge = installBridge({
+        request: host({
+          'novels/list': listing([novelRow()]),
+          'novels/chapters': chapterList(),
+          'novels/read': readsOnDemand()
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openNovels()
+
+      lineButton('长夜.txt', '读')?.click()
+      await flush()
+      button(NOVEL_PAGER_ID, '引用')?.click()
+      await flush()
+
+      expect(view(QUOTE_BAR_ID).querySelectorAll('.cs-quote')).toHaveLength(1)
+
+      view(QUOTE_BAR_ID).querySelector<HTMLElement>('.cs-quote-drop')?.click()
+
+      expect(view(QUOTE_BAR_ID).style.display, '一张都没有了就整栏收掉').toBe('none')
+
+      await send('就这些，不加原文了')
+
+      expect(bridge.request).toHaveBeenCalledWith('agent/chat', {
+        text: '就这些，不加原文了',
+        session_id: 'default'
+      })
+    })
+
+    it('stops at four quotes instead of piling them up', async () => {
+      const bridge = installBridge({
+        request: host({
+          'novels/list': listing([novelRow()]),
+          'novels/chapters': chapterList(),
+          'novels/read': readsOnDemand()
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openNovels()
+
+      lineButton('长夜.txt', '读')?.click()
+      await flush()
+
+      for (let index = 0; index < 4; index += 1) {
+        await openNovels() // 引用完会切到对话页去，得回到小说页再点下一次
+        button(NOVEL_PAGER_ID, '引用')?.click()
+        await flush()
+      }
+      expect(view(QUOTE_BAR_ID).querySelectorAll('.cs-quote')).toHaveLength(4)
+
+      const asked = novelCalls(bridge, 'novels/read').length
+      await openNovels()
+      button(NOVEL_PAGER_ID, '引用')?.click()
+      await flush()
+
+      // 第五张不给，而且要说明白为什么 —— 静默丢掉一张，用户会以为带上了。
+      expect(novelCalls(bridge, 'novels/read'), '超了就不去问宿主了').toHaveLength(asked)
+      expect(view(QUOTE_BAR_ID).querySelectorAll('.cs-quote')).toHaveLength(4)
+      expect(hintLine().textContent).toContain('最多带 4 段引用')
+    })
+
+    it('refuses to make a card out of an empty passage', async () => {
+      installBridge({
+        request: host({
+          'novels/list': listing([novelRow()]),
+          'novels/chapters': chapterList(),
+          'novels/read': (_method: string, params: unknown) => {
+            const asked = (params ?? {}) as { offset?: number; chars?: number }
+            // 翻页那次有正文；要 800 字的那一次（引用）宿主说"这儿只剩空白"。
+            return asked.chars === 800
+              ? sliceAt(asked.offset ?? 0, 0, ' ')
+              : sliceAt(asked.offset ?? 0, 4000, '正文')
+          }
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openNovels()
+
+      lineButton('长夜.txt', '读')?.click()
+      await flush()
+      button(NOVEL_PAGER_ID, '引用')?.click()
+      await flush()
+
+      // 空白一段做成的卡发出去就是"这里本来有段原文"：谁都不知道它是空的。
+      expect(view(QUOTE_BAR_ID).querySelectorAll('.cs-quote')).toHaveLength(0)
+      expect(view(QUOTE_BAR_ID).style.display).toBe('none')
+      expect(hintLine().textContent).toContain('只有空白')
+      expect(view(NOVEL_VIEW_ID).style.display, '没成就不切页，让用户接着在这儿改').toBe('flex')
+    })
+
+    it('paints a quote back as a card when the panel is reopened', async () => {
+      // 存档里就是发出去的那段文本：面板照同一套语法把它拆回卡片（同一份文本，两处画法一致）。
+      const sent = '[引用 长夜.txt 1200 40]\n那一刻他才知道什么叫冷\n[/引用]\n\n照这个写'
+      installBridge({
+        request: (method: string): unknown =>
+          method === 'agent/history'
+            ? { ok: true, result: { entries: [{ type: 'user', text: sent }] } }
+            : { ok: true, result: { text: '答案在此' } }
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      const bubble = rows('user')[0]
+      expect(
+        bubble?.querySelector('.cs-quote-title')?.textContent,
+        '位置与字数照引用块里那份念，不去猜'
+      ).toBe('引用 长夜.txt · 第 1200 字起 40 字')
+      expect(bubble?.querySelector('.cs-quote-body')?.textContent).toBe('那一刻他才知道什么叫冷')
+      expect(bubble?.querySelector('.cs-user-words')?.textContent).toBe('照这个写')
+    })
+
+    it('leaves a message that only looks like a quote alone', async () => {
+      // 少一行收尾：形状不完整，整条照普通话画（宁可少画一张卡，也不猜到哪里为止）。
+      const odd = '[引用 长夜.txt 1200 40]\n那一刻他才知道什么叫冷'
+      installBridge({
+        request: (method: string): unknown =>
+          method === 'agent/history'
+            ? { ok: true, result: { entries: [{ type: 'user', text: odd }] } }
+            : { ok: true, result: { text: '答案在此' } }
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      const bubble = rows('user')[0]
+      expect(bubble?.querySelector('.cs-quote')).toBeNull()
+      expect(saidOf(bubble)).toBe(odd)
+    })
+
+    describe('批量删几篇', () => {
+      it('deletes several novels at once, asking a second time first', async () => {
+        const bridge = installBridge({
+          request: host({
+            'novels/list': listing([novelRow(), novelRow({ name: '另一本.md' })]),
+            'novels/delete': (_method: string, params: unknown) => ({
+              ok: true,
+              result: { name: (params as { name: string }).name }
+            })
+          })
+        })
+        setupDom()
+        new Function(script)()
+        await openPanel()
+        await openNovels()
+
+        const pick = (name: string): HTMLInputElement =>
+          novelLine(name)?.querySelector('.cs-novel-pick') as HTMLInputElement
+        const batchText = (): string =>
+          view(NOVEL_BATCH_ID).querySelector('.cs-novel-batch-count')?.textContent ?? ''
+        const pickOn = async (name: string): Promise<void> => {
+          const box = pick(name)
+          box.checked = true
+          box.dispatchEvent(new Event('change'))
+          await flush()
+        }
+
+        expect(batchText(), '没勾之前先说清这一栏是干什么的').toContain('没勾选')
+
+        await pickOn('长夜.txt')
+        await pickOn('另一本.md')
+
+        expect(batchText()).toBe('选中 2 篇：长夜.txt、另一本.md')
+        expect(novelLine('长夜.txt')?.getAttribute('data-picked')).toBe('true')
+
+        document.getElementById(NOVEL_BATCH_DELETE_ID)?.click()
+
+        expect(novelCalls(bridge, 'novels/delete'), '第一下只是问一次').toHaveLength(0)
+        expect(document.getElementById(NOVEL_BATCH_DELETE_ID)?.textContent).toBe('确认删除 2 篇')
+
+        document.getElementById(NOVEL_BATCH_DELETE_ID)?.click()
+        await flush()
+
+        // 宿主一次只删一篇（novels/delete 接一个名字），所以面板串着一篇一篇来。
+        expect(novelCalls(bridge, 'novels/delete').map((call) => call[1])).toEqual([
+          { name: '长夜.txt' },
+          { name: '另一本.md' }
+        ])
+        expect(hintLine().textContent).toContain('删了 2 篇：长夜.txt、另一本.md')
+        expect(batchText(), '删完把勾清掉').toContain('没勾选')
+      })
+
+      it('reports which of the picked novels did not get deleted', async () => {
+        installBridge({
+          request: host({
+            'novels/list': listing([novelRow(), novelRow({ name: '另一本.md' })]),
+            'novels/delete': (_method: string, params: unknown) =>
+              (params as { name: string }).name === '长夜.txt'
+                ? { ok: true, result: {} }
+                : { ok: false, error: { message: '被别的程序占着' } }
+          })
+        })
+        setupDom()
+        new Function(script)()
+        await openPanel()
+        await openNovels()
+
+        const pickOn = (name: string): void => {
+          const box = novelLine(name)?.querySelector('.cs-novel-pick') as HTMLInputElement
+          box.checked = true
+          box.dispatchEvent(new Event('change'))
+        }
+        pickOn('长夜.txt')
+        pickOn('另一本.md')
+
+        document.getElementById(NOVEL_BATCH_DELETE_ID)?.click()
+        document.getElementById(NOVEL_BATCH_DELETE_ID)?.click()
+        await flush()
+
+        // 一篇删不动不该把后面几篇卡住，也不能假装这一批都删掉了。
+        expect(hintLine().textContent).toContain('删了 1 篇：长夜.txt')
+        expect(hintLine().textContent).toContain('没删成 1 篇：另一本.md（被别的程序占着）')
+        expect(hintLine().getAttribute('data-tone')).toBe('error')
+      })
+
+      it('selects the whole list at once, and clears it without touching the disk', async () => {
+        const bridge = installBridge({
+          request: host({ 'novels/list': listing([novelRow(), novelRow({ name: '另一本.md' })]) })
+        })
+        setupDom()
+        new Function(script)()
+        await openPanel()
+        await openNovels()
+
+        const batchText = (): string =>
+          view(NOVEL_BATCH_ID).querySelector('.cs-novel-batch-count')?.textContent ?? ''
+        const pick = (name: string): HTMLInputElement =>
+          novelLine(name)?.querySelector('.cs-novel-pick') as HTMLInputElement
+
+        document.getElementById(NOVEL_BATCH_ALL_ID)?.click()
+        await flush()
+
+        expect(batchText()).toBe('选中 2 篇：长夜.txt、另一本.md')
+        expect(pick('长夜.txt').checked, '全选要把每一行的方框也真的勾上').toBe(true)
+
+        document.getElementById(NOVEL_BATCH_NONE_ID)?.click()
+        await flush()
+
+        expect(batchText()).toContain('没勾选')
+        expect(pick('长夜.txt').checked).toBe(false)
+        expect(novelCalls(bridge, 'novels/delete'), '勾选与清空都不动磁盘').toHaveLength(0)
+      })
+    })
+
+    describe('章节目录与立项', () => {
+      const sideTitle = (): string =>
+        document.querySelector(`#${NOVEL_SIDE_ID} .cs-novel-side-title`)?.textContent ?? ''
+
+      it('draws each chapter as its share of the whole novel, and says where I am', async () => {
+        installBridge({
+          request: host({
+            'novels/list': listing([novelRow()]),
+            'novels/chapters': chapterList(),
+            'novels/read': (_method: string, params: unknown) =>
+              readAt((params as { offset: number }).offset)
+          })
+        })
+        setupDom()
+        new Function(script)()
+        await openPanel()
+        await openNovels()
+
+        lineButton('长夜.txt', '读')?.click()
+        await flush()
+
+        expect(sideTitle()).toContain('2 章')
+        expect(sideTitle()).toContain('9000 字')
+        expect(sideTitle()).toContain('读到第 1 章')
+
+        // 字数与那条占比用的是同一对数（chapter.chars / meta.total_chars）：面板不另外量正文。
+        expect(sideRow(0).querySelector('.cs-novel-side-meta')?.textContent).toBe('5000 字 · 56%')
+        expect(sideRow(0).querySelector<HTMLElement>('.cs-novel-side-bar-fill')?.style.width).toBe('55.56%')
+        expect(sideRow(1).querySelector('.cs-novel-side-meta')?.textContent).toBe('4000 字 · 44%')
+
+        sideRow(1).click()
+        await flush()
+
+        expect(sideRow(1).dataset.current).toBe('true')
+        expect(sideTitle(), '跳章之后那一行也得跟着走').toContain('读到第 2 章')
+      })
+
+      it('opens the new-project form with this novel picked as the source', async () => {
+        const bridge = installBridge({ request: host({ 'novels/list': listing([novelRow()]) }) })
+        setupDom()
+        new Function(script)()
+        await openPanel()
+        await openNovels()
+
+        lineButton('长夜.txt', '以此立项')?.click()
+        await flush()
+
+        expect(view(NOVEL_VIEW_ID).style.display).toBe('none')
+        expect(view(PROJECT_VIEW_ID).style.display).toBe('flex')
+        expect(view(PROJECT_FORM_ID).getAttribute('data-open')).toBe('1')
+        expect(
+          (document.getElementById(PROJECT_FORM_NAME_ID) as HTMLInputElement).value,
+          '剧名就是目录名，别带着 .txt'
+        ).toBe('长夜')
+        expect((document.getElementById(PROJECT_FORM_NOVEL_ID) as HTMLSelectElement).value).toBe('长夜.txt')
+        expect(view(PROJECT_HINT_ID).textContent).toContain('拿「长夜.txt」当原著')
+        expect(novelCalls(bridge, 'projects/create'), '建不建、建几集是人自己定').toHaveLength(0)
+      })
+    })
+
+  })
+
+  describe('一键跑 skill', () => {
+    /**
+     * skill 目录是引擎报上来的（宿主原样转，见 lib/comfy_studio/skills/catalog.py）：
+     * 面板照念，参数一个都不自己编。
+     */
+    const skillRow = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+      id: 'text-to-image',
+      title: '文生图',
+      description: '一句提示词出一张图',
+      tags: ['示例'],
+      params: [
+        {
+          name: 'ckpt_name',
+          type: 'string',
+          required: true,
+          description: '底模',
+          default: 'sd_xl.safetensors',
+          hasDefault: true
+        },
+        {
+          name: 'prompt',
+          type: 'string',
+          required: true,
+          description: '提示词',
+          default: '一间亮着灯的旧书店',
+          hasDefault: true
+        }
+      ],
+      ...over
+    })
+
+    const catalog = (skills: unknown[]): unknown => ({ ok: true, result: { skills } })
+
+    /** 引擎一次输出的图（见引擎侧 skills/types.py 的 SkillRunResult.to_json）。 */
+    const image = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+      node: '9',
+      filename: 'comfy-studio_00001_.png',
+      subfolder: '',
+      type: 'output',
+      url: 'http://127.0.0.1:8188/view?filename=comfy-studio_00001_.png&type=output',
+      ...over
+    })
+
+    const runResult = (over: Record<string, unknown> = {}): unknown => ({
+      ok: true,
+      result: {
+        skill_id: 'text-to-image',
+        isError: false,
+        text: '跑完了',
+        data: { prompt_id: 'p-1', images: [image()] },
+        ...over
+      }
+    })
+
+    /** 只有 skills/* 那两件事走自己的桩；开抽屉要问的那些保持默认。 */
+    const host = (handlers: Record<string, unknown>): RequestStub => (method, params) =>
+      method in handlers
+        ? typeof handlers[method] === 'function'
+          ? (handlers[method] as RequestStub)(method, params)
+          : handlers[method]
+        : { ok: true, result: { text: '答案在此' } }
+
+    const skillSelect = (): HTMLSelectElement =>
+      document.getElementById(SKILL_ID) as HTMLSelectElement
+    const runButton = (): HTMLButtonElement =>
+      document.getElementById(SKILL_RUN_ID) as HTMLButtonElement
+    const card = (): Element | null => rows('skill')[0] ?? null
+    const runCalls = (bridge: StudioBridge): unknown[][] =>
+      bridge.request.mock.calls.filter((call: unknown[]) => call[0] === 'skills/run')
+
+    /** 开面板 + 跑一遍，返回桥与那张卡（用例里几乎每个都要这三步）。 */
+    const runOnce = async (
+      handlers: Record<string, unknown> = {}
+    ): Promise<{ bridge: StudioBridge; card: Element | null }> => {
+      const bridge = installBridge({
+        // 默认这一趟跑成、出来一张图；要别的结果（失败、没图）的用例自己覆盖。
+        request: host({ 'skills/run': runResult(), ...handlers })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      document.getElementById(SKILL_RUN_ID)?.click()
+      await flush()
+      return { bridge, card: card() }
+    }
+
+    it('runs the chosen skill with the defaults the skill itself declares', async () => {
+      const bridge = installBridge({
+        request: host({ 'skills/list': catalog([skillRow()]), 'skills/run': runResult() })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      expect(skillSelect().value).toBe('text-to-image')
+      document.getElementById(SKILL_RUN_ID)?.click()
+      await flush()
+
+      // 参数原样来自 skill 文件里的 default：面板不替它写值（写错的值不会报错，只会跑出另一套图）。
+      expect(runCalls(bridge)).toEqual([
+        [
+          'skills/run',
+          {
+            skill_id: 'text-to-image',
+            params: { ckpt_name: 'sd_xl.safetensors', prompt: '一间亮着灯的旧书店' }
+          }
+        ]
+      ])
+      expect(document.getElementById(STATUS_ID)?.textContent).toContain('1 张图')
+    })
+
+    it('refuses to run when a required parameter has no default', async () => {
+      const bridge = installBridge({
+        request: host({
+          'skills/list': catalog([
+            skillRow({
+              params: [
+                { name: 'ckpt_name', type: 'string', required: true, default: null, hasDefault: false },
+                {
+                  name: 'prompt',
+                  type: 'string',
+                  required: true,
+                  default: '一间亮着灯的旧书店',
+                  hasDefault: true
+                }
+              ]
+            })
+          ])
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      document.getElementById(SKILL_RUN_ID)?.click()
+      await flush()
+
+      // 必填没默认值就不跑，而且要点名是哪个参数 —— 编一个值塞进去，出来的图是错的还不报错。
+      expect(runCalls(bridge)).toHaveLength(0)
+      expect(card()).toBeNull()
+      expect(document.getElementById(STATUS_ID)?.textContent).toContain('ckpt_name')
+      expect(document.getElementById(STATUS_ID)?.textContent).toContain('没有默认值')
+    })
+
+    it('paints the images the engine reports, address and all', async () => {
+      const { card: row } = await runOnce({ 'skills/list': catalog([skillRow()]) })
+
+      const img = row?.querySelector('img.cs-skill-image')
+      expect(img?.getAttribute('src'), '地址照引擎给的用，面板不自己拼 /view').toBe(
+        'http://127.0.0.1:8188/view?filename=comfy-studio_00001_.png&type=output'
+      )
+      expect(row?.querySelector('.cs-skill-caption')?.textContent).toBe('comfy-studio_00001_.png')
+      expect(row?.querySelector('.cs-skill-state')?.textContent).toBe('完成 · 1 张图')
+    })
+
+    it('says so when the engine ran but produced no image', async () => {
+      const { card: row } = await runOnce({
+        'skills/list': catalog([skillRow()]),
+        'skills/run': runResult({
+          text: '{"prompt_id":"p-1","images":[]}',
+          data: { prompt_id: 'p-1', images: [] }
+        })
+      })
+
+      // 一张图都没有时不能画成一片空白：那看着像"还在跑"。
+      expect(row?.querySelector('.cs-skill-image')).toBeNull()
+      expect(row?.querySelector('.cs-skill-state')?.textContent).toBe('完成（没有图片输出）')
+      expect(row?.textContent).toContain('{"prompt_id":"p-1","images":[]}')
+      expect(document.getElementById(STATUS_ID)?.textContent).toContain('没报出图片输出')
+    })
+
+    it('keeps the engine words when the run itself failed', async () => {
+      const { card: row } = await runOnce({
+        'skills/list': catalog([skillRow()]),
+        'skills/run': runResult({ isError: true, text: '显存不够', data: null })
+      })
+
+      expect(row?.getAttribute('data-state')).toBe('error')
+      expect(row?.querySelector('.cs-skill-state')?.textContent).toBe('失败')
+      expect(row?.textContent).toContain('显存不够')
+      expect(document.getElementById(STATUS_ID)?.textContent).toContain('失败')
+    })
+
+    it('turns an image that will not load into a line that says why', async () => {
+      const { card: row } = await runOnce({ 'skills/list': catalog([skillRow()]) })
+
+      const img = row?.querySelector('img.cs-skill-image')
+      img?.dispatchEvent(new Event('error'))
+      await flush()
+
+      // 留一个空框会被当成"图还在路上"：换成一行字，并把地址写上，用户能自己去查。
+      expect(row?.querySelector('img.cs-skill-image')).toBeNull()
+      expect(row?.querySelector('.cs-skill-image-note')?.textContent).toContain(
+        'http://127.0.0.1:8188/view?filename=comfy-studio_00001_.png&type=output'
+      )
+    })
+
+    it('runs one at a time instead of stacking them up', async () => {
+      const bridge = installBridge({
+        request: host({
+          'skills/list': catalog([skillRow()]),
+          // 第一遍一直不回来：这时候界面上的状态就是"正在跑"。
+          'skills/run': () => new Promise(() => {})
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      document.getElementById(SKILL_RUN_ID)?.click()
+      await flush()
+      // 跑着的时候按钮还按得动（灭掉的按钮不会解释自己为什么灭），但选择先灭掉：跑着改选择没意义。
+      expect(runButton().disabled).toBe(false)
+      expect(skillSelect().disabled).toBe(true)
+
+      document.getElementById(SKILL_RUN_ID)?.click()
+      await flush()
+
+      // 引擎跑一套工作流占着显存，叠着按只会两边都慢 —— 按了要说话，不能装作没看见。
+      expect(runCalls(bridge)).toHaveLength(1)
+      expect(document.getElementById(STATUS_ID)?.textContent).toContain('还在跑')
+    })
+
+    it('explains a dead row instead of leaving it empty', async () => {
+      installBridge({ request: host({ 'skills/list': catalog([]) }) })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      // 引擎没起来（skill 目录在引擎侧）时，空下拉看起来像面板坏了。
+      expect(skillSelect().options[0]?.textContent).toBe('（引擎没报出 skill）')
+      expect(runButton().disabled).toBe(true)
+    })
+
+    it('keeps the choice when the catalog is refreshed', async () => {
+      installBridge({
+        request: host({
+          'skills/list': catalog([
+            skillRow(),
+            skillRow({ id: 'text-to-video', title: '文生视频', params: [] })
+          ])
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      // 真选一下（下拉的选中只靠 change 事件回到面板那里，直接改 value 用户按不出来）。
+      skillSelect().value = 'text-to-video'
+      skillSelect().dispatchEvent(new Event('change'))
+
+      // 每轮对话结束都会重读一遍目录（用户可能刚往 skills 目录里加了一套）：刷新一次就跳回
+      // 第一个，等于替用户改了选择。
+      await send('你刚说的那个再跑一遍')
+
+      expect(skillSelect().value).toBe('text-to-video')
+    })
+  })
+
+  describe('项目管理', () => {
+    /** 项目根是宿主给的（见 lib/comfy_studio/projects.py）：面板一个路径都不拼，只照着用。 */
+    const projectDir = 'D:/comfy/custom_nodes/comfy_studio/manju/projects'
+    const projectPath = (name: string): string => `${projectDir}/${name}`
+
+    /** 宿主 projects/list 里的一行。 */
+    const projectRow = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+      name: '长夜',
+      path: projectPath('长夜'),
+      files: 3,
+      missing: [],
+      missing_count: 0,
+      stages: [{ label: '剧本', rel: '01_剧本', files: 1, done: true, sample: [] }],
+      stages_done: 1,
+      stages_total: 1,
+      mtime: 1758900000,
+      ...over
+    })
+
+    const listing = (projects: unknown[], over: Record<string, unknown> = {}): unknown => ({
+      ok: true,
+      result: {
+        dir: projectDir,
+        exists: true,
+        query: '',
+        matched: projects.length,
+        returned: projects.length,
+        truncated: false,
+        limit: 200,
+        projects,
+        ...over
+      }
+    })
+
+    const fileRow = (rel: string, over: Record<string, unknown> = {}): Record<string, unknown> => ({
+      rel,
+      name: rel.split('/').slice(-1)[0],
+      bytes: 2048,
+      mtime: 1758900000,
+      readable: true,
+      ...over
+    })
+
+    /** 一个落点格（宿主 projects/tree 里 dirs 的一项）。 */
+    const bucket = (rel: string, files: unknown[] = []): Record<string, unknown> => ({
+      rel,
+      exists: true,
+      count: files.length,
+      truncated: false,
+      files
+    })
+
+    /**
+     * 宿主 projects/tree 的回包。三格：剧本（有产物）、素材归档（空着）、项目根（一个图 + 一个 md）。
+     * 「空着的那一格照样画出来」是这一页的规矩，所以它必须留在桩里。
+     */
+    const projectTree = (over: Record<string, unknown> = {}): unknown => ({
+      ok: true,
+      result: {
+        name: '长夜',
+        path: projectPath('长夜'),
+        dirs: ['00_PROJECT/07_素材归档', '01_剧本'],
+        gaps: [],
+        unknown: [],
+        shelves: [
+          {
+            key: 'script',
+            title: '剧本',
+            dirs: [bucket('01_剧本', [fileRow('01_剧本/总纲.md')])],
+            exists: true,
+            count: 1
+          },
+          {
+            key: 'archive',
+            title: '素材归档',
+            dirs: [bucket('00_PROJECT/07_素材归档')],
+            exists: true,
+            count: 0
+          },
+          {
+            key: 'root',
+            title: '项目根',
+            dirs: [],
+            exists: true,
+            count: 2,
+            files: [
+              fileRow('封面.png', { bytes: 900, readable: false }),
+              fileRow('README.md', { bytes: 120 })
+            ]
+          }
+        ],
+        summary: {
+          name: '长夜',
+          path: projectPath('长夜'),
+          files: 3,
+          missing: ['02_分镜'],
+          missing_count: 1,
+          stages: [
+            { label: '剧本', rel: '01_剧本', files: 1, done: true, sample: ['01_剧本/总纲.md'] },
+            { label: '分镜', rel: '02_分镜', files: 0, done: false, sample: [] }
+          ],
+          stages_done: 1,
+          stages_total: 2,
+          mtime: 1758900000
+        },
+        novel: '长夜.txt',
+        ...over
+      }
+    })
+
+    /** 宿主 projects/read 的一页。 */
+    const page = (offset: number, over: Record<string, unknown> = {}): unknown => ({
+      ok: true,
+      result: {
+        name: '长夜',
+        rel: '01_剧本/总纲.md',
+        path: projectPath('长夜') + '/01_剧本/总纲.md',
+        encoding: 'utf-8',
+        bytes: 2048,
+        total_chars: 9000,
+        offset,
+        requested_chars: 4000,
+        chars: 4000,
+        truncated: offset + 4000 < 9000,
+        text: '第 ' + offset + ' 字起',
+        ...over
+      }
+    })
+
+    /** 只有 projects/* 那几件事走自己的桩；开抽屉时要问的那些保持默认。 */
+    const host = (handlers: Record<string, unknown>): RequestStub => (method, params) =>
+      method in handlers
+        ? typeof handlers[method] === 'function'
+          ? (handlers[method] as RequestStub)(method, params)
+          : handlers[method]
+        : { ok: true, result: { text: '答案在此' } }
+
+    const view = (id: string): HTMLElement => document.getElementById(id) as HTMLElement
+    const hintLine = (): HTMLElement => view(PROJECT_HINT_ID)
+    const tab = (label: string): HTMLButtonElement | undefined =>
+      Array.from(document.querySelectorAll<HTMLButtonElement>(`#${TABS_ID} .cs-tab`)).find(
+        (b) => b.textContent === label
+      )
+    const button = (text: string): HTMLButtonElement | null =>
+      Array.from(document.querySelectorAll<HTMLButtonElement>(`#${PROJECT_VIEW_ID} button`)).find(
+        (b) => b.textContent === text
+      ) ?? null
+    const projectLine = (name: string): HTMLElement | null =>
+      document.querySelector<HTMLElement>(`#${PROJECT_LIST_ID} .cs-proj-row[data-name="${name}"]`)
+    /** 一格：格头是「勾/空 标题 计数」三个 span，按第二个（就是标题本身）认。 */
+    const shelf = (title: string): HTMLElement | null =>
+      Array.from(document.querySelectorAll<HTMLElement>(`#${PROJECT_SHELVES_ID} .cs-proj-shelf`)).find(
+        (box) => box.querySelectorAll('.cs-proj-shelf-head span')[1]?.textContent === title
+      ) ?? null
+    const fileLine = (rel: string): HTMLButtonElement | null =>
+      document.querySelector<HTMLButtonElement>(`#${PROJECT_SHELVES_ID} .cs-proj-file[data-rel="${rel}"]`)
+    const pagerButton = (text: string): HTMLButtonElement | null =>
+      Array.from(
+        document.querySelectorAll<HTMLButtonElement>(`#${PROJECT_PAGER_ID} button`)
+      ).find((b) => b.textContent === text) ?? null
+    const nameInput = (): HTMLInputElement =>
+      document.getElementById(PROJECT_FORM_NAME_ID) as HTMLInputElement
+    const episodesInput = (): HTMLInputElement =>
+      document.getElementById(PROJECT_FORM_EPISODES_ID) as HTMLInputElement
+    const novelSelect = (): HTMLSelectElement =>
+      document.getElementById(PROJECT_FORM_NOVEL_ID) as HTMLSelectElement
+    const upgradeBox = (): HTMLInputElement =>
+      document.getElementById(PROJECT_FORM_UPGRADE_ID) as HTMLInputElement
+    const projectCalls = (bridge: StudioBridge, method: string): unknown[][] =>
+      bridge.request.mock.calls.filter((call: unknown[]) => call[0] === method)
+    /** 宿主这一趟收到的筛词（最后一次 projects/list 调用的参数）。 */
+    const lastListParams = (bridge: StudioBridge): unknown =>
+      projectCalls(bridge, 'projects/list').slice(-1)[0]?.[1]
+    const projectFindBox = (): HTMLInputElement =>
+      document.getElementById(PROJECT_FIND_ID) as HTMLInputElement
+    const fileFindBox = (): HTMLInputElement =>
+      document.getElementById(PROJECT_FILE_FIND_ID) as HTMLInputElement
+    const reader = (): HTMLElement => view(PROJECT_READER_ID)
+    const fileFindCount = (): HTMLElement => view(PROJECT_FILE_FIND_COUNT_ID)
+    const hits = (): HTMLElement[] =>
+      Array.from(document.querySelectorAll<HTMLElement>(`#${PROJECT_READER_ID} .cs-proj-hit`))
+    /** 敲一串字进筛项目那个框，等过防抖那一小会儿。 */
+    const typeProjectFind = async (text: string): Promise<void> => {
+      projectFindBox().value = text
+      projectFindBox().dispatchEvent(new Event('input'))
+      await vi.advanceTimersByTimeAsync(300)
+      await flush()
+    }
+
+    /** 一部「长夜」加一部「乙剧」，照 projects.py 的 list(query) 那样按 name 子串真的筛一遍。 */
+    const filteringHost = (): RequestStub =>
+      host({
+        'projects/list': (_method: string, params: unknown) => {
+          const name = String((params as { name?: string } | null)?.name ?? '')
+          const all = [projectRow(), projectRow({ name: '乙剧', stages_done: 0, stages_total: 2 })]
+          const kept = all.filter((row) => String(row.name).includes(name))
+          return listing(kept, { query: name, matched: kept.length })
+        }
+      })
+
+    const openProjects = async (): Promise<void> => {
+      tab('项目管理')?.click()
+      await flush()
+    }
+
+    const openLine = async (name: string): Promise<void> => {
+      projectLine(name)?.click()
+      await flush()
+    }
+
+    it('only asks the host for projects once that page is opened', async () => {
+      const bridge = installBridge({ request: host({ 'projects/list': listing([]) }) })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      expect(view(CHAT_VIEW_ID).style.display).toBe('flex')
+      expect(view(PROJECT_VIEW_ID).style.display).toBe('none')
+      expect(projectCalls(bridge, 'projects/list'), '没打开这一页就别去翻人家的项目根').toHaveLength(0)
+
+      await openProjects()
+
+      expect(view(CHAT_VIEW_ID).style.display).toBe('none')
+      expect(view(PROJECT_VIEW_ID).style.display).toBe('flex')
+      expect(tab('项目管理')?.dataset.active).toBe('true')
+      expect(tab('对话')?.dataset.active).toBe('false')
+      // 项目根是宿主的事：面板连 limit 都不自己定，全按宿主的默认来。
+      expect(bridge.request).toHaveBeenCalledWith('projects/list', {})
+    })
+
+    it('says the project root is not there yet instead of painting a failure', async () => {
+      installBridge({ request: host({ 'projects/list': listing([], { exists: false }) }) })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+
+      // 目录没建不是错误：说明写在列表里，指人去建第一部，而不是弹一个"读取失败"。
+      expect(document.getElementById(PROJECT_LIST_ID)?.textContent).toContain('还没建过项目')
+      expect(document.getElementById(PROJECT_LIST_ID)?.textContent).toContain(projectDir)
+      expect(hintLine().getAttribute('data-tone')).not.toBe('error')
+    })
+
+    it('lists the projects, then opens one into one shelf per drop point', async () => {
+      const bridge = installBridge({
+        request: host({
+          'projects/list': listing([projectRow(), projectRow({ name: '乙剧', stages_done: 0, stages_total: 2 })]),
+          'projects/tree': projectTree()
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+
+      expect(document.querySelectorAll(`#${PROJECT_LIST_ID} .cs-proj-row`)).toHaveLength(2)
+      // 列表只报数，不自己算完成度：阶段判据是宿主按落点里有没有产物判的。
+      expect(projectLine('长夜')?.textContent).toContain('1/1 段')
+      expect(projectLine('乙剧')?.textContent).toContain('0/2 段')
+
+      await openLine('长夜')
+
+      expect(bridge.request).toHaveBeenCalledWith('projects/tree', { name: '长夜' })
+      expect(document.getElementById(PROJECT_HEAD_ID)?.textContent).toContain('长夜')
+      expect(document.getElementById(PROJECT_HEAD_ID)?.textContent).toContain('原著：长夜.txt')
+      // 三个格子都画出来（含空着那个），不是只画有产物的。
+      expect(document.querySelectorAll(`#${PROJECT_SHELVES_ID} .cs-proj-shelf`)).toHaveLength(3)
+      expect(shelf('剧本')?.dataset.empty, '有产物').toBe('0')
+      expect(shelf('素材归档')?.dataset.empty, '空着也要占一格，人才知道这戏还缺这摞资料').toBe('1')
+      expect(shelf('素材归档')?.textContent).toContain('还空着')
+      expect(projectLine('长夜')?.dataset.open).toBe('true')
+    })
+
+    it('lists a file it cannot read but keeps it a dead row', async () => {
+      installBridge({
+        request: host({ 'projects/list': listing([projectRow()]), 'projects/tree': projectTree() })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+      await openLine('长夜')
+
+      // 图片、音频、视频躺在格子里就照样列出来，但不给点：读成文本只会是一片乱码。
+      expect(fileLine('封面.png'), '图也列出来').not.toBeNull()
+      expect(fileLine('封面.png')?.disabled).toBe(true)
+      expect(fileLine('README.md')?.disabled).toBe(false)
+    })
+
+    it('keeps the spec gaps apart from the missing drop points', async () => {
+      installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'projects/tree': projectTree({ gaps: ['02_分镜'], unknown: ['09_旧落点'] })
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+      await openLine('长夜')
+
+      const head = document.getElementById(PROJECT_HEAD_ID)?.textContent ?? ''
+      // 缺落点是"去补目录"，对不上是"面板自己有 bug"：两码事，不能混成一句话。
+      expect(head).toContain('缺 1 个落点：02_分镜')
+      expect(head).toContain('规范里有落点没被面板归到任何一格：02_分镜')
+      expect(head).toContain('面板写了规范里没有的落点：09_旧落点')
+    })
+
+    it('pages a file by character offset and pages back by the size it asked for', async () => {
+      const bridge = installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'projects/tree': projectTree(),
+          'projects/read': (_method: string, params: unknown) => {
+            const asked = (params as { offset: number }).offset
+            // 末页短读：只回 1000 字，但"这一页本来要多少"仍是 4000 —— 往回翻要按 4000 算。
+            if (asked === 8000) return page(8000, { chars: 1000, truncated: false, text: '末页' })
+            return page(asked)
+          }
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+      await openLine('长夜')
+
+      fileLine('01_剧本/总纲.md')?.click()
+      await flush()
+
+      // 不带 chars：一页多少字按宿主那份来。
+      expect(bridge.request).toHaveBeenCalledWith('projects/read', {
+        name: '长夜',
+        rel: '01_剧本/总纲.md',
+        offset: 0
+      })
+      expect(view(PROJECT_READER_ID).textContent).toBe('第 0 字起')
+      expect(pagerButton('上一页')?.disabled, '第一页没有上一页').toBe(true)
+      expect(pagerButton('下一页')?.disabled).toBe(false)
+
+      pagerButton('下一页')?.click()
+      await flush()
+      pagerButton('下一页')?.click()
+      await flush()
+
+      expect(view(PROJECT_READER_ID).textContent).toBe('末页')
+      expect(pagerButton('下一页')?.disabled, '读到头了').toBe(true)
+
+      pagerButton('上一页')?.click()
+      await flush()
+
+      // 8000 - 4000（这一页 requested_chars），不是 8000 - 1000（这一页实际回了多少字）。
+      expect(bridge.request).toHaveBeenCalledWith('projects/read', {
+        name: '长夜',
+        rel: '01_剧本/总纲.md',
+        offset: 4000
+      })
+    })
+
+    it('drops a tree that came back after the user switched to another project', async () => {
+      let late: (value: unknown) => void = () => {}
+      installBridge({
+        request: host({
+          'projects/list': listing([projectRow(), projectRow({ name: '乙剧' })]),
+          'projects/tree': (_method: string, params: unknown) => {
+            const name = (params as { name: string }).name
+            if (name === '长夜') return new Promise((resolve) => { late = resolve })
+            // 乙剧没登记原著：这里留空，好让"长夜"这个名字只可能来自那一趟迟到的回话。
+            return projectTree({ name: '乙剧', path: projectPath('乙剧'), novel: '' })
+          }
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+
+      projectLine('长夜')?.click()
+      await flush()
+      await openLine('乙剧')
+      expect(document.getElementById(PROJECT_HEAD_ID)?.textContent).toContain('乙剧')
+
+      late(projectTree())
+      await flush()
+
+      // 先发的后回来：不丢就等于把用户刚打开的乙剧盖成长夜。
+      expect(document.getElementById(PROJECT_HEAD_ID)?.textContent).toContain('乙剧')
+      expect(document.getElementById(PROJECT_HEAD_ID)?.textContent).not.toContain('长夜')
+    })
+
+    it('draws how many stages already have output on each project line', async () => {
+      installBridge({
+        request: host({ 'projects/list': listing([projectRow({ stages_done: 2, stages_total: 4 })]) })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+
+      expect(projectLine('长夜')?.querySelector<HTMLElement>('.cs-proj-meter-fill')?.style.width).toBe('50.00%')
+      // 条上写的是宿主的两个数（projects/tree 的 summary），不是面板自己算的"完成度"。
+      expect(projectLine('长夜')?.querySelector('.cs-proj-meter')?.getAttribute('title')).toBe('2/4 段有产物')
+    })
+
+    it('says how far this project is and which step is next', async () => {
+      installBridge({
+        request: host({ 'projects/list': listing([projectRow()]), 'projects/tree': projectTree() })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+      await openLine('长夜')
+
+      const head = view(PROJECT_HEAD_ID)
+      expect(head.querySelector<HTMLElement>('.cs-proj-meter-fill')?.style.width, '剧本有产物、分镜没有').toBe(
+        '50.00%'
+      )
+      expect(head.querySelector('.cs-proj-meter')?.getAttribute('title')).toBe('1/2 段有产物')
+      // 下一步是哪一步照宿主给的阶段顺序念（stages[].label），面板不自己排工序。
+      expect(head.textContent).toContain('下一步：分镜')
+    })
+
+    it('walks from a project to the novel it was built from', async () => {
+      const bridge = installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'projects/tree': projectTree(),
+          'novels/chapters': {
+            ok: true,
+            result: { name: '长夜.txt', count: 0, returned: 0, total_chars: 9000, limit: 5000, message: '', chapters: [] }
+          },
+          'novels/read': (_method: string, params: unknown) => ({
+            ok: true,
+            result: {
+              name: '长夜.txt',
+              offset: (params as { offset: number }).offset,
+              chars: 4000,
+              requested_chars: 4000,
+              total_chars: 9000,
+              at_end: false,
+              text: '正文在这儿'
+            }
+          })
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+      await openLine('长夜')
+
+      const head = view(PROJECT_HEAD_ID)
+      expect(head.textContent).toContain('原著：长夜.txt')
+      const go = Array.from(head.querySelectorAll<HTMLButtonElement>('button')).find(
+        (b) => b.textContent === '去读原文'
+      )
+      expect(go, '登记了原著就该有一条路过去').toBeDefined()
+
+      go?.click()
+      await flush()
+
+      expect(view(NOVEL_VIEW_ID).style.display).toBe('flex')
+      expect(bridge.request).toHaveBeenCalledWith('novels/read', { name: '长夜.txt', offset: 0 })
+      expect(view(NOVEL_READER_ID).textContent).toBe('正文在这儿')
+    })
+
+    it('says the source novel is gone from the library instead of pretending it is there', async () => {
+      const bridge = installBridge({
+        request: host({
+          'novels/list': { ok: true, result: { novels: [] } },
+          'novels/chapters': {
+            ok: true,
+            result: { name: '长夜.txt', count: 0, returned: 0, total_chars: 9000, limit: 5000, message: '', chapters: [] }
+          },
+          'novels/read': { ok: false, error: { message: '书库里没有长夜.txt' } },
+          'projects/list': listing([projectRow()]),
+          'projects/tree': projectTree()
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      // 先真的列过一次原文库：没列过的话面板只知道"还没问过"，不能替它下"没有这一篇"的结论。
+      tab('管理小说')?.click()
+      await flush()
+      tab('项目管理')?.click()
+      await flush()
+      await openLine('长夜')
+
+      const head = view(PROJECT_HEAD_ID)
+      expect(head.textContent).toContain('原文库里没这一篇')
+      const go = Array.from(head.querySelectorAll<HTMLButtonElement>('button')).find(
+        (b) => b.textContent === '去看看原文库'
+      )
+      expect(go).toBeDefined()
+
+      go?.click()
+      await flush()
+
+      // 路照样铺过去：到底有没有这一篇由宿主说，面板不在这儿自己编一个结论。
+      expect(bridge.request).toHaveBeenCalledWith('novels/read', { name: '长夜.txt', offset: 0 })
+      expect(view(NOVEL_READER_ID).textContent).toContain('读不了这一篇')
+      expect(view(NOVEL_HINT_ID).textContent).toContain('读不了 长夜.txt')
+    })
+
+    it('refuses a nameless project and a nonsense episode count without asking the host', async () => {
+      const bridge = installBridge({
+        request: host({ 'projects/list': listing([]), 'novels/list': { ok: true, result: { novels: [] } } })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+
+      button('新建项目…')?.click()
+      await flush()
+
+      button('建')?.click()
+      await flush()
+      expect(hintLine().textContent).toContain('先给这部戏起个名字')
+      expect(hintLine().getAttribute('data-tone')).toBe('error')
+
+      nameInput().value = '长夜'
+      episodesInput().value = '0'
+      button('建')?.click()
+      await flush()
+      expect(hintLine().textContent).toContain('集数要是 1 以上的整数')
+
+      expect(projectCalls(bridge, 'projects/create'), '本地就问得出的错，别拿去打扰宿主').toHaveLength(0)
+    })
+
+    it('creates a project with the linked novel and opens it right away', async () => {
+      const bridge = installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'novels/list': {
+            ok: true,
+            result: { novels: [{ name: '长夜.txt', bytes: 2048, mtime: 1, text: true }] }
+          },
+          'projects/create': {
+            ok: true,
+            result: {
+              name: '长夜',
+              path: projectPath('长夜'),
+              episodes: 12,
+              upgrade: false,
+              dirs: ['01_剧本'],
+              files: ['01_剧本/总纲.md'],
+              skipped: [],
+              pending: [],
+              novel: { name: '长夜', novel: '长夜.txt', file: '', linked: true, already: false, current: '', reason: 'filled' }
+            }
+          },
+          'projects/tree': projectTree()
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+
+      button('新建项目…')?.click()
+      await flush()
+      expect(novelSelect().options[0]?.textContent).toBe('（不登记原著）')
+      expect(
+        Array.from(novelSelect().options).map((o) => o.value),
+        '原著下拉是从原文库现取的'
+      ).toContain('长夜.txt')
+
+      nameInput().value = '长夜'
+      novelSelect().value = '长夜.txt'
+      upgradeBox().checked = true
+      button('建')?.click()
+      await flush()
+
+      expect(bridge.request).toHaveBeenCalledWith('projects/create', {
+        name: '长夜',
+        episodes: 12,
+        upgrade: true,
+        novel: '长夜.txt'
+      })
+      expect(hintLine().textContent).toContain('建好了 长夜（新目录 1 个，新文件 1 份）')
+      expect(hintLine().textContent).toContain('原著登记为「长夜.txt」')
+      expect(view(PROJECT_FORM_ID).dataset.open, '建完把表单收起来，接着看它的落点').toBe('0')
+      expect(document.getElementById(PROJECT_HEAD_ID)?.textContent).toContain(projectPath('长夜'))
+    })
+
+    it('explains each way the novel link did not happen', async () => {
+      const createWith = (novel: Record<string, unknown>): unknown => ({
+        ok: true,
+        result: {
+          name: '长夜',
+          path: projectPath('长夜'),
+          episodes: 12,
+          upgrade: false,
+          dirs: [],
+          files: [],
+          skipped: [],
+          pending: [],
+          novel
+        }
+      })
+      installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'projects/tree': projectTree(),
+          'projects/create': createWith({
+            name: '长夜',
+            novel: '长夜.txt',
+            linked: false,
+            already: true,
+            current: '另一本.txt',
+            reason: 'already'
+          })
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+      button('新建项目…')?.click()
+      await flush()
+
+      nameInput().value = '长夜'
+      button('建')?.click()
+      await flush()
+
+      // 来源记录不许被悄悄改掉：已经填着的时候要说出原来填的是什么。
+      expect(hintLine().textContent).toContain('没动它')
+      expect(hintLine().textContent).toContain('另一本.txt')
+    })
+
+    it('puts the brief in the composer without sending it', async () => {
+      const bridge = installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'projects/tree': projectTree(),
+          'projects/brief': {
+            ok: true,
+            result: { name: '长夜', path: projectPath('长夜'), text: '【项目】长夜\n阶段：✅ 剧本  ☐ 分镜' }
+          }
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+      await openLine('长夜')
+
+      button('发到对话')?.click()
+      await flush()
+
+      expect(bridge.request).toHaveBeenCalledWith('projects/brief', { name: '长夜' })
+      expect(view(CHAT_VIEW_ID).style.display, '拿去对话就切回对话').toBe('flex')
+      expect((document.getElementById(INPUT_ID) as HTMLTextAreaElement).value).toContain('【项目】长夜')
+      // 拿哪一部开工、怎么开工是用户的事：面板只把材料放进框里，不替他按发送。
+      expect(projectCalls(bridge, 'agent/chat')).toHaveLength(0)
+      expect(document.getElementById(STATUS_ID)?.textContent).toContain('长夜')
+    })
+
+    it('says the project could not be read when the host refuses', async () => {
+      installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'projects/tree': { ok: false, error: { message: '找不到项目规范的事实源' } }
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+      await openLine('长夜')
+
+      expect(document.getElementById(PROJECT_HEAD_ID)?.textContent).toContain('找不到项目规范的事实源')
+      expect(document.querySelectorAll(`#${PROJECT_SHELVES_ID} .cs-proj-shelf`), '读不出来就别摆格子').toHaveLength(0)
+      expect(hintLine().getAttribute('data-tone')).toBe('error')
+    })
+
+    it('filters projects through the host instead of hiding the ones it never listed', async () => {
+      const bridge = installBridge({ request: filteringHost() })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+      expect(document.querySelectorAll(`#${PROJECT_LIST_ID} .cs-proj-row`), '不带筛词时两部都在').toHaveLength(2)
+
+      await typeProjectFind('乙')
+
+      // 筛词是交给宿主去匹配的（projects.py 的 list(query)）：面板手里那一屏本来就可能被截断，
+      // 自己再过滤一遍，没列出来的那几部就永远看不见了。
+      expect(lastListParams(bridge)).toEqual({ name: '乙' })
+      expect(document.querySelectorAll(`#${PROJECT_LIST_ID} .cs-proj-row`)).toHaveLength(1)
+      expect(projectLine('乙剧')).not.toBeNull()
+      expect(projectLine('长夜')).toBeNull()
+      expect(document.getElementById(PROJECT_FIND_COUNT_ID)?.textContent).toBe('匹配 1 部')
+    })
+
+    it('counts what the host actually matched, not what fits on the screen', async () => {
+      const bridge = installBridge({
+        request: host({
+          'projects/list': listing([projectRow(), projectRow({ name: '乙剧' })], {
+            matched: 37,
+            returned: 2,
+            truncated: true,
+            limit: 2
+          })
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+
+      // matched 是宿主筛完之后的匹配数：面板不自己数屏上那两行报成"共 2 部"。
+      expect(document.getElementById(PROJECT_FIND_COUNT_ID)?.textContent).toBe('共 37 部')
+      expect(document.getElementById(PROJECT_LIST_ID)?.textContent).toContain('还有 35 部没列出来')
+      // 筛词写细一点就能把它捞出来 —— 这句得说，否则人会以为项目丢了。
+      expect(document.getElementById(PROJECT_LIST_ID)?.textContent).toContain('把名字写细一点')
+      expect(bridge.request).toHaveBeenCalledWith('projects/list', {})
+    })
+
+    it('says no project matches instead of looking like an empty project root', async () => {
+      installBridge({ request: filteringHost() })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+
+      await typeProjectFind('丙')
+
+      expect(document.getElementById(PROJECT_LIST_ID)?.textContent).toContain('没有名字含「丙」的项目')
+      expect(document.getElementById(PROJECT_FIND_COUNT_ID)?.textContent).toBe('匹配 0 部')
+      // 筛不着 ≠ 目录里还没东西：这两句话不能混着说。
+      expect(document.getElementById(PROJECT_LIST_ID)?.textContent).not.toContain('还没建过项目')
+    })
+
+    it('waits for a pause in typing before asking the host again', async () => {
+      const bridge = installBridge({ request: filteringHost() })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+      expect(projectCalls(bridge, 'projects/list'), '开页那一趟').toHaveLength(1)
+
+      projectFindBox().value = '乙'
+      projectFindBox().dispatchEvent(new Event('input'))
+      projectFindBox().value = '乙剧'
+      projectFindBox().dispatchEvent(new Event('input'))
+      await vi.advanceTimersByTimeAsync(100)
+      expect(projectCalls(bridge, 'projects/list'), '手还没停，先别问').toHaveLength(1)
+
+      await vi.advanceTimersByTimeAsync(200)
+      await flush()
+
+      expect(projectCalls(bridge, 'projects/list')).toHaveLength(2)
+      expect(lastListParams(bridge), '只发最后停下来的那一串').toEqual({ name: '乙剧' })
+    })
+
+    it('clears the filter with Escape and lists everything again', async () => {
+      const bridge = installBridge({ request: filteringHost() })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+      await typeProjectFind('乙')
+      expect(document.getElementById(PROJECT_FIND_COUNT_ID)?.textContent).toBe('匹配 1 部')
+
+      projectFindBox().dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', cancelable: true }))
+      await flush()
+
+      expect(lastListParams(bridge)).toEqual({})
+      expect(projectFindBox().value).toBe('')
+      expect(document.getElementById(PROJECT_FIND_COUNT_ID)?.textContent).toBe('共 2 部')
+    })
+
+    it('drops the filter when a project is built, so the new one shows up', async () => {
+      const rows = [projectRow({ name: '甲' }), projectRow({ name: '乙剧' })]
+      const bridge = installBridge({
+        request: host({
+          'projects/list': (_method: string, params: unknown) => {
+            const name = String((params as { name?: string } | null)?.name ?? '')
+            const kept = rows.filter((row) => String(row.name).includes(name))
+            return listing(kept, { query: name, matched: kept.length })
+          },
+          'projects/create': {
+            ok: true,
+            result: {
+              name: '新戏',
+              path: projectPath('新戏'),
+              episodes: 12,
+              upgrade: false,
+              dirs: [],
+              files: [],
+              skipped: [],
+              pending: [],
+              novel: null
+            }
+          },
+          'projects/tree': (_method: string, params: unknown) =>
+            projectTree({ name: (params as { name: string }).name })
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+      await typeProjectFind('乙')
+      expect(projectLine('甲')).toBeNull()
+      const before = projectCalls(bridge, 'projects/list').length
+
+      button('新建项目…')?.click()
+      await flush()
+      nameInput().value = '新戏'
+      button('建')?.click()
+      await flush()
+
+      // 筛词跟着这次新建一起清掉：留着的话重列还是带着「乙」，刚建好的那部名字对不上，
+      // 用户建完就"看不见自己"。清的是状态与输入框，不带出额外一趟请求。
+      expect(projectFindBox().value).toBe('')
+      expect(lastListParams(bridge)).toEqual({})
+      expect(projectCalls(bridge, 'projects/list')).toHaveLength(before + 1)
+    })
+
+    it('adds the whole screen up instead of making the user count rows', async () => {
+      installBridge({
+        request: host({
+          'projects/list': listing([
+            projectRow({ name: '甲', stages_done: 0, stages_total: 2, missing_count: 2 }),
+            projectRow({ name: '乙', stages_done: 1, stages_total: 2, missing_count: 1 }),
+            projectRow({ name: '丙', stages_done: 2, stages_total: 2, missing_count: 0 })
+          ])
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+
+      const text = view(PROJECT_OVERVIEW_ID).textContent ?? ''
+      // 这几个数全部出自宿主每一行自带的字段（stages_done / stages_total / missing_count）。
+      expect(text).toContain('列出来的 3 部')
+      expect(text).toContain('还没动工 1 部')
+      expect(text).toContain('进行中 1 部')
+      expect(text).toContain('阶段全落齐 1 部')
+      expect(text).toContain('阶段合计 3/6')
+      expect(text).toContain('缺落点共 3 格')
+      // 阶段全落齐 ≠ 这部戏做完了：这一行不越界替宿主下结论。
+      expect(text).not.toContain('做完')
+    })
+
+    it('says the overview only counted the ones it was shown', async () => {
+      installBridge({
+        request: host({
+          'projects/list': listing([projectRow()], { matched: 8, returned: 1, truncated: true, limit: 1 })
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+
+      const text = view(PROJECT_OVERVIEW_ID).textContent ?? ''
+      expect(text).toContain('列出来的 1 部')
+      expect(text).toContain('还有 7 部没算进来')
+    })
+
+    it('keeps the overview out of the way when there is nothing to add up', async () => {
+      installBridge({ request: host({ 'projects/list': listing([]) }) })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+
+      expect(view(PROJECT_OVERVIEW_ID).textContent).toBe('')
+    })
+
+    it('finds a word inside the page it already read, and marks every hit', async () => {
+      const bridge = installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'projects/tree': projectTree(),
+          'projects/read': page(0, { text: '长夜漫漫，长夜里的灯。', total_chars: 11, truncated: false })
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+      await openLine('长夜')
+      fileLine('01_剧本/总纲.md')?.click()
+      await flush()
+
+      fileFindBox().value = '长夜'
+      fileFindBox().dispatchEvent(new Event('input'))
+      await flush()
+
+      expect(hits(), '两处「长夜」都得上记号').toHaveLength(2)
+      expect(hits()[0]?.getAttribute('data-cur'), '当前停在这一处').toBe('true')
+      expect(hits()[1]?.getAttribute('data-cur')).toBeNull()
+      expect(fileFindCount().textContent).toBe('1/2 处')
+      // 上记号不该改动正文：屏幕上的字仍然是宿主给的那一份。
+      expect(reader().textContent).toBe('长夜漫漫，长夜里的灯。')
+      // 页内找字只在屏幕上转，不再去读一趟（projects/read 没有搜索参数，见 projects.py 的 read）。
+      expect(projectCalls(bridge, 'projects/read')).toHaveLength(1)
+
+      document.getElementById(PROJECT_FILE_FIND_NEXT_ID)?.click()
+      await flush()
+      expect(hits()[1]?.getAttribute('data-cur')).toBe('true')
+      expect(fileFindCount().textContent).toBe('2/2 处')
+
+      // 到底了绕回第一处
+      document.getElementById(PROJECT_FILE_FIND_NEXT_ID)?.click()
+      await flush()
+      expect(fileFindCount().textContent).toBe('1/2 处')
+
+      // 上一处往前绕：从第一处往上就是最后一处
+      document.getElementById(PROJECT_FILE_FIND_PREV_ID)?.click()
+      await flush()
+      expect(fileFindCount().textContent).toBe('2/2 处')
+
+      document.getElementById(PROJECT_FILE_FIND_CLEAR_ID)?.click()
+      await flush()
+      expect(hits()).toHaveLength(0)
+      expect(fileFindCount().textContent).toBe('')
+      expect(fileFindBox().value).toBe('')
+      expect(reader().textContent).toBe('长夜漫漫，长夜里的灯。')
+    })
+
+    it('keeps the original spelling of what it found', async () => {
+      installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'projects/tree': projectTree(),
+          'projects/read': page(0, { text: 'Draft one, draft two.', total_chars: 20, truncated: false })
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+      await openLine('长夜')
+      fileLine('01_剧本/总纲.md')?.click()
+      await flush()
+
+      fileFindBox().value = 'DRAFT'
+      fileFindBox().dispatchEvent(new Event('input'))
+      await flush()
+
+      expect(hits()).toHaveLength(2)
+      // 屏幕上是文件里本来的写法，不是输入框里那串大写。
+      expect(hits()[0]?.textContent).toBe('Draft')
+      expect(hits()[1]?.textContent).toBe('draft')
+    })
+
+    it('says it found nothing without touching the text', async () => {
+      installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'projects/tree': projectTree(),
+          'projects/read': page(0, { text: '长夜漫漫，长夜里的灯。', total_chars: 11, truncated: false })
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+      await openLine('长夜')
+      fileLine('01_剧本/总纲.md')?.click()
+      await flush()
+
+      fileFindBox().value = '没有这三个字'
+      fileFindBox().dispatchEvent(new Event('input'))
+      await flush()
+
+      expect(hits()).toHaveLength(0)
+      expect(fileFindCount().textContent).toBe('没找到')
+      expect(fileFindCount().dataset.tone).toBe('error')
+      expect(reader().textContent, '没找着就把正文原样还回去').toBe('长夜漫漫，长夜里的灯。')
+    })
+
+    it('walks the hits with Enter and Shift+Enter', async () => {
+      installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'projects/tree': projectTree(),
+          'projects/read': page(0, { text: '长夜漫漫，长夜里的灯。', total_chars: 11, truncated: false })
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+      await openLine('长夜')
+      fileLine('01_剧本/总纲.md')?.click()
+      await flush()
+
+      fileFindBox().value = '长夜'
+      fileFindBox().dispatchEvent(new Event('input'))
+      await flush()
+
+      fileFindBox().dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', cancelable: true }))
+      await flush()
+      expect(fileFindCount().textContent).toBe('2/2 处')
+
+      fileFindBox().dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Enter', shiftKey: true, cancelable: true })
+      )
+      await flush()
+      expect(fileFindCount().textContent, 'Shift+Enter 往回走').toBe('1/2 处')
+
+      fileFindBox().dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', cancelable: true }))
+      await flush()
+      expect(fileFindBox().value).toBe('')
+      expect(fileFindCount().textContent).toBe('')
+    })
+
+    it('counts hits again for the page it just turned to', async () => {
+      installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'projects/tree': projectTree(),
+          'projects/read': (_method: string, params: unknown) => {
+            const asked = (params as { offset: number }).offset
+            return asked === 0
+              ? page(0, { text: '长夜里', total_chars: 6000, truncated: true })
+              : page(asked, { text: '这一页没有那两个字', total_chars: 6000, truncated: false })
+          }
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+      await openLine('长夜')
+      fileLine('01_剧本/总纲.md')?.click()
+      await flush()
+
+      fileFindBox().value = '长夜'
+      fileFindBox().dispatchEvent(new Event('input'))
+      await flush()
+      expect(fileFindCount().textContent).toBe('1/1 处')
+
+      pagerButton('下一页')?.click()
+      await flush()
+
+      expect(reader().textContent).toBe('这一页没有那两个字')
+      expect(hits(), '上一页数到的第几处跟这一页没关系').toHaveLength(0)
+      expect(fileFindCount().textContent).toBe('没找到')
+    })
+
+    it('drops the old hits when another project is opened', async () => {
+      installBridge({
+        request: host({
+          'projects/list': listing([projectRow(), projectRow({ name: '乙剧' })]),
+          'projects/tree': (_method: string, params: unknown) =>
+            projectTree({ name: (params as { name: string }).name }),
+          'projects/read': page(0, { text: '长夜漫漫，长夜里的灯。', total_chars: 11, truncated: false })
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+      await openLine('长夜')
+      fileLine('01_剧本/总纲.md')?.click()
+      await flush()
+
+      fileFindBox().value = '长夜'
+      fileFindBox().dispatchEvent(new Event('input'))
+      await flush()
+      expect(hits()).toHaveLength(2)
+
+      await openLine('乙剧')
+
+      // 另一部戏的正文还没读出来，屏上不能留着上一部的那一页给这一部背书。
+      expect(hits()).toHaveLength(0)
+      expect(reader().textContent).toContain('点一格里的文件名')
+      expect(fileFindCount().textContent).toBe('')
+      expect(fileFindBox().value, '框里那串字留着，等新文件读出来自然会对上').toBe('长夜')
+    })
+  })
+
+  describe('键盘', () => {
+    const view = (id: string): HTMLElement => document.getElementById(id) as HTMLElement
+    const tabOf = (name: string): HTMLButtonElement =>
+      document.querySelector<HTMLButtonElement>(`#${TABS_ID} .cs-tab[data-view="${name}"]`) as HTMLButtonElement
+    /** 往 document 上按一个键（面板的快捷键就挂在 document 上），返回那个事件好查有没有被拦下。 */
+    const press = (init: KeyboardEventInit): KeyboardEvent => {
+      const event = new KeyboardEvent('keydown', { ...init, bubbles: true, cancelable: true })
+      document.dispatchEvent(event)
+      return event
+    }
+    const stub: RequestStub = (method) =>
+      method === 'novels/list' ? { ok: true, result: { novels: [] } } : { ok: true, result: { text: '答案在此' } }
+
+    it('focuses this page search box on Ctrl/Cmd+F', async () => {
+      installBridge({ request: stub })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      press({ key: 'f', ctrlKey: true })
+      expect(document.activeElement, '对话页就是消息区上头那个检索框').toBe(document.getElementById(FIND_ID))
+
+      tabOf('project').click()
+      await flush()
+      press({ key: 'f', metaKey: true }) // mac 上是 Cmd+F
+      expect(document.activeElement, '项目页是筛项目那个框').toBe(document.getElementById(PROJECT_FIND_ID))
+    })
+
+    it('leaves the browser find alone while the drawer is shut', async () => {
+      installBridge({ request: stub })
+      setupDom()
+      new Function(script)()
+
+      const event = press({ key: 'f', ctrlKey: true })
+
+      // 面板没开就不许抢键：把键抢了又不给东西，比不抢还烦人。
+      expect(event.defaultPrevented).toBe(false)
+    })
+
+    it('closes the drawer on Escape, but not while a box has the focus', async () => {
+      installBridge({ request: stub })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      const input = document.getElementById(INPUT_ID) as HTMLTextAreaElement
+      input.focus()
+      press({ key: 'Escape' })
+      // 在输入框里按 Esc 是"我还要接着改"，不是"把面板关了"。
+      expect(view(DRAWER_ID).style.display).not.toBe('none')
+
+      input.blur()
+      press({ key: 'Escape' })
+      expect(view(DRAWER_ID).style.display).toBe('none')
+    })
+
+    it('walks the tabs with the arrow keys and Home/End', async () => {
+      installBridge({ request: stub })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      const chatTab = tabOf('chat')
+      chatTab.focus()
+      chatTab.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true }))
+      await flush()
+
+      const novelTab = tabOf('novel')
+      expect(view(NOVEL_VIEW_ID).style.display).toBe('flex')
+      expect(document.activeElement, '焦点得跟着走，否则后面按左右键都不从这儿算').toBe(novelTab)
+      expect(novelTab.getAttribute('aria-selected')).toBe('true')
+      expect(chatTab.getAttribute('aria-selected')).toBe('false')
+      expect(chatTab.tabIndex, '只有当前这一页能被 Tab 到').toBe(-1)
+      expect(novelTab.tabIndex).toBe(0)
+
+      novelTab.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true, cancelable: true }))
+      await flush()
+      expect(view(PROJECT_VIEW_ID).style.display).toBe('flex')
+      expect(document.activeElement).toBe(tabOf('project'))
+
+      // 到头了绕回第一页
+      tabOf('project').dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true })
+      )
+      await flush()
+      expect(view(CHAT_VIEW_ID).style.display).toBe('flex')
+    })
+
+    it('says which page each tab stands for', async () => {
+      installBridge({ request: stub })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      // 读屏软件靠这几个属性才说得清"这是个标签、它管哪一块、现在选的是哪个"。
+      expect(document.getElementById(TABS_ID)?.getAttribute('role')).toBe('tablist')
+      expect(tabOf('chat').getAttribute('role')).toBe('tab')
+      expect(tabOf('chat').getAttribute('aria-controls')).toBe(CHAT_VIEW_ID)
+      expect(tabOf('project').getAttribute('aria-controls')).toBe(PROJECT_VIEW_ID)
+      expect(tabOf('chat').getAttribute('aria-selected')).toBe('true')
+      expect(view(CHAT_VIEW_ID).getAttribute('role')).toBe('tabpanel')
+      expect(view(PROJECT_VIEW_ID).getAttribute('role')).toBe('tabpanel')
     })
   })
 })

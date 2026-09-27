@@ -9,6 +9,7 @@
 
 所以本测试的重点**不是**"正常情况通过"，而是**故意注入每一种漂移，证明它真的会报**：
 未登记 ID · 格式非法 · 一号两类型 · 两张单子不一致 · 外来前缀不误报 · 派生后缀不误报。
+另钉一条**静态**守卫：drift 的前缀表 / 蓝图字面表必须与 `schema` 同源（见文末）。
 
 运行：`python tests/test_drift.py`
 """
@@ -230,6 +231,24 @@ def _run(tmp: Path) -> int:
     check("写明这条引用曾**差一节**（§七 → §六）", "差一节" in txt)
     check("明确列出「不验 ID 的语义正确性」", "语义正确性" in txt)
     check("明确列出「不验风格本身好不好（艺术判断）」", "艺术判断" in txt)
+
+    print()
+    print("── 前缀表 / 蓝图字面：不得与 `schema` 分家 ──")
+    # ⚠️「有哪些前缀、各是什么类型」是**同一个知识**，权威在 `schema`（`ID_STYLES` +
+    #    `ID_CROSSWALK`，两处都是有出处的规范字面）。drift 另存一份的失效模式最坏：
+    #    schema 新增资产类型时**不报错**，只是这边**静默不认那类 ID** ——
+    #    漂移检测从"漏报"变成"全 ✅ 但其实没查"，比报错难发现得多。
+    from src import schema   # noqa: E402
+    bad_pre = [f"{tpl.split('{')[0]}({t})"
+               for t, tpl in schema.ID_STYLES["project"].items()
+               if drift.PREFIX_TYPE.get(tpl.split("{")[0]) != t]
+    check("schema 的每个项目字面前缀都在 drift.PREFIX_TYPE 里且类型一致",
+          not bad_pre, f"缺失/不符：{bad_pre}")
+    bad_alias = [a for a in schema.ID_CROSSWALK.values() if a not in drift.ALIAS_TYPE]
+    check("schema 的每个蓝图字面都在 drift.ALIAS_TYPE 里", not bad_alias, f"缺失：{bad_alias}")
+    unknown = set(drift.PREFIX_TYPE.values()) - set(schema.ID_STYLES["project"])
+    check("drift 多认的类型**只能是**外来三项（SHT_/VID_/AUD_）",
+          unknown == {"storyboard", "video", "audio"}, str(unknown))
 
     print()
     print("=" * 66)

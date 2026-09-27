@@ -61,9 +61,17 @@
 **改了本目录的规格 → 重跑一次生成脚本**，否则部署的 agent 仍是旧规则：
 
 ```bash
-python .codebuddy/agents/_build.py
+python .codebuddy/agents/_build.py                                # 重生成 + 同步宿主侧那份快照
 python AI漫剧智能体工作流/07-智能体运行时/tests/test_agents.py   # 含"生成物 == 重算"检查
 ```
+
+⚠️ **本目录这 6 份还会被复制一份到宿主侧**
+`Comfy-Desktop/lib/comfy_studio/agent/presets/`（桌面面板的随包预置要自带正文：宿主包随壳
+分发、cwd 是壳自带的 lib，猜不到用户的 ComfyUI 装在哪）。**本目录是权威源，那份是派生物** ——
+上面那条命令**会顺手同步过去**（按字节复制，`--不同步预置` 可跳过；不要反向抄）。
+`tests/test_agents.py` 有一条逐字对拍钉着两处必须一字不差
+（那条断言**不做**"目录在才查"的静默跳过）。宿主包为什么不能反过来依赖本目录，见
+`presets/README.md`。
 
 > 要装到 CodeBuddy **用户级**（`~/.codebuddy/agents/`，对**本机所有项目**生效）→ 见 **§五**。
 
@@ -72,7 +80,10 @@ python AI漫剧智能体工作流/07-智能体运行时/tests/test_agents.py   #
 1. 命名按 §二 的格式；
 2. 若是**新模块**的规格，在 `.codebuddy/agents/_build.py` 的 `SOURCES` 加一行
    （`module` / `mode` 必填 —— 自动入口需与联动型一起对上 `tests/test_agents.py` 的**名册**）；
-3. 重跑生成脚本 + 校验测试（要同步到用户级，就再补 §五 的第 ② 步）。
+3. 在宿主侧的 `Comfy-Desktop/lib/comfy_studio/agent/catalog.py` 的 `PRESET_AGENTS` 加/改四项一组
+   （`id` / 下拉显示名 / 说明 / 包内文件名）—— **漏了它这个智能体就不会出现在面板下拉里**；
+   `_build.py` 跑完会直接报「清单里缺 …」，不用等测试；
+4. 重跑生成脚本 + 校验测试（要同步到用户级，就再补 §五 的第 ② 步）。
 
 ## 五、部署到 CodeBuddy **用户级**（`~/.codebuddy/agents/`）
 

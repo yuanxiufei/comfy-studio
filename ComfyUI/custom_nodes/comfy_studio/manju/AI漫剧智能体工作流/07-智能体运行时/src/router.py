@@ -8,6 +8,11 @@
 
 实现策略：先用规则（`nl_parser`）判定；LLM 可用时再用它复核/补正，
 但**只在规则置信度低时**才启用 LLM，避免无谓消耗。
+
+⚠️ 本文件有个**同名函数**（2026-09-27 逐项核对过，**不是重复**）：
+    `dispatcher.route()` 是**模块级**路由（这句话该进哪个 agent，返回 `RouteResult`）；
+    本文件的 `route()` 是**资产库内**的意图判定（create/modify/query + 资产类型，返回 `Route`）。
+    两者输入输出与层级都不同 —— 都叫 `route` 只是中文里"路由"一词的两种用法。
 """
 
 from __future__ import annotations
@@ -15,7 +20,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 
-from .nl_parser import ParsedInput, parse as rule_parse
+from .nl_parser import MODIFY_VERBS, ParsedInput, parse as rule_parse
 
 # ⚠️ 这张表是**查询判定的唯一来源**（`agent._search_term` 也用它抽过滤词 ——
 #    两处各存一份必然漂移，那是本项目反复强调的「同一知识两处维护」）。
@@ -28,7 +33,10 @@ from .nl_parser import ParsedInput, parse as rule_parse
 QUERY_WORDS = ["列出", "列一下", "查找", "查一下", "查询", "查看", "看看",
                "有哪些", "有那些", "找出", "找一下", "搜一下", "搜",
                "list", "show", "find"]
-MODIFY_WORDS = ["改成", "换成", "改为", "变成", "增加", "加上", "去掉", "删除"]
+# ⚠️ **修改类动词这里不另存一份** —— 唯一来源是 `nl_parser.MODIFY_VERBS`
+#    （它已在 `_detect_modify()` 里判过 modify，连"把"字句都算进去了）。
+#    2026-09-27 之前本文件存着第二份（少一个「减掉」），后果与上面那张查询表同款：
+#    两份表必然漂移，而漂移**不报错**（少一个词只是某句话判错）。
 
 ROUTER_SYSTEM = """你是 AI 漫剧资产库的指令路由器。判断用户想做什么，只返回 JSON：
 {"operation": "create|modify|query", "asset_type": "character|costume|prop|environment",
@@ -67,7 +75,9 @@ def route(text: str, llm=None, default_type: str = "") -> tuple[Route, ParsedInp
     if any(w in text for w in QUERY_WORDS):
         r.operation = "query"
         r.reason = "命中查询类动词"
-    if any(w in text for w in MODIFY_WORDS):
+    # ⭐ **修改优先于查询**：两句都出现时（「查看一下，把头发改成蓝色」）用户要的是改。
+    #    这里复用的是 `nl_parser` 的**同一张表**（不是副本）—— 故 precedence 也是唯一的。
+    if any(w in text for w in MODIFY_VERBS):
         r.operation = "modify"
 
     # 规则置信度低 → 交给 LLM 复核（有 Key 时）

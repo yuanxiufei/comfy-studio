@@ -54,12 +54,19 @@ STORYBOARD_DIR = "08_STORYBOARDS"
 SHOTS_DIR = "09_SHOTS"
 
 # ── 节奏常数（改了会直接改总时长，改完必须重跑分镜并核对时长列）──
+# ⚠️ 本段是**台词语速与目标时长的唯一来源**：
+#    · `CPS`       —— `pipeline` 算台词字数预算与时长估计时读它（`storyboard.CPS`）
+#    · `TARGET_SEC`—— `pipeline.target_sec()` 的兜底值 + `shots_markdown` 默认值
+#    2026-09-27 之前 `flow_core` 另存了 `LINE_CPS = 4.5` 与 `TARGET_SEC = 105.0`
+#    两份同值副本（三处 105.0 中的两处），已删 —— 同值副本的失效模式是
+#    "改一处、另几处静默失效"，而本项目反复吃过这个亏。
 ACT_BASE = 0.9        # 动作段起手：镜头切过去、眼睛跟上，约 0.9s
 ACT_CPS = 18.0        # 动作段读画面速度（字/秒）
 CPS = 4.5             # 台词配音语速（字/秒）
 MIN_SEC, MAX_SEC = 2.6, 6.5   # 单镜时长上下限（秒）
 PACK_SEC = 4.0        # 装箱目标：≈ 4s/镜（与物料单"时长 ÷ 4s/镜"的估算一致）
 TOL = 0.30            # 总时长对目标的容差：超 30% 才算"剧本写长了"，要回去改剧本
+TARGET_SEC = 105.0    # 物料单缺失时的兜底目标（2 分钟级短剧）
 
 
 def frames_dir(ep: str) -> str:
@@ -406,7 +413,7 @@ def unresolved(shots: list, registry) -> dict:
 
 def shots_markdown(title: str, shots: list, *, ep: str, fps: float,
                    model_note: str = "", missing: dict | None = None,
-                   target_sec: float = 105.0, unreg: dict | None = None) -> str:
+                   target_sec: float = TARGET_SEC, unreg: dict | None = None) -> str:
     """写成分镜表（人看的那份）。
 
     主表是工作流硬标准的**九列**（`03-分镜导演/00-主控智能体.md`：镜号/景别/摄影角度/
@@ -482,7 +489,7 @@ def shots_markdown(title: str, shots: list, *, ep: str, fps: float,
 
 def write_storyboard(project_dir: str, ep: str, shots: list, *, title: str = "",
                      fps: float = 24.0, model_note: str = "",
-                     missing: dict | None = None, target_sec: float = 105.0,
+                     missing: dict | None = None, target_sec: float = TARGET_SEC,
                      unreg: dict | None = None) -> tuple:
     """落盘：`08_STORYBOARDS/分镜表_<EP>.md` + `08_STORYBOARDS/shots_<EP>.json`。"""
     out_dir = os.path.join(project_dir, STORYBOARD_DIR)

@@ -300,6 +300,108 @@ class NovelLibraryTest(unittest.TestCase):
         with self.assertRaises(NovelsError):
             self.library.delete("删我.txt")
 
+    # ---- 章节 -----------------------------------------------------------
+
+    def test_chapters_cut_on_title_lines(self) -> None:
+        text = "书名与简介\n第一章 起点\n开篇的正文\n第二章 转折\n后面的正文\n"
+        self._novel("连载.txt", text)
+        result = self.library.chapters("连载.txt")
+        titles = [row["title"] for row in result["chapters"]]
+        self.assertEqual(titles, ["开头（章节之前）", "第一章 起点", "第二章 转折"])
+        self.assertEqual(result["count"], 3)
+        self.assertFalse(result["truncated"])
+        # 每章的 offset 拿回去调 read 就跳到那一章的开头。
+        second = result["chapters"][1]
+        page = self.library.read("连载.txt", second["offset"], 20)
+        self.assertTrue(page["text"].startswith("第一章 起点"))
+        # 末章的结尾是全篇结尾，不把别的东西算进去。
+        # 比 total_chars 而不是 len(text)：Windows 上写文件会把 \n 翻成 \r\n，
+        # 落下去的是文件里那份正文的长度。
+        last = result["chapters"][2]
+        self.assertEqual(last["offset"] + last["chars"], result["total_chars"])
+
+    def test_chapters_ignore_prose_that_merely_starts_with_a_number(self) -> None:
+        # 正文里出现"第 3 章……"极常见：不要求"整行基本是标题"，就会切出一堆假章节，
+        # 那种目录比没有目录更没用。
+        text = "第一章 起\n他说第 3 章里那句是错的\n第 3 章说的是另一件事，别被骗了\n第二章 承\n"
+        self._novel("提及.txt", text)
+        titles = [row["title"] for row in self.library.chapters("提及.txt")["chapters"]]
+        # 头一行就是标题，所以没有"开头（章节之前）"那一条。
+        self.assertEqual(titles, ["第一章 起", "第二章 承"])
+
+    def test_chapters_fall_back_to_the_whole_text(self) -> None:
+        self._novel("短篇.txt", "没有任何标题的一段字。")
+        result = self.library.chapters("短篇.txt")
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["chapters"][0]["title"], "全文")
+        # 切不出来就直说：面板照这句话显示，而不是画一棵空树。
+        self.assertIn("没切出章节", result["message"])
+
+    def test_chapters_report_truncation(self) -> None:
+        text = "".join(f"第{index}章 标题{index}\n正文\n" for index in range(1, 6))
+        self._novel("多章.txt", text)
+        result = self.library.chapters("多章.txt", limit=3)
+        self.assertEqual(result["count"], 5)
+        self.assertEqual(result["returned"], 3)
+        self.assertTrue(result["truncated"])
+
+    def test_chapters_reject_bad_input(self) -> None:
+        self._novel("一章.txt", "第一章 x\n")
+        with self.assertRaises(NovelsError):
+            self.library.chapters("一章.txt", limit=0)
+        with self.assertRaises(NovelsError):
+            self.library.chapters("没有这篇.txt")
+
+    # ---- 搜索 -----------------------------------------------------------
+
+    def test_search_returns_offsets_and_snippets(self) -> None:
+        text = "前面的字。张三来了。中间一段。张三又走了。"
+        self._novel("找人.txt", text)
+        result = self.library.search("找人.txt", "张三")
+        self.assertEqual(result["matched"], 2)
+        self.assertEqual(
+            [row["offset"] for row in result["matches"]],
+            [text.find("张三"), text.find("张三", text.find("张三") + 1)],
+        )
+        self.assertIn("张三", result["matches"][0]["snippet"])
+        self.assertFalse(result["truncated"])
+        # offset 拿回去读，落在命中处。
+        page = self.library.read("找人.txt", result["matches"][1]["offset"], 2)
+        self.assertEqual(page["text"], "张三")
+
+    def test_search_is_literal(self) -> None:
+        # 不分词、不忽略大小写：用户是从记得的那句话里挑几个字来跳转的，
+        # 把"abc"当"ABC"、把"张 三"当"张三"，给出的都是他没要的位置。
+        self._novel("字面.txt", "ABC abc 张 三")
+        self.assertEqual(self.library.search("字面.txt", "abc")["matched"], 1)
+        self.assertEqual(self.library.search("字面.txt", "张三")["matched"], 0)
+
+    def test_search_reports_truncation_and_folds_newlines(self) -> None:
+        self._novel("重复.txt", "字" * 10)
+        limited = self.library.search("重复.txt", "字", limit=3)
+        self.assertEqual(limited["matched"], 3)
+        self.assertTrue(limited["truncated"])
+        self._novel("换行.txt", "上一行\n张三\n下一行")
+        snippet = self.library.search("换行.txt", "张三")["matches"][0]["snippet"]
+        self.assertNotIn("\n", snippet)
+        self.assertIn("张三", snippet)
+
+    def test_search_rejects_blank_query(self) -> None:
+        self._novel("空.txt", "字")
+        for query in ("", "   "):
+            with self.subTest(query=query):
+                with self.assertRaises(NovelsError):
+                    self.library.search("空.txt", query)
+
+    # ---- 解码缓存 -------------------------------------------------------
+
+    def test_text_cache_is_invalidated_when_the_file_changes(self) -> None:
+        path = self._novel("缓存.txt", "第一章 x\n正文\n")
+        self.assertEqual(self.library.read("缓存.txt", 0, 5)["text"], "第一章 x")
+        # 缓存按 (路径, 大小, 改于何时) 认：文件被外面改了就得给新内容，不能拿旧的糊弄人。
+        path.write_text("第一章 y\n换了新正文\n", encoding="utf-8")
+        self.assertEqual(self.library.read("缓存.txt", 0, 5)["text"], "第一章 y")
+
     # ---- 越界 -----------------------------------------------------------
 
     def test_names_cannot_leave_the_novel_dir(self) -> None:
@@ -383,6 +485,33 @@ class NovelsRpcTest(unittest.TestCase):
         with self.assertRaises(RpcError) as typed:
             self.host.novels_import({"path": "x.txt", "overwrite": "yes"}, None)
         self.assertEqual(typed.exception.code, INVALID_PARAMS)
+
+    def test_chapters_rpc_registered_and_checked(self) -> None:
+        self.assertIn("novels/chapters", self.host.server.methods)
+        self.novel_dir.mkdir(parents=True, exist_ok=True)
+        (self.novel_dir / "连载.txt").write_text("第一章 a\n正文\n", encoding="utf-8")
+        result = self.host.novels_chapters({"name": "连载.txt"}, None)
+        self.assertEqual(result["returned"], 1)  # 第一篇开头就是标题，没有"章节之前"那一段
+        with self.assertRaises(RpcError) as err:
+            self.host.novels_chapters({"name": "连载.txt", "limit": 0}, None)
+        self.assertEqual(err.exception.code, INVALID_PARAMS)
+        with self.assertRaises(RpcError) as missing:
+            self.host.novels_chapters({"name": "没有这篇.txt"}, None)
+        self.assertEqual(missing.exception.code, INTERNAL_ERROR)
+
+    def test_search_rpc_needs_a_query(self) -> None:
+        self.assertIn("novels/search", self.host.server.methods)
+        self.novel_dir.mkdir(parents=True, exist_ok=True)
+        (self.novel_dir / "x.txt").write_text("张三", encoding="utf-8")
+        with self.assertRaises(RpcError) as err:
+            self.host.novels_search({"name": "x.txt"}, None)
+        self.assertEqual(err.exception.code, INVALID_PARAMS)
+        result = self.host.novels_search({"name": "x.txt", "query": "张三"}, None)
+        self.assertEqual(result["matched"], 1)
+        # 没挂原文目录的宿主：说不清就没得用，明说这一页用不了。
+        with self.assertRaises(RpcError) as bare:
+            self.bare.novels_search({"name": "x.txt", "query": "张三"}, None)
+        self.assertEqual(bare.exception.code, INTERNAL_ERROR)
 
 
 if __name__ == "__main__":

@@ -27,516 +27,18 @@ S6（音频，口径在 `05-音乐音频/`），那两段留给各自 agent：
 `python main.py run expression|audio`。
 """
 
-from __future__ import annotations
-
-import json
-import os
-import re
-from dataclasses import dataclass, field
-from pathlib import Path
-
-from . import asset_index, film, registry as agent_registry, storyboard
+from . import film, registry as agent_registry, storyboard
 from .agent import AgentConfig, DramaAssetAgent
+from .flow_core import *  # noqa: F401,F403 —— 常量/阶段/工具，见 flow_core.py
+from .flow_core import _append_registry_rows, _load_cfg, _md_table, _read, _write  # noqa: F401
+from .flow_prompts import *  # noqa: F401,F403 —— LLM 提问模板，见 flow_prompts.py
 from .image_provider import get_provider as get_image_provider
+from .project import find_workspace, list_projects, projects_root
 from .runtime import Runtime
 from .video_provider import find_comfy_root, get_video_provider
 
 __all__ = ["Flow", "Stage", "STAGES", "ORDER", "StageError", "StageResult",
            "find_workspace", "projects_root", "list_projects", "default_ep"]
-
-ROOT = Path(__file__).resolve().parent.parent      # `07-智能体运行时/`
-WORKFLOW_ROOT = ROOT.parent                        # `AI漫剧智能体工作流/`
-
-# ── 项目骨架落点（`02-服化道/项目骨架/README.md` §一）──
-PROJ = "00_PROJECT"
-SCRIPT_DIR = f"{PROJ}/01_剧本"
-INDEX_DIR = f"{PROJ}/02_资产索引"
-LEDGER_DIR = f"{PROJ}/03_台账"
-DELIVERY_DIR = f"{PROJ}/04_交付与出图"
-SKELETON_DIRS = ("00_PROJECT/01_剧本", "00_PROJECT/02_资产索引", "00_PROJECT/03_台账",
-                 "00_PROJECT/04_交付与出图", "00_PROJECT/05_流程", "01_WORLD",
-                 "02_CHARACTERS", "03_COSTUMES", "04_PROPS", "05_ENVIRONMENTS",
-                 "06_EXPRESSIONS", "07_POSES", "08_STORYBOARDS", "09_SHOTS",
-                 "10_CONSISTENCY")
-ASSET_DIRS = {"CHR": "02_CHARACTERS", "CST": "03_COSTUMES",
-              "PRP": "04_PROPS", "ENV": "05_ENVIRONMENTS"}
-PNG_EXTS = (".png", ".jpg", ".jpeg", ".webp")
-VER_RE = re.compile(r"_v(\d+(?:\.\d+)?)")
-
-# 四张索引表头 —— 照抄项目里已在用的列（`02_资产索引/*.md`），
-# 让模型按表头填，落盘时就不会出现"列对不上"的错位。
-IDX_HEADERS = {
-    "角色": ["ID", "姓名", "别名", "年龄(EP)", "身份", "社会地位", "外貌要点",
-             "关键特征", "出场集", "资产状态"],
-    "服装": ["ID", "角色", "服装名", "场合", "时代/阶层", "主色", "材质",
-             "状态派生", "出场集", "状态"],
-    "道具": ["ID", "名称", "归属", "用途", "尺寸参照", "材料", "状态派生",
-             "出场集", "状态"],
-    "场景": ["ID", "场景名", "时间", "内/外", "建筑特征", "光源", "主空间关系",
-             "出场集", "状态"],
-}
-IDX_FILE = {"角色": "角色索引（INDEX_CHARACTER）.md",
-            "服装": "服装索引（INDEX_COSTUME）.md",
-            "道具": "道具索引（INDEX_PROP）.md",
-            "场景": "场景索引（INDEX_ENVIRONMENT）.md"}
-IDX_TITLE = {"角色": "CHARACTER INDEX", "服装": "COSTUME INDEX",
-             "道具": "PROP INDEX", "场景": "ENVIRONMENT INDEX"}
-
-LINE_CPS = 4.5            # 台词配音语速（字/秒，与 storyboard.CPS 一致）
-LINE_SHARE = 0.55         # 一集里台词占多少时间（其余是动作段与留白）
-TARGET_SEC = 105.0        # 物料单缺失时的兜底目标（2 分钟级短剧）
-
-
-class StageError(RuntimeError):
-    """阶段失败 —— 一律显式抛出，由 CLI 打成人话。"""
-
-
-@dataclass(frozen=True)
-class Stage:
-    key: str
-    code: str
-    what: str
-    llm: bool = False
-
-
-STAGES: tuple = (
-    Stage("建纲", "S0", "小说 → 分集大纲 / 每集剧本 / 角色小传 / ID 注册表 / 未决项表",
-          llm=True),
-    Stage("资产", "S1", "剧本 → 视觉圣经 + 四张索引 + 生图提示词", llm=True),
-    Stage("分镜", "S4", "剧本 → 九列分镜表 + shots_<EP>.json（帧数/首帧/提示词）"),
-    Stage("首帧", "S4", "每镜首帧 PNG（ComfyUI 文生图；有资产图时挂参考图）"),
-    Stage("出片", "S5", "每镜 mp4（ComfyUI fl2v 时间线，逐镜一跑）"),
-    Stage("成片", "S5", "按镜序拼接成片 mp4"),
-)
-ORDER = [s.key for s in STAGES]
-BY_KEY = {s.key: s for s in STAGES}
-
-
-@dataclass
-class StageResult:
-    key: str
-    ok: bool = True
-    detail: str = ""
-    files: list = field(default_factory=list)
-    notes: list = field(default_factory=list)
-    skipped: bool = False
-
-
-# ─────────────────────────────────────────────────────────────
-# 工作区 / 项目定位（**全部动态探测，不写死机器路径**）
-# ─────────────────────────────────────────────────────────────
-
-def find_workspace(start=None) -> str:
-    """往上找「工作区根」：含 `projects/` 的那一级。
-
-    实测布局：`<工作区>/projects/<项目名>/`、`<工作区>/novel/*.txt`、
-    `<工作区>/AI漫剧智能体工作流/07-智能体运行时/`（本文件所在处）。
-    """
-    d = os.path.abspath(str(start or ROOT))
-    for _ in range(6):
-        if os.path.isdir(os.path.join(d, "projects")):
-            return d
-        up = os.path.dirname(d)
-        if up == d:
-            break
-        d = up
-    return ""
-
-
-def projects_root() -> str:
-    """项目根：环境变量 `VOIDE_PROJECTS_ROOT` 优先，否则动态探测。"""
-    env = os.getenv("VOIDE_PROJECTS_ROOT")
-    if env:
-        return os.path.abspath(env)
-    ws = find_workspace()
-    return os.path.join(ws, "projects") if ws else ""
-
-
-def list_projects() -> list:
-    d = projects_root()
-    if not d or not os.path.isdir(d):
-        return []
-    return sorted(n for n in os.listdir(d)
-                  if os.path.isdir(os.path.join(d, n)) and not n.startswith("."))
-
-
-def default_ep(project: str) -> str:
-    """项目里最小的一集（没有剧本时给 EP01）。"""
-    d = os.path.join(project, SCRIPT_DIR)
-    names = os.listdir(d) if os.path.isdir(d) else []
-    eps = sorted(set(re.findall(r"EP\d+", " ".join(names))))
-    return eps[0] if eps else "EP01"
-
-
-# ─────────────────────────────────────────────────────────────
-# 小工具
-# ─────────────────────────────────────────────────────────────
-
-def _read(path: str) -> str:
-    with open(path, encoding="utf-8") as f:
-        return f.read()
-
-
-# 名字归一（去空白/全角括号/大小写）—— 与 asset_index 同一套口径，
-# 免得"注册表认得出、这里认不出"。
-norm_key = asset_index.norm
-
-
-def auto_frame_workflow() -> str:
-    """找本机 ComfyUI 里的「分镜首帧」工作流（找不到返回空串，让 provider 自己报错）。
-
-    为什么按名字找而不是写死路径：工作流 JSON 是**用户资产**，会改名、会加批次，
-    写死等于把用户的目录结构钉进代码（也违反"扫描/探测类路径一律不许写死"）。
-    """
-    root = find_comfy_root()
-    if not root:
-        return ""
-    wf_dir = Path(root) / "user" / "default" / "workflows"
-    base = Path(root) / "user" / "default"
-    for pat in ("**/*分镜首帧*.json", "**/*首帧*.json", "**/*storyboard*frame*.json"):
-        for base_dir in (wf_dir, base):
-            hits = sorted(base_dir.glob(pat))
-            if hits:
-                return str(hits[0])
-    return ""
-
-
-def _load_cfg(root: Path) -> dict:
-    p = root / "config.json"
-    if not p.is_file():
-        return {}
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as e:
-        raise StageError(f"config.json 解析失败（{p}）：{e}") from e
-
-
-def _write(path: str, text: str) -> str:
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text if text.endswith("\n") else text + "\n")
-    return path
-
-
-def _md_table(headers: list, rows: list) -> str:
-    """按给定表头把 dict 行铺成 markdown 表（缺列补 `—`，多余的列丢掉）。"""
-    out = ["| " + " | ".join(headers) + " |",
-           "|" + "|".join(["---"] * len(headers)) + "|"]
-    for r in rows:
-        cells = []
-        for h in headers:
-            v = r.get(h, "")
-            if isinstance(v, (list, tuple)):
-                v = "、".join(str(x) for x in v)
-            cells.append(str(v).replace("|", "／").replace("\n", " ").strip() or "—")
-        out.append("| " + " | ".join(cells) + " |")
-    return "\n".join(out) + "\n"
-
-
-def _append_registry_rows(text: str, prefix: str, rows: list) -> tuple:
-    """把新行追加到注册表里 `` `PREFIX` `` 那一节的表格尾部，返回 `(新文本, 行数)`。
-
-    为什么按**表头名**映射而不是按列号拼：模板
-    （`01-剧本文本/模板/ID-REGISTRY.md` §四）与实际项目文件
-    （`## 一、角色段 \\`CHR_\\``）的**列数与顺序都不一样**，按列号拼会错位。
-    定位不到那节就抛错 —— 不猜结构。
-    """
-    m = re.search(rf"^#{{2,4}}.*`{re.escape(prefix)}_`.*$", text, re.M)
-    if not m:
-        raise StageError(
-            f"注册表里找不到 `` `{prefix}_` `` 那一节的标题 —— 请确认它写成"
-            f"「## 一、角色段 `CHR_`」这样，或手工补登记")
-    lines = text[m.end():].split("\n")
-    hi = next((i for i, ln in enumerate(lines) if ln.strip().startswith("|")), -1)
-    if hi < 0:
-        raise StageError(f"注册表 `{prefix}_` 那节下面没有表格 —— 拒绝往未知结构里追加")
-    headers = [c.strip() for c in lines[hi].strip().strip("|").split("|")]
-    j = hi + 1
-    while j < len(lines) and lines[j].strip().startswith("|"):
-        j += 1
-    add = 0
-    for r in rows:
-        cells = [str(r.get(h, "—")).replace("|", "／").strip() or "—" for h in headers]
-        lines.insert(j, "| " + " | ".join(cells) + " |")
-        j += 1
-        add += 1
-    return text[:m.end()] + "\n".join(lines), add
-
-
-# ─────────────────────────────────────────────────────────────
-# LLM 提问模板（都要求"机器能落盘的形状"，人话交给模型自己组织）
-# ─────────────────────────────────────────────────────────────
-
-# 下面这些提问模板里的「硬要求」有两类出处，标清楚免得后来人当成编的：
-#
-# ① **本工作流的权威规则** —— `生产流程规范（S0-S7）.md`、`01-剧本文本/模板/*`、
-#    `02-服化道/引擎/TURNAROUND-STANDARD.md`、`02-服化道/引擎/NEGATIVE-PROMPT-LIBRARY.md`、
-#    `03-分镜导演/00-主控智能体.md`。**与工作流冲突时一律以工作流为准**。
-# ② **对外迁移规格** `智能体搭建参考md/`（用途是把 agent 迁到别的平台，不是本仓权威，
-#    见该目录 README §一）。这里借的是它**成体系的那几套口径**：人物记忆点与总建模、
-#    单集钩子与情绪线、镜头枚举、Identity / Environment Lock、中英双语提示词结构。
-#    ⚠️ 两者**不自动同步**（README §一 明说）：借的时候要知道借的是哪一条，
-#       别把参考md 当成改动工作流的依据。
-#
-# 引用只写「项目 + 文件 + 章节」，不写本机路径。
-#
-# ─────────────────────────────────────────────────────────────
-
-OUTLINE_ASK = """# 本次任务
-
-把下面这部小说做成一部 **{eps} 集**的 AI 漫剧（2 分钟级短剧，单集成片 {target:.0f} 秒上下）。
-
-**只输出一个 JSON 对象**，不要解释、不要 markdown 代码块：
-
-{{
-  "剧名": "…",
-  "一句话卖点": "…",
-  "集": [
-    {{"集号": "EP01", "标题": "…", "本集钩子": "…",
-      "结尾钩子类型": "身份｜死亡｜能力｜关系｜真相｜反派｜情感",
-      "场次": ["场景1：地点／时间", "场景2：…"],
-      "出场角色": ["角色名"], "涉及道具": ["道具名"]}}
-  ],
-  "角色": [
-    {{"名": "…", "定位": "主角/女主/反派/配角/阶段性反派/师父/对手/情报角色",
-      "戏份级": "S/A/B/C/D", "首次出场": "EP01",
-      "主标签": "…", "辅助标签": ["…", "…"],
-      "年龄": "…", "外形一句话": "…", "服装一句话": "…", "关键特征": "…",
-      "记忆资产": {{"标志性动作": "…", "标志表情": "…", "标志镜头": "…",
-                  "配色": "…", "台词风格": "…", "服装元素": "…",
-                  "武器道具": "…", "情绪状态": "…", "出场方式": "…",
-                  "反差点": "…"}}}}
-  ],
-  "未决": ["我拿不准、需要人来定的点"]
-}}
-
-## 硬要求
-
-**A. 人物（这一段最要紧 —— 后面每一集都照这份设定走）**
-
-1. 高辨识度角色**不少于 10 个**；人不够就补，补的类型要能承担功能：阶段性反派 /
-   阵营角色 / 师父 / 对手 / 竞争者 / 情报角色 / 神秘角色 / 后期角色 / 隐藏角色。
-   每个新增角色至少承担一项功能：推动剧情 / 制造冲突 / 提供信息 / 制造误导 /
-   情绪对照 / 反转 / 阵营冲突 / 主角成长 / 世界观展示 / 后续伏笔。
-   ⛔ 不许为凑数加没有功能的角色。
-2. 每个角色给 **1 个主标签 + 2~4 个辅助标签**，并标「戏份级」（S 最重 … D 最轻）。
-3. 「记忆资产」**10 项全填** —— 它们是「观众凭什么认出这个人」的凭据，要具体，
-   别写「很酷」「有范儿」。
-4. 人物**不得同质化**：不许路人脸、不许同模板换色换衣；主角团里不得有两个人的主色
-   相近、身材与年龄感都差不多；「关键特征」彼此不许重复。
-5. 角色名**只用小说里出现过的**，不要新造人名；小说里已定的姓名 / 性别 / 年龄 /
-   核心关系 / 结局**不许改**。
-
-**B. 分集（{eps} 集，一集一个钩子）**
-
-6. 集数**严格 {eps} 集**，集号从 EP01 连续编到 EP{eps:02d}。
-7. 每集必须有**开场钩子 + 结尾钩子**；结尾钩子归到这七类之一（身份 / 死亡 / 能力 /
-   关系 / 真相 / 反派 / 情感），不要平铺直叙。
-8. 每集至少**解决或升级一个冲突**；观众开场不知道的事，结尾必须变得不同。
-9. 情绪强度按 **3→5→7→8→10→9** 起落 —— 不要每集一个强度，也不要一路往上顶。
-10. ⛔ 不许用「三年前……」「从前，有一个……」「在一个遥远的地方……」这类开场。
-
-**C. 落盘口径**
-
-11. 「场次」只写这一集真实发生的地点，格式 `场景N：地点／时间`（全角斜杠）；
-12. 「未决」如实写拿不准的地方，**不许编**。
-
-## 小说原文
-
-{novel}
-"""
-
-SCRIPT_ASK = """# 本次任务
-
-写 **{ep}《{title}》** 这一集的**剧本正文**，成片时长约 {target:.0f} 秒。
-
-## 本集大纲
-
-{outline}
-
-## 全剧角色设定（外貌/服装以这里为准，**不要改**）
-
-{chars}
-
-## 格式硬标准（照抄，别自创）
-
-- 场次头：整行写 `【场景N：地点／时间】`（地点写法照抄上文场次）
-- 动作描写：整行用全角括号包住，如 `（萧然把饼干掰成两半）`
-- 台词：`角色名：台词`；带情绪时 `角色名（情绪）：台词`
-- **不要**写镜号／景别／运镜／时长（那是分镜表的事）
-- **不要**写「旁白」「画面：」「字幕：」这类结构词
-
-## 内容硬标准（一集的戏要立得住）
-
-- **开场 5 秒给强钩子**：第一场第一句就要有信息或冲突。⛔ 不许用
-  「三年前……」「从前，有一个……」「在一个遥远的地方……」这类开场。
-- **一集一个钩子**：本集至少**解决或升级一个冲突**；结尾必须留下悬念，
-  归到七类之一即可（身份 / 死亡 / 能力 / 关系 / 真相 / 反派 / 情感），
-  但必须有 —— 不要"事情告一段落"就收。
-- **台词短、狠、快**：一句一个信息，要带潜台词；能靠动作交代的就别写台词。
-  每个角色的**用词、句长、口头禅**要有差异，同一个角色跨场次必须保持一致
-  —— 观众是靠"说话方式"认人的。
-- ⛔ **不许写结论式形容**：不准出现「他很生气」「她很悲伤」「气氛很紧张」
-  「这画面很高级」这类话，一律落到**具体动作、表情、台词**。
-- ⛔ 不许写占位句：「这里可以加入一个反转」「此处省略」「（待补）」。
-- 不许改已定设定：姓名 / 性别 / 年龄 / 外貌 / 服装 / 核心关系 / 结局。
-- 有对白就写台词；整场没对白就用**动作与表情**叙事（不要用旁白去补）。
-
-## 时长控制（这一条最重要）
-
-台词按 **{cps:g} 字/秒**配音，动作段按 18 字/秒读画面。
-本集**全部台词加起来不要超过 {budget} 字**，场次控制在 {scenes} 场以内
-（超了成片会比目标长一倍，是实测踩过的坑）。
-
-只输出剧本正文，不要任何前后缀说明。
-"""
-
-ASSETS_ASK = """# 本次任务
-
-为这部 AI 漫剧建立 **01→02 的资产索引**（服化道四张表）。ID 段与号位规则见
-`00-总控路由.md` §四，**号位一旦分配永不复用**。
-
-## 剧本
-
-{script}
-
-## 已登记的 ID（**必须沿用**，不许改号、不许新增角色号）
-
-{registry}
-
-## 现有资产清单（能复用就复用，别重复建号）
-
-{existing}
-
-**只输出一个 JSON 对象**（无解释、无代码块）：
-
-{{
-  "角色": [{{"ID": "CHR_001", "姓名": "…", "别名": "…", "年龄(EP)": "…", "身份": "…",
-            "社会地位": "…", "外貌要点": "…", "关键特征": "…", "出场集": "EP01",
-            "资产状态": "☐ 待生成"}}],
-  "服装": [{{"ID": "CST_001", "角色": "CHR_001", "服装名": "…", "场合": "…",
-            "时代/阶层": "…", "主色": "…", "材质": "…", "状态派生": "Normal",
-            "出场集": "EP01", "状态": "☐"}}],
-  "道具": [{{"ID": "PRP_001", "名称": "…", "归属": "CHR_001", "用途": "…",
-            "尺寸参照": "…", "材料": "…", "状态派生": "Intact", "出场集": "EP01",
-            "状态": "☐"}}],
-  "场景": [{{"ID": "ENV_001", "场景名": "…", "时间": "…", "内/外": "内",
-            "建筑特征": "…", "光源": "…", "主空间关系": "…", "出场集": "EP01",
-            "状态": "☐"}}]
-}}
-
-硬要求：
-1. 「外貌要点」要具体到**能被画出来**，逐项覆盖：脸型 / 眉型 / 眼型 / 鼻型 / 嘴型 /
-   肤色 / 发型 / 发色 / 瞳色 / 体态 —— 跟这个角色不相关的可省，但不许用
-   「很帅」「有气质」「很漂亮」这类形容词顶替；
-2. 「关键特征」写一个**能被观众认出来的记忆点**（动作习惯或视觉符号），
-   且**各角色之间不许重复**；
-3. 「主色」写十六进制色值（如 `#3A3F46`）—— **核心角色的主色不许互相接近**，
-   否则远景里观众分不清谁是谁；
-4. 不许出现路人脸 / 同质化设定（同模板换色、同脸换衣、所有人身材年龄都差不多）；
-5. 「主空间关系」写清家具/人物的相对位置（分镜要靠它定机位）；
-6. 只写剧本里**真实出现过**的资产，不要凑数；拿不准的填「待确认」。
-
-> 「1 人 1 主标签 + 2~4 辅助标签」「记忆资产 10 项」「戏份 S/A/B/C/D 级」这几套口径
-> 见 `智能体搭建参考md/AI剧本创作_完整迁移配置.md` §五~§八（建纲阶段已按它定好，
-> 这里只负责落到索引表里，**不要重新设计角色**）。
-"""
-
-VISUAL_ASK = """# 本次任务
-
-为这部 AI 漫剧写 **VISUAL BIBLE（视觉圣经）**：全片一致性的唯一基准，
-下游所有出图/出片都只认它。
-
-## 剧本
-
-{script}
-
-## 资产索引（已定）
-
-{index}
-
-输出 **markdown**，节标题**原样照抄**下面这些（不要改标题文字、不要加新节）：
-
-```
-# PROJECT VISUAL BIBLE · {title}
-
-## 1. 世界观 / World
-## 2. 时代 / Era
-## 3. 地域 / Geography
-## 4. 整体风格 / Style
-## 5. 色彩语言 / Color
-## 6. 光影体系 / Lighting
-## 7. 材质体系 / Material
-## 8. 建筑体系 / Architecture
-## 9. 服装体系 / Costume
-## 10. 道具体系 / Props
-## 11. 镜头语言 / Camera
-## 12. 氛围 / Atmosphere
-## 13. 人物一致性 / Consistency
-## 14. 图像标准 / Image Standard
-## 15. 固定变量 / 动态变量
-## 16. 未决（本文件的空白，不许编）
-```
-
-硬要求：
-- §5 色彩语言必须给**十六进制色值**（主色 / 辅助色 / 强调色都给出来），并把色板与
-  「情绪线」绑上 —— 哪一段用哪一档，要能对上情绪强度的起落；
-- §6 光影必须写清**主光方向 + 色温**（例如「侧逆光，3200K」）；
-- §13 人物一致性要写成**可复用的身份锁定（Identity Lock）**：性别 / 年龄感 / 脸型 /
-  发型发色 / 瞳色 / 体型 / 服装 / 配饰 / 标志特征；
-- 还要给出**环境锁定（Environment Lock）**该固定的量：地点 / 建筑 / 时间 / 天气 /
-  色板 / 光照 / 陈设 / 氛围 / 背景元素 —— 同一地点跨集**只允许**变天气、时间、
-  人物、灯光状态与道具摆放；
-- §14 写清分辨率与画幅（本项目 16:9）；
-- §16 如实列出没把握的地方（**不许编**）。
-中文、条目化、简洁。
-
-> 两个 Lock 的字段口径见 `智能体搭建参考md/分镜导演助手_完整迁移配置.md`
-> §九（人物 Identity Lock）与 §十（场景 Environment Lock）。
-"""
-
-PROMPTS_ASK = """# 本次任务
-
-给下面这些资产写**生图提示词**（S2 出图直接拿去用），并附一份交给 02 的交付包。
-
-## 资产索引
-
-{index}
-
-## 视觉圣经（风格锚点从 §5/§6/§14 取）
-
-{bible}
-
-**只输出一个 JSON 对象**：
-
-{{
-  "提示词": [
-    {{"ID": "CHR_001", "名称": "…", "英文提示词": "…", "负面词": "…",
-      "落点文件名": "CHR_001_v1_turnaround.png", "角度": "三视图 front/side/back"}}
-  ],
-  "交付包": "# 交付包 01→02\\n\\n…（本次交付了什么、ID 段分配情况、给 02 的注意事项）"
-}}
-
-硬要求：
-1. 英文提示词 **80 词以内**，逗号分隔，按这个顺序写：主体 → 外貌 → 服装 → 姿态 →
-   道具 → 材质 → 环境 → 构图 → 镜头 → 光影 → 色彩 → 画质 → 一致性要求 → 负面词；
-2. **同一人物在不同条目里的外貌服装必须逐字一致**（全片一致性的命门）；
-   角色条目末尾固定补上这句英文（跨视图一致性的标准句）：
-   `same character, same identity, same face, same hairstyle, same body proportions,
-   same costume, same accessories, same colors, same materials across all views`；
-3. 负面词按工作流负面词库口径来（`no text, no watermark, extra fingers…`），
-   并且**必须带文字屏蔽强制段**：`(any text:1.8), NO TEXT, no annotations,
-   no labels, no words`；
-4. ⛔ 提示词里**不许出现真实人名**、不许夹中文；图内不许出现文字 / 字母 / 数字 /
-   Logo / 水印 / 字幕 / 标签 / UI；三视图提示词里**不许**写 FRONT / SIDE / BACK /
-   CHARACTER 这类字样；
-5. 没有明确要求时，**不许**加 Q 版 / 二次元 / 厚涂 / 水彩 / 油画 / 扁平 / 像素 / 卡通风；
-6. 落点文件名按 §一 命名规范写（`<ID>_v1_<角度>.png`）。
-
-> 第 1 条的段序与第 4 条的禁止项口径见 `智能体搭建参考md/AI漫剧服化道智能体_完整迁移配置.md`
-> §3；第 3 条的文字屏蔽强制段是本工作流的硬标准，原文在
-> `02-服化道/引擎/TURNAROUND-STANDARD.md` §1.6 与 `02-服化道/引擎/NEGATIVE-PROMPT-LIBRARY.md`。
-"""
 
 
 # ─────────────────────────────────────────────────────────────
@@ -648,9 +150,9 @@ class Flow:
         return int(cfg) if cfg else 12
 
     def target_sec(self, ep: str = "") -> float:
-        """该集目标时长（读项目物料单；没有就用兜底 105s）。"""
+        """该集目标时长（读项目物料单；没有就用 `storyboard.TARGET_SEC` 兜底）。"""
         t = asset_index.episode_targets(self.project).get(ep or self.ep)
-        return float(t) if t else float(TARGET_SEC)
+        return float(t) if t else float(storyboard.TARGET_SEC)
 
     # ── LLM ──
 
@@ -870,12 +372,12 @@ class Flow:
             path = self.p(SCRIPT_DIR, f"{epno}-剧本.md")
             if self._guard(path, f"{epno} 剧本"):
                 continue
-            budget = int(self.target_sec(epno) * LINE_CPS * LINE_SHARE)
+            budget = int(self.target_sec(epno) * storyboard.CPS * LINE_SHARE)
             self.say(f"🤖 写 {epno}《{ep_plan.get('标题', '')}》（台词预算 ≤ {budget} 字）…")
             body = self._ask_md("script", SCRIPT_ASK.format(
                 ep=epno, title=ep_plan.get("标题", ""), target=self.target_sec(epno),
                 outline=json.dumps(ep_plan, ensure_ascii=False, indent=2),
-                chars=self._chars_brief(chars), cps=LINE_CPS, budget=budget,
+                chars=self._chars_brief(chars), cps=storyboard.CPS, budget=budget,
                 scenes=max(3, min(8, int(self.target_sec(epno) / 22)))))
             self._check_script(epno, body, res)
             _write(path, body)
@@ -975,15 +477,16 @@ class Flow:
             return
         lines = sum(1 for s in scenes for b in s.blocks if b["kind"] == "line")
         chars = sum(len(b["text"]) for s in scenes for b in s.blocks if b["kind"] == "line")
-        est = chars / LINE_CPS
+        est = chars / storyboard.CPS
         tgt = self.target_sec(ep)
         res.notes.append(
             f"{ep}《{title}》：{len(scenes)} 场 / {lines} 句台词 / 台词 {chars} 字 "
             f"≈ {est:.0f}s（目标 {tgt:.0f}s）")
-        if est > tgt * 1.3:
+        if est > tgt * (1 + storyboard.TOL):
             res.notes.append(
-                f"⚠️ {ep} 的台词量约 {est:.0f}s，超目标 {tgt:.0f}s 的 30% —— "
-                f"成片会明显超长，回去压缩台词或加集（实测 EP04 就是这么超的）")
+                f"⚠️ {ep} 的台词量约 {est:.0f}s，超目标 {tgt:.0f}s 的 "
+                f"{storyboard.TOL:.0%} —— 成片会明显超长，回去压缩台词或加集"
+                f"（实测 EP04 就是这么超的）")
 
     def _ensure_ledgers(self) -> tuple:
         """建 `ID注册表` 与 `未决项表`（从工作流模板拷贝，不自己发明格式）。"""
@@ -1255,9 +758,9 @@ class Flow:
                                 sorted(items.items(), key=lambda x: -x[1])[:6])
                 res.notes.append(f"{len(items)} 个{kind}没登记 ID：{top}"
                                  f"（补 `03_台账/ID注册表` 后重跑分镜）")
-        if total > tgt * 1.3:
-            res.notes.append(f"总时长 {total:.0f}s 超目标 {tgt:.0f}s 的 30% —— "
-                             f"先改剧本再出片，别拿素材堆时长")
+        if total > tgt * (1 + storyboard.TOL):
+            res.notes.append(f"总时长 {total:.0f}s 超目标 {tgt:.0f}s 的 "
+                             f"{storyboard.TOL:.0%} —— 先改剧本再出片，别拿素材堆时长")
         res.notes.insert(0, note)
         return res
 

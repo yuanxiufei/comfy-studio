@@ -1,7 +1,7 @@
 # OPEN ISSUES — 未决项跟踪表
 
 > **本表在项目「启动阶段」创建，全程跟踪，直到发布前全部关闭。**
-> 落盘位置：`AI_DRAMA_PROJECT/00_PROJECT/OPEN-ISSUES.md`
+> 落盘位置：`00_PROJECT/03_台账/未决项表（OPEN-ISSUES）.md`
 
 ---
 

@@ -25,6 +25,11 @@
 故明确分两档：
     · **本模块管**（CHR/CST/PRP/ENV/EXP/POS）→ 可判定，未登记即报
     · **外来前缀**（SHT/VID/AUD）        → **不判定**，只列出并说明归谁管
+
+⚠️ 与 `consistency.py` 的分工（2026-09-27 核对过，**不是两套重复实现**）：
+    本文件查**交付物文本里引用的 ID**（在不在总表、有没有自造）与风格锚点漂移；
+    `consistency.py` 查**单张资产卡内部**（改一处有没有动到别处、派生卡指纹）。
+    一个管"文本引用"，一个管"卡片内"，判据不重叠、也不该合并。
 """
 
 from __future__ import annotations
@@ -33,6 +38,8 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from .schema import ID_CROSSWALK      # 蓝图字面的唯一来源（见 `ALIAS_TYPE`）
 
 # ─────────────────────────────────────────────────────────────
 # ID 语法（权威：`00-总控路由.md` §四）
@@ -46,10 +53,10 @@ PREFIX_TYPE: dict[str, str] = {
 }
 
 # 蓝图字面（`config.json` 的 `id_style=blueprint`；同一语义，跨系统互通）
-ALIAS_TYPE: dict[str, str] = {
-    "CHAR-": "character", "COSTUME-": "costume",
-    "PROP-": "prop", "SCENE-": "environment",
-}
+# ⚠️ **字面清单唯一来源是 `schema.ID_CROSSWALK`**（项目字面 → 蓝图字面）。
+#    这里只把那张表翻个面（蓝图字面 → 资产类型），**不另存一份字面表** ——
+#    两份字面表的失效模式：schema 加了新前缀、这边没跟，别名 ID 就静默漏报漂移。
+ALIAS_TYPE: dict[str, str] = {alias: PREFIX_TYPE[pre] for pre, alias in ID_CROSSWALK.items()}
 
 # 本项目**有总表、可判定**的类型
 OWNED = {"character", "costume", "prop", "environment", "expression", "pose"}

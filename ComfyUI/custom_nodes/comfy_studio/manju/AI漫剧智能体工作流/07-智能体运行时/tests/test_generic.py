@@ -317,6 +317,22 @@ def _run(tmp: Path) -> int:
           _rt.route("生成所有角色的三视图")[0].operation != "query",
           _rt.route("生成所有角色的三视图")[0].operation)
 
+    print()
+    print("── ⑯ 修改动词表**只有一份**（router 不得再存第二份）──")
+    # ⚠️ 2026-09-27 之前这里有第二份表（`router.MODIFY_WORDS`），比
+    #    `nl_parser.MODIFY_VERBS` 少一个「减掉」。与 ⑮ 的查询词表同款失效模式：
+    #    两份表必然漂移，而漂移**不报错** —— 少一个词只是某句话被判错。
+    check("`router` 模块里**没有**自家的修改动词表（存一份就会漂移）",
+          not hasattr(_rt, "MODIFY_WORDS"))
+    check("`router` 用的就是 `nl_parser.MODIFY_VERBS`（**同一个对象**，不是副本）",
+          getattr(_rt, "MODIFY_VERBS", None) is nlp.MODIFY_VERBS)
+    for _w in nlp.MODIFY_VERBS:
+        _op = _rt.route(f"把她的头发{_w}银白色")[0].operation
+        check(f"修改动词「{_w}」→ modify", _op == "modify", _op)
+    check("⭐ 查询词与修改词同时出现 → **修改优先**（用户要的是改，不是看）",
+          _rt.route("查看一下，把头发改成蓝色")[0].operation == "modify",
+          _rt.route("查看一下，把头发改成蓝色")[0].operation)
+
     # ⭐ 核心要求：**过滤条件必须可见** —— 否则"没抽到词 → 列出全部"用户看不见
     class _Q:
         seen = ("", "")

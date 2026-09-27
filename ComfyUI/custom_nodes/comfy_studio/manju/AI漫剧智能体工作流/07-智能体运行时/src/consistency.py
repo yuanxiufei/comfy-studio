@@ -21,6 +21,11 @@
   2. `check_derivation`    —— 状态派生卡与母卡**指纹是否一致**
   3. `check_required`      —— 必填项是否齐全（用工作流的字段清单）
   4. `check_text_risk`     —— 文字风险（RULE-005：输图后必须逐字检查隐蔽位置）
+
+⚠️ 与 `drift.py` 的分工（2026-09-27 核对过，**不是两套重复实现**）：
+    本文件查**单张资产卡内部**（改一处有没有顺带动到别处、派生卡与母卡指纹是否一致）；
+    `drift.py` 查**交付物文本里引用的 ID**（在不在总表、有没有自造）与风格锚点。
+    一个管"卡片内"，一个管"文本引用"，判据不重叠、也不该合并。
 """
 
 from __future__ import annotations
@@ -31,6 +36,10 @@ from dataclasses import dataclass, field
 from .schema import AssetCard
 
 # 「改一处」时**不允许被动到**的字段（蓝图 §六 的 Face/Body/Clothing/Equipment）
+# ⚠️ 这是**单次修改的作用域**（"改发色时别顺带动身高"），**不是身份层的永久性判定**。
+#    身份层"100% 不可改"的权威是 `lock.LIFELONG_FIELDS`（`LOCK-SYSTEM.md` §四·补 A）。
+#    两者语境不同（一次修改之内 vs 各状态卡之间）故**刻意不合并**；但语义有交集，
+#    要改"哪些算永久识别特征"请改 `lock.py`，**别在这里另立一份**。
 PROTECTED_GROUPS: dict[str, list[str]] = {
     "Face": ["face_shape", "jaw", "cheekbone", "brow_ridge", "nose_bridge", "lips"],
     "Eyes": ["eye_shape", "eye_color"],

@@ -385,7 +385,9 @@ class DramaAssetAgent:
         # ② 提示词
         add("英文提示词非空", bool(card.prompt_en.strip()),
             f"{len(card.prompt_en)} 字符")
-        cn_left = [c for c in card.prompt_en if "\u4e00" <= c <= "\u9fff"]
+        from .generic import cjk_chars
+
+        cn_left = cjk_chars(card.prompt_en)
         add("英文提示词无中文残留", not cn_left,
             "0 处" if not cn_left else f"{len(cn_left)} 处（{''.join(cn_left[:12])}…）")
         add("负面词含权重标记", "any text:1.8" in card.negative_prompt,

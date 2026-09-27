@@ -222,6 +222,52 @@ def main() -> int:
                 modules.setdefault(m_port.group(1), []).append(
                     (p.name, fm.get("agentMode", "")))
 
+    # ══════════════════════════════════════════════════════════════════
+    # 随包预置快照（宿主侧 `Comfy-Desktop/lib/comfy_studio/agent/presets/`）
+    # ══════════════════════════════════════════════════════════════════
+    # 就是上面那 6 份源规格，**在两处各存一份**：此处是**权威源**，宿主侧那份是**随包快照**。
+    # 查证过的依据（不是"顺手多存一份"）：
+    #   · 宿主包必须**自带正文** —— 它由桌面壳按 `-m comfy_studio` 启动、cwd 是壳自带的 lib
+    #     （`Comfy-Desktop/src/main/lib/comfyStudioHost.ts` 的 `getBundledLibDir`），ComfyUI 装
+    #     在哪由用户的 `--comfyui-dir` 决定；让宿主去猜引擎树的落点，等于把"随包"变成"看运气"。
+    #   · 而引擎侧正文里的 `智能体搭建参考md/…` 引用（`src/flow_prompts.py` 的提示词、07 的
+    #     README）以**本数据根**为基准，搬进宿主包就指错了地方。
+    # 两份都留 → 唯一能挡住"改了源规格、面板下拉里还是旧人设"的就是下面这条逐字对拍。
+    # ⚠️ 不做"目录在才查"式的静默跳过：本文件本来就只在本仓库里跑得通（`AG` 不存在时上面
+    #    直接判失败），少查一次等于白留 —— 那正是"换台机器就永远不跑"的老毛病。
+    # ⚠️ 宿主侧**不能**放对应的对拍：那个包要能跟着桌面壳单独分发，在那里往上找仓库根、
+    #    找不到就跳过，就是同一个毛病换了个地方。
+    PRESETS = AG.parent.parent / "Comfy-Desktop" / "lib" / "comfy_studio" / "agent" / "presets"
+    print()
+    print("── ⭐ 随包预置快照 == 源规格（面板下拉读的就是那份）──")
+    check("宿主侧随包预置目录存在", PRESETS.is_dir(), str(PRESETS))
+    if PRESETS.is_dir():
+        want_src = {it["src"] for it in BUILD.SOURCES}          # 生成器认的那 6 份
+        got_src = {p.name for p in PRESETS.glob("*.md")} - {"README.md"}
+        check(f"预置的规格清单与生成器的源规格一致（{len(want_src)} 份）",
+              got_src == want_src,
+              f"仅出现在一侧：{sorted(got_src ^ want_src)}"
+              " → 增删/改名要同时改 _build.py 的 SOURCES 与 catalog.py 的 PRESET_AGENTS")
+        stale = []
+        for name in sorted(want_src & got_src):
+            same = (ROOT / "智能体搭建参考md" / name).read_bytes() == (PRESETS / name).read_bytes()
+            check(f"逐字一致: {name}", same)
+            if not same:
+                stale.append(name)
+        if stale:
+            print("     ⚠️ 修法：python .codebuddy/agents/_build.py")
+            print("        —— 生成移植型 agent 的同时会把源规格**按字节**同步到宿主侧；")
+            print(f"        权威源是引擎侧那份，别反向抄 {PRESETS}。")
+        # ⭐ 上面比的是"两份文件"；这里再钉一次**生成脚本自己认的落点** —— 脚本里的路径
+        #    写错时，`--预览` 会把 6 份全报成"待同步"（真同步下去会覆盖成源内容，不报错），
+        #    而它平时跑起来只说"已同步"，看不出认错了地方。
+        synced, _same = BUILD.sync_presets(preview=True)        # 只算不写
+        check("生成脚本认的宿主预置落点就是这里（无待同步项）",
+              not synced, f"脚本认为待同步 {synced} → 落点 {BUILD.PRESETS}")
+        check("生成脚本能读出宿主清单登记的 6 份（与源规格同名）",
+              BUILD.preset_filenames() == want_src,
+              f"清单里是 {sorted(BUILD.preset_filenames())}")
+
     # ⭐⭐ 核心不变量：**自动入口必须是"名册里登记的那几个"**
     #
     #   风险（实测）：主 Agent 按 `description` 挑；若同一职责有两个 agentic agent，

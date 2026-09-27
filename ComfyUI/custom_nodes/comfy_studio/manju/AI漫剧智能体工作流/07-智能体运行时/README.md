@@ -217,7 +217,9 @@ $ python main.py drift output/EP01-分镜表.md
 （此前缺它们 —— 而「丝质旗袍」会因 `tr('丝')` 原样返回中文而把中文送进英文）；
 场所后缀加「洋行/当铺/客栈/衙门/书院…」。
 
-**测试**：`tests/test_generic.py`（**57 项**）—— 含「表外题材」「英文纯度」「类型判定」三类断言。
+**测试**：`tests/test_generic.py`（**91 项**）—— 含「表外题材」「英文纯度」「类型判定」三类断言。
+2026-09-27 补 **⑯「修改动词表只有一份」**：`router.MODIFY_WORDS` 曾是 `nl_parser.MODIFY_VERBS`
+的副本（少一个「减掉」），已删除并钉住「同一对象 + 每个动词都判 modify + 修改优先于查询」。
 
 #### ⭐ 类型判定：**能靠语法判的，绝不靠名词表**
 
@@ -451,13 +453,17 @@ python main.py "把她的眼睛换成琥珀色" --reference output/images/CHR_00
 │   ├── handover.py        ⭐ 交接清单 + 门禁预检
 │   ├── runtime.py         ⭐ 通用执行器（装配 → 调用 → 落盘）
 │   ├── rule_source.py       02 的规则来源层（只读工作流）
-│   ├── schema.py / nl_parser.py / prompt_engine.py / consistency.py
+│   ├── schema.py / nl_parser.py / router.py / prompt_engine.py / consistency.py
 │   ├── character_agent.py / prop_agent.py / costume_agent.py
 │   ├── overrides.py         本机覆盖层（`prompts/overrides/`）
 │   ├── drift.py             ⭐ §六 漂移检测（ID 是否都在总表、是否自造 ID）
 │   ├── generic.py           ⭐ 通用补全层（**任何小说都行**：按语法抽词 + 中性兜底）
 │   ├── lock.py              ⭐ 锁定系统 / 修改引擎（§一/§二/§三/§四·补 A·B）
 │   ├── image_provider.py / asset_manager.py / llm_client.py / agent.py
+│   ├── pipeline.py          ⭐ S0→S5 全流程编排（小说 → 剧本 → 资产 → 分镜 → 首帧 → 出片 → 成片）
+│   │   ├── flow_core.py       常量 / 阶段 / 公用小工具
+│   │   └── flow_prompts.py    LLM 提问模板（纯文本）
+│   │        （2026-09-27 从一个 1547 行的 `pipeline.py` 切成三份：编排 · 常量 · 模板）
 │   └── __init__.py
 ├── tests/
 │   ├── test_providers.py   ⭐ 出图 Provider 的**离线合约测试**（本地桩服务器，无需 Key）
@@ -651,7 +657,7 @@ python .codebuddy/agents/_install_user.py --仅移植型  # 只装参考 md 那 
 | **场景 360° 全景基准**（§4.6） | ✅ 已实现（`panorama`，见 §四） |
 | **场景 S01–S06 六角度 + 索引表**（§4.1） | ✅ 已实现（`angles`，见 §四） |
 | **锁定系统 / 修改引擎**（`LOCK-SYSTEM.md` §三「修改执行四步（强制）」） | ✅ 已实现（`src/lock.py`）—— **36 项测试**（含「必须报 / 不得误报」两类注入用例） |
-| **通用性**（任何一部小说都能跑，不绑题材） | ✅ 已实现（`src/generic.py` + `batch`/`world`/**查询**改造）—— **71 项测试** |
+| **通用性**（任何一部小说都能跑，不绑题材） | ✅ 已实现（`src/generic.py` + `batch`/`world`/**查询**改造）—— **91 项测试** |
 | **六类资产冒烟**（每类真实创建 + 落盘 + 英文纯度） | ✅ **25 项测试**（`tests/test_agent_smoke.py`；**它刚抓出一个真 bug**，见下）|
 | **§六 漂移检测**（ID 在不在总表 / 是否自造 ID / **风格锚点漂移** / **锁定项合法性**） | ✅ 已实现（`drift`）—— **38 项测试** |
 | 其余四张单子 | 见 §六 表（ID 总表 ✅ / 风格锚点 ✅ / 锁定清单 ✅ / 变更记录 ✅） |
