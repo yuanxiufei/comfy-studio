@@ -9,6 +9,7 @@ from .config import (
     collect_servers,
     engine_python,
     engine_server,
+    engine_web_tools,
     parse_extra_servers,
 )
 from .hub import McpHub
@@ -25,6 +26,7 @@ __all__ = [
     "collect_servers",
     "engine_python",
     "engine_server",
+    "engine_web_tools",
     "error_message",
     "parse_extra_servers",
     "result_json",

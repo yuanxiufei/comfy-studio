@@ -182,10 +182,13 @@ export function resolveStudioCommand(installation: InstallationRecord): ComfyStu
     // by itself. `--memory-dir` / `--no-memory` exist for builds that need to
     // move or drop it.
     //
-    // Web access (`web__search` / `web__fetch`) is absent for the same reason:
-    // no relay, no local dir to point at, so `--no-web` is the only switch and
-    // this shell does not pass it. That is not an oversight — if a build ever
-    // needs it off, add the flag next to the ones above.
+    // Web access (`web__search` / `web__fetch` / `web__crawl`) is absent for the
+    // same reason: no relay, no local dir to point at, so `--no-web` is the only
+    // switch and this shell does not pass it. Same for `--searxng-url`: the
+    // optional self-hosted backend is a per-machine choice, and leaving it out
+    // falls back to the Bing RSS entry point that needs no deployment. That is
+    // not an oversight — if a build ever needs one of them, add the flag next to
+    // the ones above.
   ]
   // Keep localfiles aligned with the engine's storage args (see
   // `resolveEngineStorageDirs`); omitted exactly when the launch omits them, so

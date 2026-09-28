@@ -12,16 +12,54 @@
 第 9 把是 ``comfy_list_model_folders``：模型类别是**引擎那边**决定的（``folder_paths``
 的键，第三方节点还能自己注册），写死在工具描述里必然落后，所以单独开一把工具让模型
 先问类别、再拿类别去 ``comfy_list_models`` 取文件。
+
+再往后是联网那三把（``web__search`` / ``web__fetch`` / ``web__crawl``）：本地模型的知识停在
+训练那天，而"这个插件现在怎么装""这个报错什么意思"本机查不到。它们在
+:mod:`comfy_studio.web` 里定义，**只有给了 ``WebFetcher`` 才挂上**（见 :func:`build_tools`
+的 ``fetcher`` 参数）—— 那东西握着一条 aiohttp 连接，谁用谁负责关，不能让这里凭空造一个
+没人管的。引擎面板里的对话与引擎侧 MCP 走的是同一批工具（见
+:mod:`comfy_studio.agent.loop` 开头那句），所以两边都传同一个句柄。
 """
 
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from ..engine import EngineClient, EngineError
 from ..skills import PARAM_TYPES, Skill, SkillRegistry
+from ..web import (
+    SEARCH_BACKEND_BING,
+    SEARCH_BACKEND_SEARXNG,
+    WEB_TOOLS,
+    WebConfig,
+    WebError,
+    WebFetcher,
+    call_web_tool,
+    check_search_urls,
+    qualified_name,
+)
+
+#: 关掉引擎侧联网的环境变量（与宿主侧的 ``--no-web`` 同一个意思）。
+#: 存在这一条是因为联网会**往外面发请求**：不想让它出门的机器得有个开关，而不是让人去改代码。
+NO_WEB_ENV = "COMFY_NO_WEB"
+
+#: 换搜索后端的环境变量（与宿主侧的 ``--searxng-url`` 同一个意思）：填了自建 SearXNG 就用它，
+#: 不填走必应 RSS。名字与宿主侧那份（``COMFY_STUDIO_SEARXNG_URL``）刻意不同：两边是**两份独立
+#: 的安装**，同一个变量名会让人以为设一个就两边都换了，而实际上引擎起在 ComfyUI 的进程里、
+#: 宿主起在桌面壳里，环境根本不是同一份。
+SEARXNG_ENV = "COMFY_SEARXNG_URL"
+
+#: 换搜索**入口**的环境变量（与宿主侧的 ``--web-search-url`` 同一个意思）：只想换一个搜索入口
+#: （镜像 / 地区域名 / 自建 RSS 代理）而仍然按必应的 RSS 形状读回来时用它。名字与宿主侧那份
+#: （``COMFY_STUDIO_WEB_SEARCH_URL``）同样刻意不同，理由同上一条。
+SEARCH_URL_ENV = "COMFY_WEB_SEARCH_URL"
+
+#: 环境变量里哪些值算"关"。**只认这几个真值**：写 ``COMFY_NO_WEB=0`` 不算关，
+#: 免得"我明明写了变量怎么还联网"变成一场猜谜（默认就是开着的）。
+_FALSEY = frozenset({"1", "true", "yes", "on"})
 
 ToolHandler = Callable[[dict[str, Any]], Awaitable[Any]]
 
@@ -95,11 +133,86 @@ def skill_entry(skill: Skill) -> dict[str, Any]:
 SAVE_SKILL_FIELDS = ("id", "title", "description", "tags", "workflow", "params")
 
 
-def build_tools(engine: EngineClient, registry: SkillRegistry) -> list[Tool]:
+def web_enabled(environ: dict[str, str] | None = None) -> bool:
+    """联网开关（默认开）。见 :data:`NO_WEB_ENV`。"""
+    source = os.environ if environ is None else environ
+    return source.get(NO_WEB_ENV, "").strip().lower() not in _FALSEY
+
+
+def web_config(environ: dict[str, str] | None = None) -> WebConfig:
+    """按环境变量拼联网配置：``SEARXNG_ENV`` 给了就换后端，``SEARCH_URL_ENV`` 给了就换入口，
+    两个都不给就是必应 RSS 的默认值。
+
+    **不给变量时一律走默认**（必应 RSS）：那条路不用部署任何东西，所以引擎侧"什么都没配"
+    也必须可用。给了地址才换成自建实例 —— 那是用户自己架的东西，连不上是他自己的机器/网络
+    问题，报错里会带上实例地址与排查方向（见 :meth:`comfy_studio.web.WebFetcher.search`）。
+
+    ``SEARCH_URL_ENV`` 只换入口、不换后端：那种入口仍按必应的 RSS 形状解析
+    （``BING_SEARCH_FORMAT``）—— 换的是"去哪儿问"，不是"怎么读回来"。逗号分隔可以给多个
+    （前面那个连不上就试后面的），与 ``SEARXNG_ENV`` 的多实例同一个口径。
+
+    **两个都给就报错**（:class:`~comfy_studio.web.WebError`），而不是安静地挑一个：被静默丢掉的
+    那个变量，在别人机器上就是"设了却不生效"，这比当场报错难查得多。与宿主侧
+    :func:`comfy_studio.web.search_config` 同一条口径 —— 两边各读各的环境，但话得是同一套。
+    """
+    source = os.environ if environ is None else environ
+    url = source.get(SEARXNG_ENV, "").strip()
+    entry = source.get(SEARCH_URL_ENV, "").strip()
+    if url and entry:
+        raise WebError(
+            f"{SEARXNG_ENV} 与 {SEARCH_URL_ENV} 只能设一个：前者换搜索后端（自建 SearXNG，"
+            "结果多源、带直接答案，代价是自己维护那个实例），后者只换一个搜索入口"
+            "（镜像 / 地区域名 / 自建 RSS 代理）"
+        )
+    if url:
+        return WebConfig(search_backend=SEARCH_BACKEND_SEARXNG, searxng_url=url)
+    if entry:
+        return WebConfig(
+            search_url=check_search_urls(entry), search_backend=SEARCH_BACKEND_BING
+        )
+    return WebConfig()
+
+
+def build_web_tools(fetcher: WebFetcher) -> list[Tool]:
+    """把 :data:`comfy_studio.web.WEB_TOOLS` 那几张定义装配成可调用的 :class:`Tool`。
+
+    失败一律回 ``isError`` 文本而不是抛出去：网址写错、落在禁区、对方回 404，模型都能自己
+    换个做法再试（这与 MCP 那一层的兜底是同一条口径，见 :mod:`comfy_studio.mcp.server`）。
+    """
+
+    def make(name: str) -> ToolHandler:
+        async def handler(args: dict[str, Any]) -> Any:
+            try:
+                payload = await call_web_tool(fetcher, name, args)
+            except WebError as err:
+                return error_result(err)
+            return text_result(payload)
+
+        return handler
+
+    return [
+        Tool(
+            # 限定名由这里拼（``web__search``）而不是写在 web.py 里：那一层只管"工具是什么"，
+            # 不关心自己在哪个命名空间下（见 comfy_studio.web.WebToolSpec）。
+            name=qualified_name(spec.name),
+            description=spec.description,
+            input_schema=spec.input_schema,
+            handler=make(spec.name),
+        )
+        for spec in WEB_TOOLS
+    ]
+
+
+def build_tools(
+    engine: EngineClient, registry: SkillRegistry, fetcher: WebFetcher | None = None
+) -> list[Tool]:
     """按引擎句柄 + skill 目录视图组装工具列表。
 
     ``skill__<id>`` 是**此刻**快照里每个 skill 一把；``comfy_list_skills`` /
     ``comfy_run_skill`` / ``comfy_save_skill`` 则都走 ``registry``，看的是实时结果。
+
+    ``fetcher`` 给了才挂联网那三把 —— 它是调用方建的（连接得有人关），这里不凭空造一个
+    没人管的句柄；``fetcher=None`` 时工具表与从前一模一样。
     """
 
     async def list_model_folders(_args: dict[str, Any]) -> Any:
@@ -302,6 +415,8 @@ def build_tools(engine: EngineClient, registry: SkillRegistry) -> list[Tool]:
                 handler=_make_skill_handler(engine, skill),
             )
         )
+    if fetcher is not None:
+        tools.extend(build_web_tools(fetcher))
     return tools
 
 
@@ -314,12 +429,17 @@ def _make_skill_handler(engine: EngineClient, skill: Skill) -> ToolHandler:
 
 
 __all__ = [
+    "NO_WEB_ENV",
     "SAVE_SKILL_FIELDS",
+    "SEARXNG_ENV",
     "Tool",
     "ToolHandler",
     "build_tools",
+    "build_web_tools",
     "error_result",
     "schema_for",
     "skill_entry",
     "text_result",
+    "web_config",
+    "web_enabled",
 ]

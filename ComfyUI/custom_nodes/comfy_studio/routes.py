@@ -20,11 +20,12 @@ from typing import Any
 from aiohttp import web
 
 from .agent import AgentError, AgentEvent, LLMConfig, LLMError, OpenAIChatClient
-from .agent.loop import AgentSession
+from .agent.loop import DEFAULT_SYSTEM_PROMPT, AgentSession
 from .engine import EngineError, get_engine
 from .mcp.server import skills_dir
-from .mcp.tools import build_tools, skill_entry
+from .mcp.tools import build_tools, skill_entry, web_config, web_enabled
 from .skills import Skill, SkillRegistry, user_skills_dir
+from .web import SEARCH_BACKEND_BING, WEB_PROMPT_RULES, WebFetcher
 
 PREFIX = "/comfy-studio"
 
@@ -34,6 +35,40 @@ MAX_SESSIONS = 8
 _registry: SkillRegistry | None = None
 _skill_stamp: tuple[tuple[str, float], ...] | None = None
 _sessions: dict[str, AgentSession] = {}
+#: 面板里对话用的联网句柄：**进程一个、所有会话共用**。它不能被某个会话关掉（那个会话
+#: 被淘汰时只关自己的模型连接），所以生命周期跟着进程走（见 :func:`_web_fetcher`）。
+#:
+#: 名字**不能叫** ``_web_fetcher``：那样它就和下面的函数同名，``def`` 一执行就把这个格子
+#: 换成函数对象，于是函数里的 ``is None`` 永远不成立、缓存永远不生效，取回来的"句柄"
+#: 其实是函数本身 —— 面板里真去搜一次才会炸。
+_fetcher: WebFetcher | None = None
+
+
+def _web_fetcher() -> WebFetcher | None:
+    """取（或建）联网句柄；环境变量关了联网就回 ``None``（工具表里不会出现 ``web__*``）。
+
+    搜索后端也走环境变量（``COMFY_SEARXNG_URL``，见 :func:`comfy_studio.mcp.tools.web_config`）：
+    没给就是必应 RSS。这样"面板里这段对话"与"引擎侧 MCP"用的是同一份配置 —— 两处各读一次
+    环境变量，而不是各写一份默认值。换**入口**的那个变量（``COMFY_WEB_SEARCH_URL``）同理；
+    两个都设了**会在这里报错**（不是静默挑一个），修掉其中一个再问。
+
+    句柄是懒建的：aiohttp 的 session 必须在事件循环里建（第一次真发请求时已经在了，
+    见 :meth:`comfy_studio.web.WebFetcher._session`），而且不开联网的机器根本不会走到这儿。
+    """
+    global _fetcher
+    if not web_enabled():
+        return None
+    if _fetcher is None:
+        _fetcher = WebFetcher(web_config())
+    return _fetcher
+
+
+def _system_prompt() -> str:
+    """面板对话的人设。挂了联网才把"你可以联网"那一段接上 —— 没挂却写进人设，
+    等于教模型去调不存在的 ``web__search``（与宿主侧同一个做法）。"""
+    if not web_enabled():
+        return DEFAULT_SYSTEM_PROMPT
+    return f"{DEFAULT_SYSTEM_PROMPT}\n{WEB_PROMPT_RULES}"
 
 
 def _skills_stamp() -> tuple[tuple[str, float], ...]:
@@ -113,7 +148,14 @@ async def _session(session_id: str, engine: Any, registry: SkillRegistry) -> Age
         # 只清 messages 会留下一堆没人管的连接（句柄泄漏 + "Unclosed client session"）。
         await oldest.close()
 
-    created = AgentSession(engine, build_tools(engine, registry), OpenAIChatClient(LLMConfig.from_env()))
+    created = AgentSession(
+        engine,
+        # 联网句柄是进程级的（不是每个会话一个）：三个会话各开一条 aiohttp 连接没必要，
+        # 而且那样一来"哪个会话该关它"就没有答案了。
+        build_tools(engine, registry, _web_fetcher()),
+        OpenAIChatClient(LLMConfig.from_env()),
+        system_prompt=_system_prompt(),
+    )
     _sessions[session_id] = created
     return created
 
@@ -188,16 +230,37 @@ def register_routes() -> None:
 
     @router.get(f"{PREFIX}/agent/config")
     async def agent_config(_request: web.Request) -> web.Response:
+        fetcher = _web_fetcher()
+        # 联网这一档照实报，**字段名与宿主侧 host/info 完全一样**：能不能上网、走的是必应
+        # 还是自建 SearXNG。两处各报一份是因为两边是不同的进程、各有各的环境变量，
+        # 但话得是同一套 —— 前端照着同一个键名画同一句话，也就不会出现"面板说有网、
+        # 引擎这边其实没有"这种各说各的。
+        web_fields = {
+            "web": fetcher is not None,
+            # 搜索入口**只在真用它时才报**（走自建 SearXNG 时必应那条 RSS 根本没被请求过）：
+            # 那种情况下入口就是 web_searxng_url，理由与宿主侧那份逐字相同。
+            "web_search_url": fetcher.config.search_url
+            if fetcher is not None and fetcher.config.search_backend == SEARCH_BACKEND_BING
+            else None,
+            "web_backend": fetcher.config.search_backend if fetcher is not None else None,
+            # 没配自建实例时如实报 None 而不是空串：两种都是"没配"，但空串在 JSON 里
+            # 看着像"配了一个空地址"（与宿主侧同一个理由）。
+            "web_searxng_url": (fetcher.config.searxng_url or None) if fetcher is not None else None,
+        }
         try:
             config = LLMConfig.from_env()
         except LLMError as err:
-            return web.json_response({"configured": False, "reason": str(err)})
+            # 没配好模型也把这几个字段带上：它们的形状不该随另一个字段的值变来变去，
+            # 调用方也就不必写两套读法。
+            return web.json_response({"configured": False, "reason": str(err), **web_fields})
         return web.json_response(
             {
                 "configured": True,
                 "model": config.model,
                 "base_url": config.base_url,
-                "tool_count": len(build_tools(engine, await _skill_registry())),
+                # 工具数要与会话里真正拿到的那批一致（不然面板显示的数字会骗人）。
+                "tool_count": len(build_tools(engine, await _skill_registry(), fetcher)),
+                **web_fields,
             }
         )
 

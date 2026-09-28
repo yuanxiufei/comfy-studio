@@ -8,20 +8,39 @@
 跑法（引擎 venv 的 python，cwd 在 Comfy-Desktop/lib）::
 
     <仓库>/ComfyUI/.venv/Scripts/python.exe -m unittest comfy_studio.tests.test_web -v
+
+末尾几段还盯着 ``host/info`` 与面板那段 TypeScript 之间的字面量契约（后端取值、字段名都是两边
+照抄的，改一边不会报错，见 :class:`PanelWebLineContractTests`）。
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import io
 import json
+import os
+import re
 import socket
 import unittest
+import urllib.error
+from pathlib import Path
 from unittest import mock
 
+from comfy_studio import __main__ as main_module
 from comfy_studio.cancel import Cancelled
+from comfy_studio.mcp import McpHub
+from comfy_studio.server import StudioHost
+from comfy_studio.skills import SkillCatalog
 from comfy_studio.web import (
+    SEARCH_BACKEND_BING,
+    SEARCH_BACKEND_SEARXNG,
+    DEFAULT_CRAWL_DEPTH,
+    DEFAULT_CRAWL_PAGES,
     DEFAULT_FETCH_CHARS,
     DEFAULT_SEARCH_LIMIT,
+    MAX_CRAWL_DEPTH,
+    MAX_CRAWL_PAGES,
     MAX_FETCH_CHARS,
     MAX_SEARCH_LIMIT,
     WEB_PROMPT_RULES,
@@ -29,12 +48,16 @@ from comfy_studio.web import (
     WebConfig,
     WebError,
     WebFetcher,
+    _all_bases_failed_message,
     assert_public,
     blocked_reason,
+    check_search_url,
+    check_search_urls,
     decode_body,
     html_to_text,
     parse_rss_results,
     parse_url,
+    search_config,
     sniff_charset,
 )
 
@@ -138,6 +161,45 @@ def _public_dns(*_args: object, **_kwargs: object) -> list:
     return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))]
 
 
+class _RoutedSession:
+    """**按网址查表**吐响应的假会话：crawl 会并发抓同一层的多个页面，用"按顺序吐"的
+    :class:`_FakeSession` 会让响应和请求错位，用例就变成了掷骰子。
+
+    没登记的地址回 404（``/robots.txt`` 也在内 —— 那正好等于"这站没写 robots.txt"）。
+    每次请求都记进 ``requested``，"这一页到底有没有被真去抓"全靠它。
+    """
+
+    def __init__(self, routes: dict[str, _FakeResponse], *, miss_status: int = 404) -> None:
+        self._routes = dict(routes)
+        self._miss_status = miss_status
+        self.requested: list[str] = []
+
+    @property
+    def closed(self) -> bool:
+        return False
+
+    def get(self, url: str, **kwargs: object) -> _FakeResponse:
+        self.requested.append(url)
+        if url in self._routes:
+            return self._routes[url]
+        return _FakeResponse(url, status=self._miss_status, body="<p>没有这一页</p>".encode())
+
+
+def _doc(links: tuple[tuple[str, str], ...] = (), *, title: str = "示例页") -> str:
+    """造一页够像样的 HTML：有标题、有密度够高的正文、外加几个链接。
+
+    正文写长一点是有意的 —— ``webdom.extract`` 按内容密度剪枝，太短的块会被当成噪声剪掉。
+    """
+    parts = [
+        f"<html><head><title>{title}</title></head><body><h1>{title}</h1>",
+        "<p>" + "这是这一页的正文，写得长一点好让内容密度过得去。" * 12 + "</p>",
+    ]
+    for href, text in links:
+        parts.append(f'<a href="{href}">{text}</a>')
+    parts.append("</body></html>")
+    return "".join(parts)
+
+
 # ---- 禁区判定 ---------------------------------------------------------------
 
 
@@ -230,6 +292,22 @@ class AssertPublicTests(unittest.TestCase):
             with self.assertRaises(WebError) as err:
                 asyncio.run(assert_public("https://no-such-host.example/"))
         self.assertIn("解析不了域名", str(err.exception))
+
+    def test_a_failed_lookup_is_not_reported_as_a_missing_name(self) -> None:
+        """查询本身失败，不能说成"这个名字不存在"——两者对下一步的含义正好相反。
+
+        名字不存在是确定性结论（重试没用），查询失败重试可能就好了。而 ``URLError`` 也是
+        ``OSError`` 的子类（``urlopen`` 那条路的错都长这样），一起收进来就会被贴上"解析不了
+        域名"，照着它去查 DNS 记录会白跑一趟。这条同时守住分支顺序：``gaierror`` 正是
+        ``OSError`` 的子类，两条调换位置，上面那条用例立刻会红。
+        """
+        for err in (TimeoutError("连接尝试失败"), urllib.error.URLError("连接尝试失败")):
+            with self.subTest(err=type(err).__name__):
+                with mock.patch("socket.getaddrinfo", side_effect=err):
+                    with self.assertRaises(WebError) as caught:
+                        asyncio.run(assert_public("https://slow.example/"))
+                self.assertNotIn("解析不了域名", str(caught.exception))
+                self.assertIn("slow.example", str(caught.exception))
 
 
 # ---- 编码 / 正文清洗 --------------------------------------------------------
@@ -458,9 +536,9 @@ class WebClientTests(unittest.TestCase):
     def _client(self, fetcher: WebFetcher | None = None) -> WebClient:
         return WebClient(fetcher)
 
-    def test_tool_table_is_the_two_web_tools(self) -> None:
+    def test_tool_table_is_the_three_web_tools(self) -> None:
         tools = asyncio.run(WebClient().list_tools())
-        self.assertEqual([t.name for t in tools], ["search", "fetch"])
+        self.assertEqual([t.name for t in tools], ["search", "fetch", "crawl"])
         for tool in tools:
             self.assertEqual(tool.server, "web")
             self.assertEqual(tool.qualified_name, f"web__{tool.name}")
@@ -553,14 +631,932 @@ class WebClientTests(unittest.TestCase):
         self.assertEqual(_Counting.closed, 1)
 
 
+# ---- 多页抓取（按网址查表的假会话，全程不出网） -----------------------------
+
+
+class CrawlTests(unittest.TestCase):
+    """``WebFetcher.crawl``：限深 / 限页 / 同域 / robots / 去重 / 单页失败不牵连全局。"""
+
+    START = "https://example.com/"
+
+    def _crawler(self, routes: dict[str, _FakeResponse], **config: object):
+        fetcher = WebFetcher(WebConfig(**config))
+        session = _RoutedSession(routes)
+        fetcher._http = session
+        return fetcher, session
+
+    def _crawl(self, fetcher: WebFetcher, url: str = START, **kwargs: object) -> dict:
+        args: dict[str, object] = {
+            "max_pages": DEFAULT_CRAWL_PAGES,
+            "max_depth": DEFAULT_CRAWL_DEPTH,
+            "max_chars": DEFAULT_FETCH_CHARS,
+        }
+        args.update(kwargs)
+        with mock.patch("socket.getaddrinfo", side_effect=_public_dns):
+            return asyncio.run(fetcher.crawl(url, **args))  # type: ignore[arg-type]
+
+    def test_one_layer_of_same_site_links(self) -> None:
+        routes = {
+            self.START: _FakeResponse(self.START, body=_doc((("/a", "A"), ("/b", "B"))).encode()),
+            "https://example.com/a": _FakeResponse(
+                "https://example.com/a", body=_doc((("/c", "C"),)).encode()
+            ),
+            "https://example.com/b": _FakeResponse(
+                "https://example.com/b", body=_doc().encode()
+            ),
+        }
+        fetcher, session = self._crawler(routes)
+        out = self._crawl(fetcher, max_depth=1)
+
+        self.assertEqual(out["count"], 3)
+        self.assertEqual(
+            [p["url"] for p in out["pages"]],
+            [self.START, "https://example.com/a", "https://example.com/b"],
+        )
+        self.assertEqual([p["depth"] for p in out["pages"]], [0, 1, 1])
+        # 第二层的链接（/c）不该被抓：层数上限是自己给的界，不许悄悄越过去。
+        self.assertNotIn("https://example.com/c", session.requested)
+        self.assertEqual(out["limits"], {
+            "max_pages": DEFAULT_CRAWL_PAGES,
+            "max_depth": 1,
+            "same_domain": True,
+        })
+        self.assertIn("正文", out["pages"][0]["text"], "抓回来的应当是正文，不是整页 HTML")
+        self.assertNotIn("<a href", out["pages"][0]["text"])
+
+    def test_cross_domain_link_is_skipped_and_reported(self) -> None:
+        routes = {
+            self.START: _FakeResponse(
+                self.START,
+                body=_doc((("/ok", "OK"), ("https://other.example/x", "别站"))).encode(),
+            ),
+            "https://example.com/ok": _FakeResponse("https://example.com/ok", body=_doc().encode()),
+        }
+        fetcher, session = self._crawler(routes)
+        out = self._crawl(fetcher, max_depth=1)
+
+        self.assertEqual(out["count"], 2)
+        self.assertEqual(
+            [item["url"] for item in out["skipped"]], ["https://other.example/x"]
+        )
+        self.assertIn("跨站", out["skipped"][0]["why"])
+        self.assertNotIn("https://other.example/x", session.requested)
+
+    def test_same_domain_can_be_turned_off(self) -> None:
+        """关了同域限制就该真去抓 —— 否则这个参数是个摆设，而摆设比没有更糟。"""
+        routes = {
+            self.START: _FakeResponse(
+                self.START, body=_doc((("https://other.example/x", "别站"),)).encode()
+            ),
+            "https://other.example/x": _FakeResponse(
+                "https://other.example/x", body=_doc(title="别站").encode()
+            ),
+        }
+        fetcher, session = self._crawler(routes)
+        out = self._crawl(fetcher, max_depth=1, same_domain=False)
+
+        self.assertEqual(out["count"], 2)
+        self.assertEqual(out["skipped"], [])
+        self.assertIn("https://other.example/x", session.requested)
+
+    def test_robots_disallow_is_skipped_and_counted(self) -> None:
+        robots = "User-agent: *\nDisallow: /private\n"
+        routes = {
+            "https://example.com/robots.txt": _FakeResponse(
+                "https://example.com/robots.txt",
+                body=robots.encode(),
+                content_type="text/plain; charset=utf-8",
+            ),
+            self.START: _FakeResponse(
+                self.START,
+                body=_doc((("/private/secret", "私密"), ("/ok", "OK"))).encode(),
+            ),
+            "https://example.com/ok": _FakeResponse("https://example.com/ok", body=_doc().encode()),
+        }
+        fetcher, session = self._crawler(routes)
+        out = self._crawl(fetcher, max_depth=1)
+
+        self.assertEqual(out["count"], 2)
+        self.assertEqual(out["robots"], {"rules": 1, "origin": "example.com"})
+        self.assertIn("robots.txt 不允许", out["skipped"][0]["why"])
+        self.assertNotIn("https://example.com/private/secret", session.requested)
+
+    def test_missing_robots_txt_means_everything_allowed(self) -> None:
+        """取不到 robots.txt 不构成禁止（理由在 comfy_studio.webrobots 开头）——
+        但要把"规则 0 条"如实报出来，好让人分辨"没读到"与"什么都允许"。"""
+        routes = {
+            self.START: _FakeResponse(self.START, body=_doc((("/ok", "OK"),)).encode()),
+            "https://example.com/ok": _FakeResponse("https://example.com/ok", body=_doc().encode()),
+        }
+        fetcher, _session = self._crawler(routes)
+        out = self._crawl(fetcher, max_depth=1)
+
+        self.assertEqual(out["count"], 2)
+        self.assertEqual(out["robots"]["rules"], 0)
+
+    def test_max_pages_is_a_hard_cap(self) -> None:
+        links = tuple((f"/p{i}", f"P{i}") for i in range(4))
+        routes = {self.START: _FakeResponse(self.START, body=_doc(links).encode())}
+        for i in range(4):
+            url = f"https://example.com/p{i}"
+            routes[url] = _FakeResponse(url, body=_doc().encode())
+        fetcher, session = self._crawler(routes)
+        out = self._crawl(fetcher, max_pages=2, max_depth=1)
+
+        self.assertEqual(out["count"], 2)
+        self.assertEqual(out["limits"]["max_pages"], 2)
+        # 上限是**派发时**掐的，不是抓完再筛：超出的页一个请求都不该发出去
+        # （曾经就是整层 gather、抓完再数，结果多抓了 3 个页面 —— 对方站点的带宽是真的，
+        # 我们自己的"只抓两页"承诺也是真的）。
+        self.assertEqual(
+            [u for u in session.requested if not u.endswith("robots.txt")],
+            [self.START, "https://example.com/p0"],
+        )
+        # 被上限掐掉的页必须说出来：只回两页而理由是"我自己掐的"，与"这站只有两页"是两件事。
+        # 起点自己占一页、p0 占第二页，所以 p1 也在这批里 —— 上限是"总页数"，不是"每层页数"。
+        self.assertEqual(
+            sorted(item["url"] for item in out["skipped"]),
+            ["https://example.com/p1", "https://example.com/p2", "https://example.com/p3"],
+        )
+        self.assertTrue(all("上限" in item["why"] for item in out["skipped"]))
+
+    def test_a_broken_page_lands_in_failed_without_killing_the_crawl(self) -> None:
+        """某一页跳去本机服务（SSRF 的一个入口）只该让那一页失败，其余照抓。
+
+        顺带验"每一跳都复查"在 crawl 这条路上也生效 —— 页面上写一句内网地址就能绕过起点检查，
+        那是不能接受的。
+        """
+        routes = {
+            self.START: _FakeResponse(
+                self.START, body=_doc((("/boom", "坏页"), ("/ok", "OK"))).encode()
+            ),
+            "https://example.com/boom": _FakeResponse(
+                "https://example.com/boom",
+                status=302,
+                location="http://127.0.0.1:8188/history",
+            ),
+            "https://example.com/ok": _FakeResponse("https://example.com/ok", body=_doc().encode()),
+        }
+        fetcher, session = self._crawler(routes)
+        out = self._crawl(fetcher, max_depth=1)
+
+        self.assertEqual(out["count"], 2, "一页失败不该让整次抓取作废")
+        self.assertEqual([item["url"] for item in out["failed"]], ["https://example.com/boom"])
+        self.assertIn("不抓这个地址", out["failed"][0]["why"])
+        self.assertNotIn("http://127.0.0.1:8188/history", session.requested, "第二跳不许发出去")
+
+    def test_internal_address_link_is_not_followed_even_across_domains(self) -> None:
+        targets = ("http://192.168.1.1/admin", "http://169.254.169.254/latest/meta-data/")
+        routes = {
+            self.START: _FakeResponse(
+                self.START, body=_doc(tuple((t, "内网") for t in targets)).encode()
+            ),
+            "https://example.com/ok": _FakeResponse("https://example.com/ok", body=_doc().encode()),
+        }
+        fetcher, session = self._crawler(routes)
+        out = self._crawl(fetcher, max_depth=1, same_domain=False)
+
+        self.assertEqual(sorted(item["url"] for item in out["failed"]), sorted(targets))
+        for host in ("192.168.1.1", "169.254.169.254"):
+            self.assertFalse(
+                any(host in url for url in session.requested), f"{host} 一次请求都不该发出去"
+            )
+
+    def test_repeated_links_are_fetched_once(self) -> None:
+        routes = {
+            self.START: _FakeResponse(
+                self.START,
+                body=_doc((("/a", "一"), ("/a", "二"), ("/a#top", "三"))).encode(),
+            ),
+            "https://example.com/a": _FakeResponse("https://example.com/a", body=_doc().encode()),
+        }
+        fetcher, session = self._crawler(routes)
+        out = self._crawl(fetcher, max_depth=1)
+
+        self.assertEqual(out["count"], 2)
+        self.assertEqual(session.requested.count("https://example.com/a"), 1, "同一个网址抓两遍")
+        self.assertEqual(out["skipped"], [])
+
+    def test_fragment_only_differences_do_not_create_extra_pages(self) -> None:
+        """``/a`` 与 ``/a#top`` 是同一页：按规范化后的键去重，别把锚点当成新页面。"""
+        routes = {
+            self.START: _FakeResponse(
+                self.START, body=_doc((("/a#top", "一"), ("/a#bottom", "二"))).encode()
+            ),
+            "https://example.com/a": _FakeResponse("https://example.com/a", body=_doc().encode()),
+        }
+        fetcher, session = self._crawler(routes)
+        out = self._crawl(fetcher, max_depth=1)
+
+        self.assertEqual(out["count"], 2)
+        self.assertEqual(len([u for u in session.requested if u.startswith("https://example.com/a")]), 1)
+
+    def test_non_html_page_is_returned_with_a_note(self) -> None:
+        routes = {
+            self.START: _FakeResponse(self.START, body=_doc((("/manual.pdf", "手册"),)).encode()),
+            "https://example.com/manual.pdf": _FakeResponse(
+                "https://example.com/manual.pdf",
+                body=b"%PDF-1.4 ...",
+                content_type="application/pdf",
+            ),
+        }
+        fetcher, _session = self._crawler(routes)
+        out = self._crawl(fetcher, max_depth=1)
+
+        pdf = out["pages"][1]
+        self.assertEqual(pdf["text"], "")
+        self.assertIn("不是 HTML", pdf["note"])
+
+    def test_no_links_at_all_is_one_page_and_no_noise(self) -> None:
+        routes = {self.START: _FakeResponse(self.START, body=_doc().encode())}
+        fetcher, _session = self._crawler(routes)
+        out = self._crawl(fetcher)
+
+        self.assertEqual(out["count"], 1)
+        self.assertEqual((out["skipped"], out["failed"]), ([], []))
+
+    def test_blocked_start_is_an_error_not_an_empty_result(self) -> None:
+        """起点就被挡 = 这次抓取根本没发生，必须抛错 —— 回个空 pages 会让模型以为"这站是空的"。"""
+        fetcher, session = self._crawler({})
+        with mock.patch("socket.getaddrinfo", side_effect=_public_dns):
+            with self.assertRaises(WebError) as err:
+                asyncio.run(
+                    fetcher.crawl(
+                        "http://127.0.0.1:8188/",
+                        max_pages=3,
+                        max_depth=1,
+                        max_chars=100,
+                    )
+                )
+        self.assertIn("不抓这个地址", str(err.exception))
+        self.assertEqual(session.requested, [])
+
+
+class CrawlToolTests(unittest.TestCase):
+    """``web__crawl`` 在 MCP 那一层的形状：参数校验 + 结果怎么给模型。"""
+
+    START = "https://example.com/"
+
+    def _client(self, routes: dict[str, _FakeResponse]) -> tuple[WebClient, _RoutedSession]:
+        fetcher = WebFetcher(WebConfig())
+        session = _RoutedSession(routes)
+        fetcher._http = session
+        return WebClient(fetcher), session
+
+    def _routes(self) -> dict[str, _FakeResponse]:
+        return {
+            self.START: _FakeResponse(
+                self.START, body=_doc((("/a", "A"), ("https://other.example/x", "别站"))).encode()
+            ),
+            "https://example.com/a": _FakeResponse("https://example.com/a", body=_doc().encode()),
+        }
+
+    def _call_crawl(self, client: WebClient, **args: object) -> dict:
+        with mock.patch("socket.getaddrinfo", side_effect=_public_dns):
+            return _call(client, "crawl", url=self.START, **args)
+
+    def test_crawl_returns_the_pages_as_json_text(self) -> None:
+        client, _session = self._client(self._routes())
+        payload = _payload(self._call_crawl(client, max_depth=1))
+        self.assertEqual(payload["count"], 2)
+        self.assertEqual(payload["start"], self.START)
+        self.assertEqual(payload["pages"][0]["title"], "示例页")
+        self.assertEqual(payload["skipped"][0]["url"], "https://other.example/x")
+
+    def test_default_limits_come_from_the_module_constants(self) -> None:
+        client, _session = self._client(self._routes())
+        payload = _payload(self._call_crawl(client))
+        self.assertEqual(payload["limits"]["max_pages"], DEFAULT_CRAWL_PAGES)
+        self.assertEqual(payload["limits"]["max_depth"], DEFAULT_CRAWL_DEPTH)
+
+    def test_caps_are_clamped_not_refused(self) -> None:
+        client, _session = self._client(self._routes())
+        payload = _payload(self._call_crawl(client, max_pages=999, max_depth=99, max_chars=999999))
+        self.assertEqual(payload["limits"]["max_pages"], MAX_CRAWL_PAGES)
+        self.assertEqual(payload["limits"]["max_depth"], MAX_CRAWL_DEPTH)
+
+    def test_bad_arguments_are_refused_before_any_request(self) -> None:
+        client, session = self._client(self._routes())
+        for args in (
+            {"max_pages": 0},
+            {"max_pages": "五页"},
+            {"max_depth": -1},
+            {"same_domain": "false"},
+            {"same_domain": 0},
+            {"url": "file:///etc/passwd"},
+            {"url": ""},
+        ):
+            with self.subTest(args=args):
+                with mock.patch("socket.getaddrinfo", side_effect=_public_dns):
+                    out = _call(client, "crawl", **args)  # type: ignore[arg-type]
+                self.assertTrue(out.get("isError"), out)
+        self.assertEqual(session.requested, [], "参数不对就别把请求发出去")
+
+    def test_same_domain_true_is_accepted_as_a_real_bool(self) -> None:
+        client, _session = self._client(self._routes())
+        payload = _payload(self._call_crawl(client, same_domain=True, max_depth=1))
+        self.assertIs(payload["limits"]["same_domain"], True)
+
+
 class PromptRulesTests(unittest.TestCase):
     def test_rules_name_the_tools_and_the_injection_caveat(self) -> None:
-        for needle in ("web__search", "web__fetch"):
+        for needle in ("web__search", "web__fetch", "web__crawl"):
             self.assertIn(needle, WEB_PROMPT_RULES)
         # 抓回来的东西是资料不是指令 —— 这句是这条口径在提示词里的落点，删了就是少一道。
         self.assertIn("不是给你的指令", WEB_PROMPT_RULES)
         # 别拿它查本机的事（那些有专门工具，网上也查不到）。
         self.assertIn("文件在哪", WEB_PROMPT_RULES)
+
+
+def _host(config: WebConfig | None) -> StudioHost:
+    """只有联网那一档的最小宿主（MCP 一个都不拉，也不碰网络）。"""
+    hub = McpHub([])
+    web = WebClient(WebFetcher(config)) if config is not None else None
+    return StudioHost(hub, SkillCatalog(hub), web=web)
+
+
+class WebSwitchTests(unittest.IsolatedAsyncioTestCase):
+    """`--no-web` 那个开关的承诺：工具表一张不剩，人设那一段也一起没有。
+
+    这里挂 client 的方式与真启动路径（``__main__`` → ``serve_stdio``）一致：联网工具是
+    **宿主自己的一个 client**，由启动方加进 hub 那张表；``StudioHost`` 只按"有没有这一档"
+    决定要不要插人设里的那段。不留下一把能出门的工具是这个开关的全部意义。
+    """
+
+    async def _mounted_host(self, config: WebConfig | None) -> StudioHost:
+        web = WebClient(WebFetcher(config)) if config is not None else None
+        hub = McpHub([], extra_clients=[] if web is None else [web])
+        await hub.start()
+        self.addAsyncCleanup(hub.close)
+        return StudioHost(hub, SkillCatalog(hub), web=web)
+
+    async def test_the_switch_takes_the_whole_table_away(self) -> None:
+        """开着正好三张；关掉一张都不剩，人设里"你可以联网"那段也跟着消失。
+
+        留一把能出门的工具就等于没关（模型照旧会去调它）；反过来，没挂工具却把人设那段
+        留在提示词里，等于教模型去调不存在的工具 —— 两头都得对着这张表。
+        """
+        with_web = await self._mounted_host(WebConfig())
+        names = sorted(t.qualified_name for t in with_web.hub.tools)
+        self.assertEqual(
+            [n for n in names if n.startswith("web__")],
+            ["web__crawl", "web__fetch", "web__search"],
+        )
+        self.assertIn(WEB_PROMPT_RULES, with_web._prompt_source()())
+
+        without = await self._mounted_host(None)
+        names = [t.qualified_name for t in without.hub.tools]
+        self.assertEqual([n for n in names if n.startswith("web__")], [], "关掉了还留着能出门的工具")
+        self.assertNotIn(WEB_PROMPT_RULES, without._prompt_source()())
+
+
+class HostInfoWebFieldsTests(unittest.TestCase):
+    """``host/info`` 报给面板的联网那一档：键名与语义就是面板那行小字的唯一依据。"""
+
+    def test_default_is_bing_and_reports_the_endpoint_it_really_hits(self) -> None:
+        info = _host(WebConfig()).info({}, None)
+        self.assertIs(info["web"], True)
+        self.assertEqual(info["web_backend"], SEARCH_BACKEND_BING)
+        self.assertEqual(info["web_search_url"], "https://www.bing.com/search")
+        self.assertIsNone(info["web_searxng_url"], "没配自建实例就报 None，不要报空串")
+
+    def test_self_hosted_backend_does_not_claim_the_bing_endpoint(self) -> None:
+        """走自建实例时**不报**必应那条入口：它根本没被请求过。
+
+        报出去的话，面板就会一边写"搜索入口：www.bing.com/search"、一边写"自建实例：
+        http://127.0.0.1:8888" —— 用户照着第一句去查必应页，然后觉得这功能坏了。
+        入口在这条路上就是 :attr:`web_searxng_url` 那个值。
+        """
+        config = WebConfig(
+            search_backend=SEARCH_BACKEND_SEARXNG, searxng_url="http://127.0.0.1:8888"
+        )
+        info = _host(config).info({}, None)
+        self.assertEqual(info["web_backend"], SEARCH_BACKEND_SEARXNG)
+        self.assertIsNone(info["web_search_url"])
+        self.assertEqual(info["web_searxng_url"], "http://127.0.0.1:8888")
+
+    def test_without_web_every_field_is_none_not_falsey_strings(self) -> None:
+        info = _host(None).info({}, None)
+        self.assertIs(info["web"], False)
+        for key in ("web_search_url", "web_backend", "web_searxng_url"):
+            with self.subTest(key=key):
+                self.assertIsNone(info[key])
+
+    def test_a_custom_entry_point_is_reported_as_that_entry(self) -> None:
+        """换过入口就报换过的那条：面板那行小字要说的正是"它到底去哪儿问"。
+
+        报的**只能是真会被请求的那个** —— 与"走自建实例时报 None"是同一条规矩：不摆一个没被
+        请求过的地址在那儿。
+        """
+        info = _host(WebConfig(search_url="https://search.example.com/rss")).info({}, None)
+        self.assertEqual(info["web_backend"], SEARCH_BACKEND_BING)
+        self.assertEqual(info["web_search_url"], "https://search.example.com/rss")
+        self.assertIsNone(info["web_searxng_url"])
+
+    def test_a_list_of_entry_points_is_reported_verbatim(self) -> None:
+        """配了一串就如实报整串：面板那行小字要说的正是"它到底去哪儿问"，没有哪一个是更
+        "代表"的 —— 挑一个报出去，用户就会以为搜索只去那一个地方。"""
+        info = _host(
+            WebConfig(search_url="https://a.example.com/rss, https://b.example.com/rss")
+        ).info({}, None)
+        self.assertEqual(
+            info["web_search_url"], "https://a.example.com/rss, https://b.example.com/rss"
+        )
+
+
+class SearchEntryPointTests(unittest.TestCase):
+    """``--web-search-url`` / ``COMFY_STUDIO_WEB_SEARCH_URL`` 换的那条入口。
+
+    写死一个默认端点本身不算错（公网上那个地址换机器也一样），错的是**换不了**：必应那条 RSS
+    改版、或者这台机器要过镜像 / 自建代理时，原来只能改代码发版。这里盯"换得动"、"形状不对就
+    报错"，以及两个入口同时给时**不许静默挑一个**。
+    """
+
+    def test_defaults_to_the_builtin_bing_entry(self) -> None:
+        config = search_config()
+        self.assertEqual(config.search_backend, SEARCH_BACKEND_BING)
+        self.assertEqual(config.search_url, "https://www.bing.com/search")
+        self.assertEqual(config.searxng_url, "")
+
+    def test_a_custom_entry_keeps_the_bing_backend(self) -> None:
+        """换入口不换读法：那条路仍按必应 RSS 的形状解析，所以后端还是 bing。"""
+        config = search_config(search_url="https://search.example.com/rss")
+        self.assertEqual(config.search_backend, SEARCH_BACKEND_BING)
+        self.assertEqual(config.search_url, "https://search.example.com/rss")
+
+    def test_a_trailing_slash_is_trimmed(self) -> None:
+        """尾斜杠要归一化：拼接处是 ``{入口}?q=``，留着它就成了 ``.../rss/?q=``。"""
+        self.assertEqual(
+            check_search_url("  https://search.example.com/rss/  "),
+            "https://search.example.com/rss",
+        )
+
+    def test_multiple_entries_are_split_and_normalised(self) -> None:
+        """一串入口：逗号分隔，逐条削空白与尾斜杠，再拼回一个规整的串。
+
+        校验与归一化只在这一层做（:func:`check_search_urls`）；把串拆成"多个 base"是
+        :meth:`WebFetcher._search_bases` 的活 —— 两份地方各拆一次，早晚会拆得不一样。
+        """
+        self.assertEqual(
+            check_search_urls("  https://a.example.com/rss/ ,  https://b.example.com/rss  "),
+            "https://a.example.com/rss, https://b.example.com/rss",
+        )
+
+    def test_a_list_without_one_valid_entry_is_refused(self) -> None:
+        """只有逗号、或者全是空白：那不是"配了多个"，是压根没配，照旧拒掉。"""
+        for raw in ("", "   ", ",", " , , "):
+            with self.subTest(raw=raw):
+                with self.assertRaises(WebError) as err:
+                    check_search_urls(raw)
+                self.assertIn("http(s)", str(err.exception))
+
+    def test_one_bad_entry_refuses_the_whole_list(self) -> None:
+        """一条不合格就整体拒：留着它，等于每次搜索都白撞一次死入口。"""
+        with self.assertRaises(WebError) as err:
+            check_search_urls("https://a.example.com/rss, search.example.com")
+        self.assertIn("http(s)", str(err.exception))
+
+    def test_a_custom_entry_list_survives_search_config(self) -> None:
+        """配一串也走同一条路：``search_config`` 只校验与归一化，原样带着逗号交给 fetcher。"""
+        config = search_config(
+            search_url="https://a.example.com/rss/, https://b.example.com/rss"
+        )
+        self.assertEqual(config.search_backend, SEARCH_BACKEND_BING)
+        self.assertEqual(
+            config.search_url, "https://a.example.com/rss, https://b.example.com/rss"
+        )
+
+    def test_a_malformed_entry_is_refused_with_the_shape_it_wants(self) -> None:
+        """不给它猜：没写 scheme 的直接拒，报错里写清要什么形状（下一行就能改对）。"""
+        for raw in ("search.example.com", "file:///etc/passwd", "https://", ""):
+            with self.subTest(raw=raw):
+                with self.assertRaises(WebError) as err:
+                    check_search_url(raw)
+                self.assertIn("http(s)", str(err.exception))
+
+    def test_both_entry_points_is_an_error_not_a_silent_pick(self) -> None:
+        """两个都给 = 配置自相矛盾。挑一个继续跑，另一个就成"设了却不生效"了。"""
+        with self.assertRaises(WebError) as err:
+            search_config(
+                search_url="https://search.example.com/rss",
+                searxng_url="http://127.0.0.1:8888",
+            )
+        text = str(err.exception)
+        self.assertIn("--searxng-url", text)
+        self.assertIn("--web-search-url", text)
+
+    def test_the_self_hosted_backend_keeps_the_default_entry_in_the_config(self) -> None:
+        """只给了自建实例：后端换成 searxng；入口那栏在配置里保持默认（``host/info`` 不报它）。"""
+        config = search_config(searxng_url="http://127.0.0.1:8888")
+        self.assertEqual(config.search_backend, SEARCH_BACKEND_SEARXNG)
+        self.assertEqual(config.searxng_url, "http://127.0.0.1:8888")
+        self.assertEqual(config.search_url, "https://www.bing.com/search")
+
+
+class SearchFailoverTests(unittest.TestCase):
+    """配了一串入口时，搜索要"前面那个不行就试后面的"—— 与自建实例那份是同一条口径。
+
+    写死一个入口的害处不是报错，是**下不了台**：必应那条 RSS 改版、或者这台机器要过镜像 /
+    自建代理，整次搜索就死在那一个地址上。
+    """
+
+    def _fetcher(
+        self, entry: str, responses: list[_FakeResponse]
+    ) -> tuple[WebFetcher, _FakeSession]:
+        fetcher = WebFetcher(WebConfig(search_url=entry))
+        session = _FakeSession(responses)
+        fetcher._http = session
+        return fetcher, session
+
+    def _search(self, fetcher: WebFetcher) -> dict:
+        with mock.patch("socket.getaddrinfo", side_effect=_public_dns):
+            return asyncio.run(fetcher.search("comfyui", limit=5))
+
+    def test_the_entry_list_is_split_here_with_a_trimmed_slash(self) -> None:
+        """拆分在 fetcher 里做，且尾斜杠要削掉（拼接处是 ``{入口}?q=``）。"""
+        fetcher = WebFetcher(
+            WebConfig(search_url="https://a.example.com/rss/, https://b.example.com/rss")
+        )
+        self.assertEqual(
+            fetcher._search_bases(),
+            ["https://a.example.com/rss", "https://b.example.com/rss"],
+        )
+
+    def test_a_dead_entry_falls_through_to_the_next(self) -> None:
+        """第一个入口回了一整页 HTML（被挡成壳页），接着试第二个，结果从第二个来。"""
+        dead = _FakeResponse(
+            "https://a.example.com/rss", body=b"<html><body>please retry later</body></html>"
+        )
+        good = _FakeResponse("https://b.example.com/rss", body=BING_RSS_SAMPLE.encode())
+        fetcher, session = self._fetcher(
+            "https://a.example.com/rss, https://b.example.com/rss", [dead, good]
+        )
+        out = self._search(fetcher)
+        self.assertEqual(out["backend"], SEARCH_BACKEND_BING)
+        self.assertEqual(out["count"], 5)
+        self.assertEqual(out["page_url"], "https://b.example.com/rss")
+        self.assertEqual(len(session.requested), 2, "两个入口都该试过")
+        self.assertTrue(session.requested[0].startswith("https://a.example.com/rss?"))
+        self.assertTrue(session.requested[1].startswith("https://b.example.com/rss?"))
+
+    def test_all_entries_dead_raises_instead_of_a_silent_zero(self) -> None:
+        """一串全挂了必须抛错，而不是回"搜到了 0 条"让模型以为网上查不到。
+
+        文案怎么拼由 :func:`_all_bases_failed_message` 管（逐个说明每个入口的原因），
+        这条只管"必须抛、且每个入口都真被试过"。
+        """
+        dead_a = _FakeResponse("https://a.example.com/rss", body=b"<html>a</html>")
+        dead_b = _FakeResponse("https://b.example.com/rss", body=b"<html>b</html>")
+        fetcher, session = self._fetcher(
+            "https://a.example.com/rss, https://b.example.com/rss", [dead_a, dead_b]
+        )
+        with self.assertRaises(WebError):
+            self._search(fetcher)
+        self.assertEqual(len(session.requested), 2, "两个入口都该试过")
+
+    def test_a_single_entry_is_still_a_single_try(self) -> None:
+        """只配一个：跟从前一样撞一次就抛，不会凭空多打请求。"""
+        fetcher, session = self._fetcher(
+            "https://a.example.com/rss",
+            [_FakeResponse("https://a.example.com/rss", body=b"<html>a</html>")],
+        )
+        with self.assertRaises(WebError):
+            self._search(fetcher)
+        self.assertEqual(len(session.requested), 1)
+
+    def test_a_lone_dead_entry_keeps_its_own_message(self) -> None:
+        """只配一个入口时，报的就是那一句话本身，不套"1 个入口挨个都试了"的壳。
+
+        套壳不算错，但会让人以为"还有别的入口被试过" —— 而这里从头到尾只有一个。约定写在
+        :func:`_all_bases_failed_message` 的文档里（只挂一处时，调用方原样抛那句），这条盯着它。
+        """
+        dead = _FakeResponse("https://a.example.com/rss", body=b"<html>a</html>")
+        fetcher, session = self._fetcher("https://a.example.com/rss", [dead])
+        with self.assertRaises(WebError) as caught:
+            self._search(fetcher)
+        text = str(caught.exception)
+        self.assertIn("拿回来的不是搜索结果的 XML", text, "原样抛出那一句，才看得出是哪条路挂的")
+        self.assertNotIn("挨个都试了", text, "只有一个入口，别说成'挨个都试过'")
+        self.assertEqual(len(session.requested), 1)
+
+    def test_all_entries_dead_says_why_each_one_failed(self) -> None:
+        """全挂时要**逐个**说明是哪个入口、为什么不行，而不是只留最后一个。
+
+        只报最后一个的害处是指错方向：人会以为"只有最后一个入口有问题、前面那些是好的"。
+        实际是挨个都试过、挨个都不行 —— 该看的是共性（这台机器出不了网？每个入口都被同一
+        道墙挡了？），而共性只有摆齐了才看得出来；只留最后一个，连"前面也挂过"都看不出来。
+        """
+        dead_a = _FakeResponse("https://a.example.com/rss", body=b"<html>a</html>")
+        dead_b = _FakeResponse("https://b.example.com/rss", body=b"<html>b</html>")
+        fetcher, _ = self._fetcher(
+            "https://a.example.com/rss, https://b.example.com/rss", [dead_a, dead_b]
+        )
+        with self.assertRaises(WebError) as caught:
+            self._search(fetcher)
+        text = str(caught.exception)
+        self.assertIn("https://a.example.com/rss", text)
+        self.assertIn("https://b.example.com/rss", text)
+
+    def test_the_summary_does_not_repeat_a_name_the_reason_already_carries(self) -> None:
+        """原因里已经点了实例名的（``_empty_results_message`` 的 SearXNG 分支就自带）不再补前缀。
+
+        重复一遍（``http://x/：SearXNG 实例 http://x/ 的 JSON 里…``）不算错，但很吵；要紧的是
+        "要不要补前缀"这个判断只在一处做 —— 让调用方各自判断的话，换个后端就会长出重复的名字。
+        """
+        text = _all_bases_failed_message(
+            [
+                (
+                    "http://x.example.com/",
+                    WebError("SearXNG 实例 http://x.example.com/ 的 JSON 里一条结果都没有"),
+                ),
+                (
+                    "https://b.example.com/rss",
+                    WebError("搜索结果是 XML，但一条 item 都没解析出来"),
+                ),
+            ]
+        )
+        self.assertEqual(text.count("http://x.example.com/"), 1, "自带实例名的那条不该再加前缀")
+        self.assertIn("  - https://b.example.com/rss：搜索结果是 XML", text)
+
+    def test_a_zero_result_entry_is_listed_with_its_own_name(self) -> None:
+        """另一条失败路径（拿回来的**是** XML，但一条结果都没解析出来）也得带上是哪个入口。
+
+        与上一条走的是不同分支：那边 `_request` 就认出"这不是 XML"先抛了；这边请求成功、
+        解析出零条。:func:`_empty_results_message` 的必应分支**不带**入口名（SearXNG 那条自带），
+        所以汇总时必须自己补 —— 不补就变成两句谁也认不出是谁的话。
+
+        末尾那句是**自查**：确认这条用例真的走到了"零结果"那条路，而不是又被 `_request`
+        提前挡掉、悄悄退化成上一条的复制品。
+        """
+        empty = b'<?xml version="1.0"?><rss version="2.0"><channel></channel></rss>'
+        dead_a = _FakeResponse("https://a.example.com/rss", body=empty)
+        dead_b = _FakeResponse("https://b.example.com/rss", body=empty)
+        fetcher, _ = self._fetcher(
+            "https://a.example.com/rss, https://b.example.com/rss", [dead_a, dead_b]
+        )
+        with self.assertRaises(WebError) as caught:
+            self._search(fetcher)
+        text = str(caught.exception)
+        self.assertIn("一条 ``<item>`` 都没解析出来", text, "这条要真走到'零结果'那条路")
+        self.assertIn("https://a.example.com/rss", text)
+        self.assertIn("https://b.example.com/rss", text)
+
+
+class SearchEntryWiringTests(unittest.TestCase):
+    """``main`` → ``serve_stdio`` 这根线：参数加了不接上，等于没加，而且两边用例都还是绿的。
+
+    真起进程验不划算（要一条 stdio 管道，还要一台能起来的引擎），所以这里把 ``collect_servers``
+    与 ``serve_stdio`` 换掉，只看"命令行 / 环境变量给的值有没有走到那一步"。
+    """
+
+    #: 基线：把两个入口的环境变量清空，免得跑测试的这台机器自己设了它们而让用例看人下菜碟。
+    _CLEAR = {"COMFY_STUDIO_SEARXNG_URL": "", "COMFY_STUDIO_WEB_SEARCH_URL": ""}
+
+    def _run_main(
+        self, argv: list[str], environ: dict[str, str] | None = None
+    ) -> tuple[int, mock.AsyncMock, str]:
+        served = mock.AsyncMock()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(main_module, "collect_servers", return_value=[]),
+            mock.patch.object(main_module, "serve_stdio", served),
+            mock.patch.dict(os.environ, dict(self._CLEAR, **(environ or {}))),
+            contextlib.redirect_stderr(stderr),
+        ):
+            code = main_module.main(argv)
+        return code, served, stderr.getvalue()
+
+    def test_the_flag_reaches_serve_stdio(self) -> None:
+        code, served, _ = self._run_main(
+            ["--web-search-url", "https://search.example.com/rss"]
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            served.await_args.kwargs["web_search_url"],
+            "https://search.example.com/rss",
+        )
+
+    def test_the_env_var_also_reaches_it(self) -> None:
+        code, served, _ = self._run_main(
+            [], {"COMFY_STUDIO_WEB_SEARCH_URL": "https://mirror.example.com/search"}
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            served.await_args.kwargs["web_search_url"],
+            "https://mirror.example.com/search",
+        )
+
+    def test_a_list_of_entries_reaches_serve_stdio_as_one_string(self) -> None:
+        """一串入口要**整串**传下去，不能在这一层拆成 list。
+
+        拆分只有 ``WebFetcher._search_bases`` 那一处：这里也拆一遍，就等于第二份拆分逻辑，
+        两处早晚会拆得不一样（而且传下去的类型一变，``serve_stdio`` 那边先炸）。
+        """
+        raw = "https://a.example.com/rss, https://b.example.com/rss"
+        code, served, _ = self._run_main(["--web-search-url", raw])
+        self.assertEqual(code, 0)
+        self.assertEqual(served.await_args.kwargs["web_search_url"], raw)
+
+    def test_both_entry_points_stop_the_startup_instead_of_picking_one(self) -> None:
+        code, served, err = self._run_main(
+            [
+                "--web-search-url",
+                "https://search.example.com/rss",
+                "--searxng-url",
+                "http://127.0.0.1:8888",
+            ]
+        )
+        self.assertEqual(code, 2)
+        served.assert_not_awaited()
+        self.assertIn("--web-search-url", err)
+        self.assertIn("--searxng-url", err)
+
+    def test_a_typo_in_the_entry_point_stops_the_startup(self) -> None:
+        """配错了在启动时就报，而不是等模型第一次 search 才炸。"""
+        code, served, err = self._run_main(["--web-search-url", "search.example.com"])
+        self.assertEqual(code, 2)
+        served.assert_not_awaited()
+        self.assertIn("http(s)", err)
+
+    def test_a_no_web_start_does_not_police_them(self) -> None:
+        """关着联网时那两个参数根本不会被读：为一份用不上的配置拦下启动才是错的。"""
+        code, served, _ = self._run_main(
+            [
+                "--no-web",
+                "--web-search-url",
+                "https://search.example.com/rss",
+                "--searxng-url",
+                "http://127.0.0.1:8888",
+            ]
+        )
+        self.assertEqual(code, 0)
+        served.assert_awaited()
+
+
+#: 面板那段前端脚本：它读 ``host/info`` 的哪几个字段、拿哪个值当后端，只能按文本比 ——
+#: 它在 TypeScript 里，Python 进不去，而这两处字面量**没有一个地方能互相看见**。
+PANEL_SCRIPT_REL = ("Comfy-Desktop", "src", "main", "lib", "comfyStudioChatContentScript.ts")
+
+_PACKAGE_DIR = Path(__file__).resolve().parents[1]  # .../Comfy-Desktop/lib/comfy_studio
+
+
+def panel_script_path() -> Path | None:
+    """面板脚本的落点，找不到回 ``None``。
+
+    从本包目录往上找，**不写死盘符路径**：``lib/comfy_studio`` 被单独装进别处时那份脚本不在
+    磁盘上 —— 那时基于它的用例要明说"跳过、因为什么"，而不是假装通过。
+    """
+    for parent in _PACKAGE_DIR.parents:
+        candidate = parent.joinpath(*PANEL_SCRIPT_REL)
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+#: 面板里跟 ``web_backend`` 比的字面量：单双引号都认（那份脚本两种都在用）。
+_BACKEND_COMPARISON = re.compile(r"web_backend\s*===\s*(?:'([^']*)'|\"([^\"]*)\")")
+#: 面板从 ``info`` 上读的联网字段（``info.web_backend`` → ``web_backend``）。
+_WEB_INFO_KEY = re.compile(r"\binfo\.(web[A-Za-z_]*)")
+
+_PANEL_SCRIPT = panel_script_path()
+
+
+def panel_backend_literals(source: str) -> list[str]:
+    """面板里跟 ``web_backend`` 比的字面量（按出现顺序）。
+
+    抽不出来时返回**空清单**，由用例当面报错：空清单看着像"没有要守的"，而那正是这条守卫变瞎
+    的样子（面板改成查表、或不再比后端时，谁也不该默默过关）。
+    """
+    return [found.group(1) or found.group(2) for found in _BACKEND_COMPARISON.finditer(source)]
+
+
+def panel_web_info_keys(source: str) -> set[str]:
+    """面板从 ``info`` 上读的联网字段名。
+
+    只认 ``web`` 开头的：那份脚本里另有一个同名的 DOM 元素（``info.className``），整片扫会把它
+    当成 host/info 的字段。
+    """
+    return set(_WEB_INFO_KEY.findall(source))
+
+
+def _panel_source() -> str:
+    assert _PANEL_SCRIPT is not None  # 这个类整体挂在 skipUnless 下
+    return _PANEL_SCRIPT.read_text(encoding="utf-8")
+
+
+@unittest.skipUnless(
+    _PANEL_SCRIPT is not None,
+    "面板脚本不在（lib/comfy_studio 被单独安装时属于正常情况）",
+)
+class PanelWebLineContractTests(unittest.TestCase):
+    """面板那行"能不能联网 / 走哪条路"与 ``host/info`` 之间那条**跨语言**契约。
+
+    两边都是照抄的字面量：宿主那份是 :mod:`comfy_studio.web` 里的 ``SEARCH_BACKEND_*``，面板那份
+    是 TypeScript 里的 ``'bing'`` / ``'searxng'``。谁改了一边的取值，另一边不会报错 —— 面板只会
+    安静地退到那句光秃秃的"能联网"，于是"搜出来不对"时唯一那条线索没了。字段名同理：面板读
+    ``info.`` 上哪个名字也是照抄的，对不上时那一档直接不显示，而 Python 这边一片绿。
+
+    两侧的用例各自都盯不住这件事：Python 用例拿常量跟常量比（改值一起绿），前端用例的 mock 是
+    手写的字面量（宿主改名它不知道）。这里就是那个"改了一边"的报警器。
+    """
+
+    def test_the_panel_only_branches_on_backends_the_host_can_report(self) -> None:
+        """面板比的值必须是宿主真会报的：否则那一支永远不成立（改了取值忘了改面板）。"""
+        literals = panel_backend_literals(_panel_source())
+        known = {SEARCH_BACKEND_BING, SEARCH_BACKEND_SEARXNG}
+        self.assertEqual(
+            sorted(set(literals) - known),
+            [],
+            "面板在跟一个宿主不会报的后端值比 —— 那一句界面上永远不会出现："
+            f"面板里写着 {sorted(set(literals))}，宿主只报 {sorted(known)}"
+            f"（宿主这份在 {_PACKAGE_DIR / 'web.py'}，面板那份在 {_PANEL_SCRIPT}）",
+        )
+
+    def test_every_backend_the_host_can_report_is_named_by_the_panel(self) -> None:
+        """宿主能报的后端，面板都得说得出来：新加一个后端时这条先红，而不是让它显示成"能联网"。"""
+        literals = set(panel_backend_literals(_panel_source()))
+        self.assertEqual(
+            sorted({SEARCH_BACKEND_BING, SEARCH_BACKEND_SEARXNG} - literals),
+            [],
+            "宿主能报的后端，面板上没有对应的那句话 —— 用户就看不出走的是哪条路了"
+            f"（面板那份在 {_PANEL_SCRIPT}；真要让它说，就在 paintStorage 的联网那一档里加一支）",
+        )
+
+    def test_the_panel_only_reads_fields_the_host_reports(self) -> None:
+        """面板读的字段名得是 ``host/info`` 真报出来的：名字差一个字母，那一档就不显示了。"""
+        keys = panel_web_info_keys(_panel_source())
+        reported = set(_host(WebConfig()).info({}, None))
+        self.assertEqual(
+            sorted(keys - reported),
+            [],
+            "面板在读一个 host/info 不报的字段 —— 界面上那一句会永远空着"
+            f"（面板那份在 {_PANEL_SCRIPT}，宿主报的键在 {_PACKAGE_DIR / 'server.py'} 的 info()）",
+        )
+
+    def test_the_extraction_is_not_blind(self) -> None:
+        """抽空就等于这几条以后再也不会红：所以它自己也得有人盯着。"""
+        self.assertTrue(
+            panel_backend_literals(_panel_source()),
+            "面板里已经找不到跟 web_backend 比的字面量了：要么这一档被删了（那就连这条守卫一起"
+            "删掉，别留着当摆设），要么它换了个写法（改 panel_backend_literals 跟上它）",
+        )
+        self.assertTrue(
+            panel_web_info_keys(_panel_source()),
+            "面板里已经读不到 info.web* 了：同上 —— 改抽取、或把这条守卫删掉",
+        )
+
+
+class PanelContractGuardSelfCheckTest(unittest.TestCase):
+    """抽取自己的用例：合成源码走一遍（不需要面板脚本，永远跑）。
+
+    :class:`PanelWebLineContractTests` 拿真脚本一比就绿，**抽取变瞎了也一样绿**。这里把每条
+    判断都拿编出来的文本走一遍。
+    """
+
+    def test_backend_literals_are_read_in_both_quote_styles(self) -> None:
+        source = (
+            "if (info.web_backend === 'searxng') a();\n"
+            'else if (info.web_backend === "bing") b();\n'
+        )
+        self.assertEqual(panel_backend_literals(source), ["searxng", "bing"])
+
+    def test_a_comparison_against_a_variable_yields_nothing(self) -> None:
+        """改成跟变量比（或查表）时抽空 —— 上游那条"不许变瞎"的断言就会响，而不是安静放过。"""
+        self.assertEqual(panel_backend_literals("if (info.web_backend === backend) a();\n"), [])
+        self.assertEqual(panel_backend_literals('if (BACKENDS[info.web_backend]) a();\n'), [])
+
+    def test_only_the_web_fields_are_picked_up(self) -> None:
+        """``info`` 在那份脚本里还当过一个 DOM 元素的名字，别把它的属性当成 host/info 的字段。"""
+        source = "info.web_backend; info.web; info.web_search_url; info.memory_file; info.className;"
+        self.assertEqual(
+            panel_web_info_keys(source), {"web", "web_backend", "web_search_url"}
+        )
+
+
+class PanelScriptLayoutTests(unittest.TestCase):
+    """认不认得出面板脚本的落点，本身要有用例。
+
+    认不出时上面那个类会**整批跳过**，而输出仍然是 OK —— 那正是"守卫还在、其实没在守"的样子。
+    """
+
+    def test_the_panel_script_is_found_while_the_desktop_tree_is_here(self) -> None:
+        desktop_lib = _PACKAGE_DIR.parents[1] / "src" / "main" / "lib"
+        if not desktop_lib.is_dir():
+            self.skipTest(
+                f"没有 {desktop_lib}：只装了 lib/comfy_studio 的独立安装，跨语言守卫这轮不适用"
+            )
+        self.assertIsNotNone(
+            _PANEL_SCRIPT,
+            f"{desktop_lib} 在，却没认出面板脚本 —— 跨语言守卫会整批跳过而输出仍是 OK，"
+            "先看 panel_script_path() 的探测",
+        )
+
+
+if _PANEL_SCRIPT is None:
+    print(
+        "[test_web] 跳过面板字面量契约检查：从 "
+        f"{_PACKAGE_DIR} 往上没找到 {'/'.join(PANEL_SCRIPT_REL)}"
+    )
 
 
 if __name__ == "__main__":

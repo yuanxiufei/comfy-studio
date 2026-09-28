@@ -339,6 +339,29 @@ class _FakeCompletions(BaseHTTPRequestHandler):
         return
 
 
+class EngineCheckoutLayoutTest(unittest.TestCase):
+    """宿主侧 e2e 的"出勤自检"：引擎检出缺了要响，别整组静默跳过还显示 OK。
+
+    :class:`StudioHostE2ETest` 的跳过条件把两件事混在一起：venv 没建（合法缺勤，跳过是对的）
+    与引擎检出缺了（本仓入库的源码，缺了说明布局不对）。后半截被前半截盖住之后，输出仍然
+    是 ``OK``，整组 e2e 一条都不跑也不会有人注意到。
+
+    这条用例**故意不带 skipUnless**：本仓布局（与 ``Comfy-Desktop/`` 平级有 ``ComfyUI/``）在，
+    就要求引擎检出在；不在，才按"这个检出里没有引擎侧"记一笔跳过。
+    """
+
+    def test_engine_checkout_is_there_when_the_repo_layout_is_there(self) -> None:
+        if not (REPO_ROOT / "ComfyUI").is_dir():
+            self.skipTest(
+                f"没有与 Comfy-Desktop/ 平级的 ComfyUI 检出（{REPO_ROOT / 'ComfyUI'}），"
+                "宿主侧 e2e 这轮不适用"
+            )
+        self.assertTrue(
+            (ENGINE_PACKAGE / "mcp" / "server.py").is_file(),
+            f"没找到引擎检出 {ENGINE_PACKAGE} —— 宿主侧 e2e 会整组跳过而输出仍是 OK",
+        )
+
+
 @unittest.skipUnless(
     VENV_PYTHON.exists() and (ENGINE_PACKAGE / "mcp" / "server.py").exists(),
     f"需要 {VENV_PYTHON} 与 {ENGINE_PACKAGE}（先跑仓库根的 npm run setup）",
@@ -509,9 +532,12 @@ class StudioHostE2ETest(unittest.TestCase):
         self.assertIs(info.get("history"), True)
         self.assertEqual(info.get("history_dir"), str(self.memory_dir / SESSION_SUBDIR))
         # 联网默认开着。**这里只验状态，不真发请求**：真出门是下面 web 用例各自的事，
-        # 而端到端测试要能在断网的机器上跑，所以这两张工具在这里只验"挂上了"。
+        # 而端到端测试要能在断网的机器上跑，所以这三张工具在这里只验"挂上了"。
+        # 后端也要报对：没给 --searxng-url 就是必应那条不用部署任何东西的路。
         self.assertIs(info.get("web"), True)
         self.assertEqual(info.get("web_search_url"), "https://www.bing.com/search")
+        self.assertEqual(info.get("web_backend"), "bing")
+        self.assertIsNone(info.get("web_searxng_url"))
 
     def test_02_tools_are_namespaced_by_server(self) -> None:
         tools = self.call(2, "mcp/tools").get("result", {}).get("tools", [])
@@ -523,9 +549,19 @@ class StudioHostE2ETest(unittest.TestCase):
         self.assertIn("memory__remember", names)
         self.assertIn("memory__recall", names)
         self.assertIn("memory__forget", names)
-        # 联网那两张是"不用谁接话"的那类，默认就汇进工具表（--no-web 才没有）。
+        # 联网那三张是"不用谁接话"的那类，默认就汇进工具表（--no-web 才没有）。
         self.assertIn("web__search", names)
         self.assertIn("web__fetch", names)
+        self.assertIn("web__crawl", names)
+        # 而它们**只能有一套**：引擎那个 server 也被拉起来了（上面那条 comfy-studio__… 就是它），
+        # 它自己那份联网没关的话，这里会多出 comfy-studio__web__*，于是两套并存 ——
+        # 模型在两套里随便挑，--no-web 也只关掉宿主那三张（等于开关失效）。宿主替它关掉联网
+        # 这件事写在 mcp/config.py 的 ENGINE_NO_WEB_ENV 上，这条断言就是那件事的机械核对：
+        # 名字写错或取值那边不认时，它不会报错，只会在这里多出三个带前缀的联网工具。
+        for name in ("web__search", "web__fetch", "web__crawl"):
+            with self.subTest(name=name):
+                same = [n for n in names if n.endswith(f"__{name}") or n == name]
+                self.assertEqual(same, [name], f"联网工具应当只有宿主那一套，实际有两套：{same}")
         # 每把工具都严格是 <server>__<tool>：回程那条通道（review）也不破例。
         for tool in tools:
             self.assertTrue(tool["qualified_name"].startswith(f"{tool['server']}__"), tool)

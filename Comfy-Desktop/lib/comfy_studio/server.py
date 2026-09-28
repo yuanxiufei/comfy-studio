@@ -83,7 +83,7 @@ from .history import (
 )
 from .localfiles import LocalFiles, LocalFilesClient
 from .memory import MemoryClient, MemoryStore, MemoryStoreError, memory_home
-from .mcp import McpHub, McpServerConfig
+from .mcp import McpHub, McpServerConfig, engine_web_tools
 from .novels import (
     DEFAULT_CHAPTER_LIMIT,
     DEFAULT_LIST_LIMIT,
@@ -121,7 +121,13 @@ from .settings import (
     SettingsStore,
 )
 from .skills import SkillCatalog, SkillsError
-from .web import WEB_PROMPT_RULES, WebClient
+from .web import (
+    SEARCH_BACKEND_BING,
+    WEB_PROMPT_RULES,
+    WebClient,
+    WebFetcher,
+    search_config,
+)
 
 SERVER_NAME = "comfy-studio-desktop"
 SERVER_VERSION = "0.1.0"
@@ -382,9 +388,22 @@ class StudioHost:
             "memory_entries": memory_entries,
             "memory_error": memory_error,
             # 联网默认开着（--no-web 关掉）。它没有本地落点可报，只如实说"挂没挂" ——
-            # 面板据此决定要不要显示"这个模型能上网"。
+            # 面板据此决定要不要显示"这个模型能上网"。后端与自建实例地址也一并报出来：
+            # "搜出来结果少"的第一个该看的东西就是到底走了哪条路。
             "web": self.web is not None,
+            # 搜索入口**只在真用它时才报**：走自建 SearXNG 时 config.search_url（必应那条 RSS）
+            # 根本没被请求过，报出去就成了"面板说走必应、实际走的是自建实例"——
+            # 那句话比不报更坏，用户会照着它去查必应页。那种情况下入口就是 web_searxng_url。
             "web_search_url": str(self.web.fetcher.config.search_url)
+            if self.web is not None
+            and self.web.fetcher.config.search_backend == SEARCH_BACKEND_BING
+            else None,
+            "web_backend": self.web.fetcher.config.search_backend
+            if self.web is not None
+            else None,
+            # 没配自建实例时如实报 None 而不是空串：两种都是"没配"，但空串在 JSON 里
+            # 看着像"配了一个空地址"，面板与排障脚本都得跟着猜。
+            "web_searxng_url": (self.web.fetcher.config.searxng_url or None)
             if self.web is not None
             else None,
             "history": self.history is not None,
@@ -1504,7 +1523,7 @@ class StudioHost:
             if store is not None:
                 sections.append(store.digest())
             if web:
-                # "你可以联网"这一段只在真挂了那两张工具时才成立：没挂却写进人设，等于教模型
+                # "你可以联网"这一段只在真挂了那三张工具时才成立：没挂却写进人设，等于教模型
                 # 去调不存在的 web__search，它会当成"网也上不了、查也查不成"。
                 sections.append(WEB_PROMPT_RULES)
             return compose_system_prompt(*sections)
@@ -1614,6 +1633,8 @@ async def serve_stdio(
     memory_dir: str | None = None,
     agents_dir: str | None = None,
     web: bool = True,
+    web_search_url: str | None = None,
+    searxng_url: str | None = None,
     history: bool = True,
     turn_timeout: float | None = DEFAULT_TURN_TIMEOUT,
 ) -> None:
@@ -1648,10 +1669,19 @@ async def serve_stdio(
     智能体清单（:mod:`comfy_studio.agent.catalog`）也用这份数据目录：内置那几项写死在代码里，
     用户自己写的 md 放 ``agents/`` 下（``agents_dir`` 换地方）。它只决定人设里的**角色段**，
     既不进工具表也不需要谁接话，所以没有开关 —— 面板上永远有的选。
-    联网（:mod:`comfy_studio.web`：``web__search`` 搜一下、``web__fetch`` 读一页）也**默认开着**
+    联网（:mod:`comfy_studio.web`：``web__search`` 搜一下、``web__fetch`` 读一页、``web__crawl``
+    顺着同站链接一次读一组页）也**默认开着**
     —— 本地模型的知识停在训练那天，而"这个插件现在怎么装""这个报错是什么意思"这类问题本机
     确实查不到，硬答就是编。它不需要谁接话，但会往外面发请求，所以给了 ``web=False`` 整个关掉：
     工具表里不再有 ``web__*``，系统提示词里也不再提"你可以联网"（那一整段只在挂了它时才成立）。
+    ``searxng_url`` 是**可选**的后端：不填就走必应 RSS（不用部署任何东西），填了才换成自建实例
+    （可给多个、逗号分隔，前面那个连不上就试后面）。``web_search_url`` 换的是**入口**而不是后端：
+    必应那条 RSS 哪天改版、或者这台机器要过一个镜像 / 自建代理，用它换掉而不用改代码 ——
+    那种入口仍按必应的 RSS 形状解析（同样可给多个、逗号分隔，前面那个连不上就试后面，口径与
+    自建实例那份一致）。两个都给了由 :func:`comfy_studio.web.search_config` 报错
+    （后端只有一个，静默挑一个等于让另一个配置在这台机器上不生效）。``host/info`` 报出 ``web``
+    / ``web_search_url`` / ``web_backend`` / ``web_searxng_url``，面板据此说清它能不能上网、
+    走的是哪条路（``web_search_url`` 配了多个时如实报整串）。
     抓哪些地址有硬闸门（本机 / 内网 / 云元数据一律不抓，跳转也要逐跳复查），细节见
     :mod:`comfy_studio.web` 开头。
     ``turn_timeout`` 是一轮对话的上限（默认 :data:`DEFAULT_TURN_TIMEOUT`，``None`` = 不设看门狗）：
@@ -1684,9 +1714,16 @@ async def serve_stdio(
     memory_client = (
         MemoryClient(MemoryStore(memory_dir or memory_home())) if memory else None
     )
-    # 联网那两张（web__search / web__fetch）：不需要谁接话，也没有本地落点要配，默认就挂。
-    # 逮地址的硬闸门在这一层里面（见 comfy_studio.web），关掉只能整个不挂。
-    web_client = WebClient() if web else None
+    # 联网那三张（web__search / web__fetch / web__crawl）：不需要谁接话，也没有本地落点要配，
+    # 默认就挂。逮地址的硬闸门在这一层里面（见 comfy_studio.web），关掉只能整个不挂。
+    # 搜索默认走必应 RSS（不用部署任何东西）；两个入口（换后端 / 换入口）只能给一个，落成配置的
+    # 活交给 web.search_config —— 它同时管着"两个都给就报错"与入口形状检查，好让 __main__ 在
+    # 启动时就把错报出来，而不是等模型第一次 search 才炸。
+    web_client = (
+        WebClient(WebFetcher(search_config(search_url=web_search_url, searxng_url=searxng_url)))
+        if web
+        else None
+    )
     # 对话存档与记忆共用同一个数据目录（--memory-dir / COMFY_STUDIO_MEMORY_DIR 管着它俩）：
     # 记忆是平铺的 memory.json，对话按会话分文件放在 sessions/ 下。
     data_root = memory_home() if memory_dir is None else Path(memory_dir).expanduser()
@@ -1754,6 +1791,18 @@ async def serve_stdio(
             file=sys.stderr,
             flush=True,
         )
+        # 内建 server 是被吩咐过"联网不用你管"的（见 mcp/config.py 的 ENGINE_NO_WEB_ENV），
+        # 它名下就不该有联网工具。真出现时两边都不会报错 —— 面板只会安静地多出第二套，
+        # 用户"搜不到"时又得在两份配置里挑一份看。所以在这里喊一声，别等到那时候。
+        leaked = engine_web_tools(hub.tools)
+        if leaked:
+            print(
+                f"[{SERVER_NAME}] 警告：内建 server 仍然挂出了联网工具（{', '.join(leaked)}）——"
+                "宿主给它的那个开关没生效，面板里等于有两套同能力的联网工具；"
+                "请核对两边那份开关名（宿主 mcp/config.py 的 ENGINE_NO_WEB_ENV 与引擎 mcp/tools.py 的 NO_WEB_ENV）",
+                file=sys.stderr,
+                flush=True,
+            )
         await host.server.serve()
     finally:
         if host is not None:

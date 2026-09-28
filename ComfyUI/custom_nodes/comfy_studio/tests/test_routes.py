@@ -23,6 +23,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from .. import routes
 from ..agent.types import ChatMessage, ToolCall
 from ..engine import EngineError
+from ..web import WebFetcher
 from .support import FakeEngine, FakeLLM
 
 WORKFLOW_BODY = {"params": {"ckpt_name": "a.safetensors", "positive": "一只猫", "seed": 7}}
@@ -194,12 +195,68 @@ class RouteContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, 200)
         self.assertIs(body["configured"], False)
         self.assertIn("COMFY_STUDIO_LLM_MODEL", body["reason"])
+        # 没配模型也要带着联网那几个字段：形状不随别的字段变，调用方不必写两套读法。
+        self.assertIn("web_backend", body)
 
         with mock.patch.dict(os.environ, {"COMFY_STUDIO_LLM_MODEL": "qwen"}, clear=True):
             status, body = await self.json_of("get", "/comfy-studio/agent/config")
         self.assertEqual(status, 200)
         self.assertEqual(body["model"], "qwen")
-        self.assertEqual(body["tool_count"], 10, "9 个通用工具 + 每 skill 一个")
+        self.assertEqual(body["tool_count"], 13, "9 个通用工具 + 每 skill 一个 + 联网 3 把")
+
+    def test_the_panel_handle_is_a_real_fetcher_and_is_reused(self) -> None:
+        """取回来必须是**真句柄**，而且取第二次得是同一个（进程级共用一份）。
+
+        这条盯的是一个真踩过的坑：缓存变量与取值函数同名时，``def`` 会把缓存那个格子换成
+        函数对象，于是 ``is None`` 永远不成立、缓存永远不建，取回来的"句柄"其实是函数本身。
+        它不会在装配阶段报错（工具表照样齐、``web=True`` 照样报对了），要等**模型真去搜一次**
+        才炸 —— 所以只能在这里把它钉住：类型对 + 同一个对象。
+        """
+        self.addCleanup(setattr, routes, "_fetcher", routes._fetcher)
+        routes._fetcher = None
+        with mock.patch.dict(os.environ, {}, clear=True):
+            handle = routes._web_fetcher()
+        self.assertIsInstance(handle, WebFetcher, "取回来的不是句柄，是别的东西（比如函数）")
+        self.assertIs(routes._web_fetcher(), handle, "第二次取得是同一份，不能每次新建")
+
+    def test_the_handle_is_not_cached_when_web_is_off(self) -> None:
+        """关着联网就每次回 ``None``：不能"建过一次就一直给"，那等于开关失效。"""
+        self.addCleanup(setattr, routes, "_fetcher", routes._fetcher)
+        routes._fetcher = None
+        with mock.patch.dict(os.environ, {"COMFY_NO_WEB": "1"}, clear=True):
+            self.assertIsNone(routes._web_fetcher())
+            self.assertIsNone(routes._fetcher, "关了就不该建句柄")
+
+    async def test_agent_config_reports_which_search_path_it_takes(self) -> None:
+        """``agent/config`` 说的联网那一档，字段与宿主侧 ``host/info`` 一一对应。
+
+        两处各报一份是因为**这是两个进程、两份环境**，但话必须是同一套：
+        键名一致，前端才能照着同一句话画；"搜出来太少"时第一个要看的就是这条。
+
+        注意这里的句柄是**进程级缓存**（:func:`routes._web_fetcher`）：环境变量只在第一次
+        建句柄时读一次。这正是引擎要的语义 —— 它的环境是启动时给的，跑起来不会变 ——
+        但写用例时得自己把那份缓存清掉，否则验的只是"上一条用例留下的那个后端"。
+        """
+        self.addCleanup(setattr, routes, "_fetcher", routes._fetcher)
+        cases = [
+            ({}, True, "bing", "https://www.bing.com/search", None),
+            ({"COMFY_NO_WEB": "1"}, False, None, None, None),
+            # 走自建实例时**不报**必应那条入口：它根本没被请求过，报出去等于说
+            # "面板写走必应、实际走的是自建实例"，用户会照着那句话去查必应。
+            ({"COMFY_SEARXNG_URL": "http://127.0.0.1:8888"}, True, "searxng", None, "http://127.0.0.1:8888"),
+        ]
+        for environ, web, backend, search_url, searxng_url in cases:
+            with self.subTest(environ=environ):
+                routes._fetcher = None  # 清缓存：不然读到的是上一条用例建的句柄
+                with mock.patch.dict(
+                    os.environ, {**environ, "COMFY_STUDIO_LLM_MODEL": "qwen"}, clear=True
+                ):
+                    status, body = await self.json_of("get", "/comfy-studio/agent/config")
+                self.assertEqual(status, 200, body)
+                self.assertIs(body["web"], web)
+                self.assertEqual(body["web_backend"], backend)
+                self.assertEqual(body["web_search_url"], search_url)
+                self.assertEqual(body["web_searxng_url"], searxng_url)
 
     async def test_agent_chat_validates_input_and_llm_config(self) -> None:
         for body in ({}, {"message": "   "}, {"message": 3}):
@@ -251,6 +308,54 @@ class RouteContractTest(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(text.split("event: tool_call\ndata: ", 1)[1].split("\n\n", 1)[0])
         self.assertEqual(payload["name"], "skill__text-to-image")
         self.assertEqual(self.engine.submitted[0]["6"]["inputs"]["text"], "一只猫")
+
+    async def test_agent_chat_can_really_search_the_web_from_the_panel(self) -> None:
+        """模型在面板里真去搜一次：句柄 → 工具表 → 工具调用这整条线都得通。
+
+        这是"缓存变量与函数同名"那个坑真正炸掉的地方 —— 装配阶段一切正常（工具表齐、
+        ``web=True`` 也报对了），要等**真去搜**才炸成 500。所以这里不假造工具、也不假造
+        工具表，只把**一次网络往返**换掉（``WebFetcher.search``）：路由那层取到的句柄
+        必须是个真句柄，才接得住这次调用。
+        """
+        self.addCleanup(setattr, routes, "_fetcher", routes._fetcher)
+        routes._fetcher = None
+        seen: list[tuple[str, int]] = []
+
+        async def fake_search(self: WebFetcher, query: Any, *, limit: int) -> dict[str, Any]:
+            seen.append((query, limit))
+            return {
+                "query": query,
+                "backend": "bing",
+                "page_url": "https://www.bing.com/search?q=x",
+                "results": [
+                    {"title": "装法", "url": "https://example.test/a", "snippet": "先装管理器"}
+                ],
+            }
+
+        self.llm = FakeLLM(
+            [
+                ChatMessage(
+                    role="assistant",
+                    content="",
+                    tool_calls=[
+                        ToolCall(id="c1", name="web__search", arguments={"query": "插件怎么装", "limit": 3})
+                    ],
+                ),
+                reply("搜到了：先装管理器"),
+            ]
+        )
+        with mock.patch.dict(os.environ, {"COMFY_STUDIO_LLM_MODEL": "qwen"}, clear=True):
+            with mock.patch.object(routes, "OpenAIChatClient", lambda _config: self.llm):
+                with mock.patch.object(WebFetcher, "search", fake_search):
+                    response = await self.client.post(
+                        "/comfy-studio/agent/chat", json={"message": "插件怎么装"}
+                    )
+                    text = await response.text()
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(seen, [("插件怎么装", 3)], "搜索得真走到句柄上，参数原样带下去")
+        self.assertIn("装法", text, "搜到的标题要进工具结果，模型才看得见")
+        self.assertNotIn("event: error", text)
 
     async def test_agent_chat_reports_model_failure_as_an_error_frame(self) -> None:
         class BrokenLLM:

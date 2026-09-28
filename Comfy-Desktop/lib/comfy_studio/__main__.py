@@ -25,6 +25,7 @@ from .server import (
     SERVER_NAME,
     serve_stdio,
 )
+from .web import WebError, search_config
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -144,10 +145,31 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-web",
         action="store_true",
         help=(
-            "关掉联网（web__search / web__fetch 两张工具与系统提示词里的联网段）。"
+            "关掉联网（web__search / web__fetch / web__crawl 三张工具与系统提示词里的联网段）。"
             "默认是开的：本地模型的知识停在训练那天，查不到的事实让它去查，别硬答。"
             "它会往外面发请求（只抓公网地址，本机 / 内网 / 云元数据一律挡掉），"
             "不想让它出门就加这个开关"
+        ),
+    )
+    parser.add_argument(
+        "--searxng-url",
+        default=None,
+        help=(
+            "用自建的 SearXNG 当搜索后端（也可用 COMFY_STUDIO_SEARXNG_URL）。"
+            "不填就走必应 RSS —— 那条不用部署任何东西。填了就得是能出 JSON 的实例地址"
+            "（settings.yml 的 search.formats 里要含 json，默认只开 html）。"
+            "逗号分隔可以给多个，前面那个连不上就试后面的。与 --web-search-url 互斥"
+        ),
+    )
+    parser.add_argument(
+        "--web-search-url",
+        default=None,
+        help=(
+            "换搜索**入口**（也可用 COMFY_STUDIO_WEB_SEARCH_URL），默认 https://www.bing.com/search。"
+            "必应那条 RSS 哪天改版、或者这台机器要过一个镜像 / 自建代理时，用它换掉而不用改代码 —— "
+            "仍然按必应的 RSS 形状解析：换的是'去哪儿问'，不是'怎么读回来'（想换读法用 --searxng-url）。"
+            "逗号分隔可以给多个，前面那个连不上就试后面的。"
+            "要写完整的 http(s) 地址；与 --searxng-url 互斥，两个都给了直接报错退出"
         ),
     )
     parser.add_argument(
@@ -185,6 +207,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    web_search_url = args.web_search_url or os.environ.get("COMFY_STUDIO_WEB_SEARCH_URL")
+    searxng_url = args.searxng_url or os.environ.get("COMFY_STUDIO_SEARXNG_URL")
+    # 联网开着才校验这两条：关掉的进程里它们根本不会被读，为一份用不上的配置拦下启动才是错的
+    # （引擎侧同一个口径，见 comfy_studio.mcp.server.serve_stdio）。
+    if not args.no_web:
+        try:
+            search_config(search_url=web_search_url, searxng_url=searxng_url)
+        except WebError as err:
+            print(f"[{SERVER_NAME}] {err}", file=sys.stderr, flush=True)
+            return 2
+
     try:
         configs = collect_servers(
             comfyui_dir=args.comfyui_dir,
@@ -214,6 +247,8 @@ def main(argv: list[str] | None = None) -> int:
                 memory_dir=args.memory_dir or os.environ.get("COMFY_STUDIO_MEMORY_DIR"),
                 agents_dir=args.agents_dir or os.environ.get("COMFY_STUDIO_AGENTS_DIR"),
                 web=not args.no_web,
+                web_search_url=web_search_url,
+                searxng_url=searxng_url,
                 history=not args.no_history,
                 turn_timeout=None if args.turn_timeout <= 0 else args.turn_timeout,
             )

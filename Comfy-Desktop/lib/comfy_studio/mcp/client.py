@@ -49,7 +49,7 @@ class McpTool:
 
     @property
     def qualified_name(self) -> str:
-        """``<server>::<tool>``，多 server 场景下当函数名给模型用。"""
+        """``<server>__<tool>``，多 server 场景下当函数名给模型用。"""
         return f"{self.server}__{self.name}"
 
 

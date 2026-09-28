@@ -3036,6 +3036,22 @@ function paintStorage(info) {
   else if (info.history === true) parts.push('对话存在这台机器上');
   else parts.push('对话存不存它没说');
 
+  // 能不能上网：默认开着（web__search / web__fetch / web__crawl 三张表工具），只有 --no-web 才关。
+  // 顺带报**走的是哪条路** —— 必应 RSS 还是自建 SearXNG："搜出来结果不对/太少"时第一个要看的就是它，
+  // 而这条路在界面上没别的地方会说（见 lib/comfy_studio/server.py 里 host/info 那几行）。
+  // 宿主没报的字段不替它编：老宿主可能只说 web 不说后端。
+  if (info.web === false) parts.push('这次没开联网（--no-web），不知道的事它只能凭记忆答');
+  else if (info.web !== true) parts.push('联网开没开它没说');
+  else if (info.web_backend === 'searxng') parts.push('能联网（自建 SearXNG）');
+  else if (info.web_backend === 'bing') parts.push('能联网（走必应）');
+  else parts.push('能联网');
+
+  // 地址按同样的理由塞进悬停提示：一个网址铺在界面上占地方，但它正是排障要看的那一眼。
+  // 两条各报各的、都只看宿主给没给：走自建实例时宿主那头就**不会**再报必应那条入口
+  // （它没被请求过），所以这里不必自己判断"该不该显示"—— 报了才画，没报就没有。
+  if (info.web === true && info.web_search_url) where.push('搜索入口：' + info.web_search_url);
+  if (info.web === true && info.web_searxng_url) where.push('自建实例：' + info.web_searxng_url);
+
   setStorage(parts.join('；'), '', where.join(' ｜ '));
 }
 

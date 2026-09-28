@@ -1070,16 +1070,60 @@ describe('getComfyStudioChatContentScript', () => {
 
     it('says how much it remembers and that it all stays on this machine', async () => {
       installBridge({
-        request: hostInfo({ ...paths, memory: true, memory_entries: 3, history: true })
+        request: hostInfo({
+          ...paths,
+          memory: true,
+          memory_entries: 3,
+          history: true,
+          web: true,
+          web_backend: 'bing',
+          web_search_url: 'https://www.bing.com/search'
+        })
       })
       setupDom()
       new Function(script)()
       await openPanel()
 
-      expect(line()?.textContent).toBe('它记着 3 条事；对话存在这台机器上')
+      expect(line()?.textContent).toBe('它记着 3 条事；对话存在这台机器上；能联网（走必应）')
       // 路径太长，铺在界面上要占掉半个抽屉：放悬停提示里
       expect(line()?.title).toContain('memory.json')
       expect(line()?.title).toContain('sessions')
+      // 搜索走哪条路也一样："搜出来不对"时第一个要看的就是它，界面上没别处会说。
+      expect(line()?.title).toContain('bing.com')
+    })
+
+    it('names the self-hosted search backend when that is what it is using', async () => {
+      installBridge({
+        request: hostInfo({
+          memory: true,
+          history: true,
+          web: true,
+          web_backend: 'searxng',
+          // 宿主走自建实例时**不报**必应那条入口（它根本没被请求过，见 lib/comfy_studio/web.py
+          // 那一档的注释）：这里就照真实的形状给 null，走的正是"报什么画什么"这条路。
+          web_search_url: null,
+          web_searxng_url: 'http://127.0.0.1:8888'
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      expect(line()?.textContent).toContain('能联网（自建 SearXNG）')
+      expect(line()?.title, '自建实例地址是排障要看的那一眼').toContain('127.0.0.1:8888')
+      // 入口这时就是那个自建实例：不该再冒出一句必应，否则两句互相打架、用户照错的那句去查。
+      expect(line()?.title ?? '').not.toContain('搜索入口')
+    })
+
+    it('says out loud when the host was started without web access', async () => {
+      installBridge({ request: hostInfo({ memory: true, history: true, web: false }) })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      expect(line()?.textContent).toContain('这次没开联网（--no-web）')
+      // 关了就关干净：没有搜索入口这种话不该出现，那会让用户以为还能搜。
+      expect(line()?.title ?? '').not.toContain('搜索入口')
     })
 
     it('puts an unreadable memory file in front, since every turn fails on it', async () => {
@@ -1104,14 +1148,15 @@ describe('getComfyStudioChatContentScript', () => {
     })
 
     it('says out loud when the host was started without memory or the archive', async () => {
-      installBridge({ request: hostInfo({ memory: false, history: false }) })
+      installBridge({ request: hostInfo({ memory: false, history: false, web: false }) })
       setupDom()
       new Function(script)()
       await openPanel()
 
       expect(line()?.textContent).toBe(
         '这次没开记忆（--no-memory），你说过的事它不会记住；' +
-          '这次没开对话存档（--no-history），面板一关这段对话就没了'
+          '这次没开对话存档（--no-history），面板一关这段对话就没了；' +
+          '这次没开联网（--no-web），不知道的事它只能凭记忆答'
       )
     })
 
@@ -1121,7 +1166,7 @@ describe('getComfyStudioChatContentScript', () => {
       new Function(script)()
       await openPanel()
 
-      expect(line()?.textContent).toBe('记忆开没开它没说；对话存不存它没说')
+      expect(line()?.textContent).toBe('记忆开没开它没说；对话存不存它没说；联网开没开它没说')
     })
 
     it('says so when the host cannot be asked at all', async () => {
@@ -1139,19 +1184,28 @@ describe('getComfyStudioChatContentScript', () => {
       installBridge({
         request: (method: string) =>
           method === 'host/info'
-            ? { ok: true, result: { memory: true, memory_entries: entries, history: true } }
+            ? {
+                ok: true,
+                result: {
+                  memory: true,
+                  memory_entries: entries,
+                  history: true,
+                  web: true,
+                  web_backend: 'bing'
+                }
+              }
             : { ok: true, result: { text: '答案在此' } }
       })
       setupDom()
       new Function(script)()
       await openPanel()
-      expect(line()?.textContent).toBe('还没记住什么；对话存在这台机器上')
+      expect(line()?.textContent).toBe('还没记住什么；对话存在这台机器上；能联网（走必应）')
 
       entries = 1 // 这一轮里它记下了一条
       await send('记住我喜欢方形构图')
       await flush() // 这一问是收尾时才发的，多让一拍
 
-      expect(line()?.textContent).toBe('它记着 1 条事；对话存在这台机器上')
+      expect(line()?.textContent).toBe('它记着 1 条事；对话存在这台机器上；能联网（走必应）')
     })
   })
 

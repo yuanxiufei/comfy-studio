@@ -8,13 +8,13 @@
   导航 / 页脚 / 侧栏 / 评论那一类整块剪掉（算法在 :mod:`comfy_studio.webdom`）；
 * ``web__crawl`` —— 从一个网址出发，同站限层抓一组页面（守 robots、限页数、限并发）。
 
-**这份代码是"两处落点"里的一份，不是唯一的**：同一套实现也住在引擎侧
-（``ComfyUI/custom_nodes/comfy_studio/``：``web.py`` / ``webdom.py`` / ``websearch.py`` /
+**这份代码是"两处落点"里的一份，不是唯一的**：同一套实现也住在宿主侧
+（``Comfy-Desktop/lib/comfy_studio/``：``web.py`` / ``webdom.py`` / ``websearch.py`` /
 ``webrobots.py`` / ``weberror.py``）。两边都叫 ``comfy_studio`` 但是**两份独立的安装**，
-宿主装在桌面壳的 ``lib/``，引擎装进 ComfyUI 的 ``custom_nodes/``，谁也 import 不到谁 ——
-所以只能各留一份。**改这里就要照着改那边**（四个纯算法模块是逐字相同的副本，行尾不计 ——
-两边换行策略不同，见引擎侧 ``tests/test_web_tools.py`` 里那条逐字守卫；这个 ``web.py`` 只差在：
-宿主这一份多接了取消令牌与 MCP client 外壳）。
+引擎装进 ComfyUI 的 ``custom_nodes/``，宿主装在桌面壳的 ``lib/``，谁也 import 不到谁 ——
+所以只能各留一份。**改这里就要照着改那边**（四个纯算法模块是逐字相同的副本，**行尾不计** ——
+两边换行策略不同，逐字比对与理由见 ``tests/test_web_tools.py`` 里那条守卫；
+这个 ``web.py`` 只差在：引擎侧没有取消令牌、也没有宿主那套 MCP client 外壳）。
 
 **搜索后端走必应的 RSS 入口，这是 2026-09-28 在本机实测选出来的**：
 
@@ -76,8 +76,6 @@ from urllib.parse import quote_plus, urljoin, urlsplit
 import aiohttp
 
 from . import webdom
-from .cancel import CancelToken, race
-from .mcp import McpError, McpTool
 from .weberror import WebError
 from .webrobots import RobotsRules
 from .websearch import (
@@ -92,8 +90,9 @@ from .websearch import (
 #: 汇进工具表时用的 server 名。
 WEB_SERVER = "web"
 
-#: 搜索入口的**默认值**（可换，见 :func:`search_config` 与 ``--web-search-url``）。写 ``www``
-#: 而不写死地区域名：它自己按地区跳（本机实测跳到了 cn.bing.com），写死的话换台机器就未必对了。
+#: 搜索入口的**默认值**（可换，见 :func:`comfy_studio.mcp.tools.web_config` 的
+#: ``SEARCH_URL_ENV``）。写 ``www`` 而不写死地区域名：它自己按地区跳（本机实测跳到了
+#: cn.bing.com），写死的话换台机器就未必对了。
 BING_SEARCH_URL = "https://www.bing.com/search"
 
 #: 搜索入口的取数格式。**HTML 那条路实测已经回 0 条**（见模块开头那张表），所以走 RSS。
@@ -472,38 +471,6 @@ def check_search_urls(raw: str) -> str:
     return ", ".join(parts)
 
 
-def search_config(
-    *, search_url: str | None = None, searxng_url: str | None = None
-) -> WebConfig:
-    """把启动参数（``--web-search-url`` / ``--searxng-url``）落成一份联网配置。
-
-    **两个入口只允许给一个**：搜索后端只有一个，两边都给了就报错，而不是安静地挑一个 ——
-    被静默丢掉的那个参数，在别人机器上就是"配了却不生效"，这比当场报错难查得多。
-
-    都不给就是必应 RSS（不用部署任何东西）。``search_url`` 只换入口、不换后端：那种入口仍按
-    必应的 RSS 形状解析（``BING_SEARCH_FORMAT``）—— 换的是"去哪儿问"，不是"怎么读回来"；
-    想换读法就得走 ``searxng_url`` 那条（SearXNG 的 JSON API）。
-
-    ``search_url`` 逗号分隔可以给多个（前面那个连不上就试后面的），口径与 ``searxng_url``
-    的多实例完全一致；逐个都过 :func:`check_search_urls` 的形状检查。
-    """
-    if search_url and searxng_url:
-        raise WebError(
-            "搜索后端只能有一个：--searxng-url 与 --web-search-url 二选一。"
-            "自建 SearXNG 走前者（结果多源、带直接答案，代价是自己维护那个实例）；"
-            "只想换一个搜索入口（镜像 / 地区域名 / 自建 RSS 代理）走后者"
-        )
-    if search_url:
-        return WebConfig(
-            search_url=check_search_urls(search_url), search_backend=SEARCH_BACKEND_BING
-        )
-    if searxng_url:
-        return WebConfig(
-            search_backend=SEARCH_BACKEND_SEARXNG, searxng_url=searxng_url
-        )
-    return WebConfig()
-
-
 class WebFetcher:
     """真正干活的：一个 aiohttp 会话，加"搜"与"抓"两个动作。"""
 
@@ -531,7 +498,7 @@ class WebFetcher:
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
 
-    async def search(self, query: Any, *, limit: int, cancel: CancelToken | None = None) -> dict[str, Any]:
+    async def search(self, query: Any, *, limit: int) -> dict[str, Any]:
         """搜一个词，回 ``{"query", "results": [...], "page_url", "backend"}``。
 
         ``results`` 每项是 ``{title, url, snippet, published, engines}``；SearXNG 那边若带了
@@ -546,12 +513,8 @@ class WebFetcher:
         "正好这几条"里挪位置，等于没排 —— 那是白做。
         """
         bases, backend, text, pool = self._search_setup(query, limit)
-        return await race(
-            lambda: self._search_with_failover(
-                bases, backend=backend, text=text, pool=pool, limit=limit
-            ),
-            cancel,
-            what=f"搜索 {text}",
+        return await self._search_with_failover(
+            bases, backend=backend, text=text, pool=pool, limit=limit
         )
 
     def _search_setup(self, query: Any, limit: int) -> tuple[list[str], str, str, int]:
@@ -751,7 +714,6 @@ class WebFetcher:
         max_depth: int,
         max_chars: int,
         same_domain: bool = True,
-        cancel: CancelToken | None = None,
     ) -> dict[str, Any]:
         """从 ``url`` 出发，在同站内按层抓一组页面。
 
@@ -773,19 +735,15 @@ class WebFetcher:
         await assert_public(start)
         start_host = (urlsplit(start).hostname or "").lower()
         rules = await self._robots_rules(start)
-
-        async def once() -> dict[str, Any]:
-            return await self._crawl_walk(
-                start,
-                start_host,
-                rules,
-                max_pages=max_pages,
-                max_depth=max_depth,
-                max_chars=max_chars,
-                same_domain=same_domain,
-            )
-
-        return await race(once, cancel, what=f"抓取 {start}")
+        return await self._crawl_walk(
+            start,
+            start_host,
+            rules,
+            max_pages=max_pages,
+            max_depth=max_depth,
+            max_chars=max_chars,
+            same_domain=same_domain,
+        )
 
     async def _crawl_walk(
         self,
@@ -869,7 +827,7 @@ class WebFetcher:
             "count": len(pages),
         }
 
-    async def fetch(self, url: Any, *, max_chars: int, cancel: CancelToken | None = None) -> dict[str, Any]:
+    async def fetch(self, url: Any, *, max_chars: int) -> dict[str, Any]:
         """抓一个网址：准入之后交给 :meth:`_fetch_body` 取数，回的字段在那边列着。
 
         非 2xx **不抛错**：状态码照实给回去，正文也照给 —— 404 页面上写着什么，模型看一眼
@@ -877,11 +835,7 @@ class WebFetcher:
         """
         target = parse_url(url)
         await assert_public(target)
-        return await race(
-            lambda: self._fetch_body(target, max_chars=max_chars),
-            cancel,
-            what=f"抓取 {target}",
-        )
+        return await self._fetch_body(target, max_chars=max_chars)
 
     async def _fetch_body(self, target: str, *, max_chars: int) -> dict[str, Any]:
         """取回 ``target`` 的正文并按内容密度剪枝，回模型要的那几个字段。
@@ -973,16 +927,29 @@ def _looks_like_html(content_type: str, text: str) -> bool:
 
 
 @dataclass(frozen=True)
-class _Spec:
-    """一张工具的定义。与 :mod:`comfy_studio.memory` 里那个同名结构同形。"""
+class WebToolSpec:
+    """一张联网工具的定义（名字 / 说明 / 参数表），**还没有 handler**。
+
+    这里只管"这张工具是什么"；"怎么把它变成一个能调的东西"交给调用方
+    （引擎侧是 :mod:`comfy_studio.mcp.tools` 里那个 :class:`~comfy_studio.mcp.tools.Tool`）——
+    这个模块不 import MCP 那一层，否则 ``mcp/tools.py`` 与本模块相互 import 就转不出来了。
+
+    ``name`` 是**光名字**（``search`` / ``fetch`` / ``crawl``）；对外的限定名由调用方拼
+    （引擎侧拼成 :data:`WEB_SERVER` + ``__`` + 光名字，见 :func:`qualified_name`）。
+    """
 
     name: str
     description: str
     input_schema: dict[str, Any]
 
 
-WEB_TOOLS: tuple[_Spec, ...] = (
-    _Spec(
+def qualified_name(name: str) -> str:
+    """把光名字拼成对外用的限定名（``search`` -> ``web__search``）。"""
+    return f"{WEB_SERVER}__{name}"
+
+
+WEB_TOOLS: tuple[WebToolSpec, ...] = (
+    WebToolSpec(
         name="search",
         description=(
             "上网搜一下，回几条标题 / 链接 / 摘要。用在需要**本机没有的、时效性的**信息时："
@@ -1002,7 +969,7 @@ WEB_TOOLS: tuple[_Spec, ...] = (
             "required": ["query"],
         },
     ),
-    _Spec(
+    WebToolSpec(
         name="fetch",
         description=(
             "抓一个具体网址，把网页读成纯文本正文。网址要给全，含 http:// 或 https://。"
@@ -1022,7 +989,7 @@ WEB_TOOLS: tuple[_Spec, ...] = (
             "required": ["url"],
         },
     ),
-    _Spec(
+    WebToolSpec(
         name="crawl",
         description=(
             "从一个网址出发，把同站的**一组**页面一起读成纯文本（文档站 / 手册 / 多页文章最合适）。"
@@ -1139,115 +1106,49 @@ def _validate(name: str, args: dict[str, Any]) -> dict[str, Any]:
             ),
             "same_domain": _bounded_flag(args.get("same_domain"), default=True, field="same_domain"),
         }
-    raise McpError(f"联网工具表里没有 {name}")
+    raise WebError(f"联网工具表里没有 {name}")
 
 
-def _error_text(message: str) -> dict[str, Any]:
-    """MCP 里"工具跑失败了"的形状：``isError`` 加一行文本。"""
-    return {"content": [{"type": "text", "text": message}], "isError": True}
+async def call_web_tool(
+    fetcher: WebFetcher, name: str, arguments: dict[str, Any]
+) -> Any:
+    """跑一次联网动作，回**可 JSON 序列化的结果**；形状不对 / 抓不动就抛 :class:`WebError`。
 
+    这一层只回答"回什么数据、什么时候算失败"。**包装成哪种协议是调用方的事**：引擎侧在
+    :mod:`comfy_studio.mcp.server` 的 ``call_tool`` 里统一把异常翻成 ``isError`` 文本，
+    宿主侧在自己那份 ``WebClient`` 里翻 —— 所以这里不 import 任何协议层。
 
-@dataclass(frozen=True)
-class WebServerConfig:
-    """与 :class:`~comfy_studio.mcp.McpServerConfig` 同形的极小配置：这里只需要名字。"""
-
-    name: str = WEB_SERVER
-
-
-class WebClient:
-    """鸭子型 MCP client：形状与 :class:`~comfy_studio.mcp.client.McpStdioClient` 一致，
-    好直接汇进 :class:`~comfy_studio.mcp.McpHub` 的工具表（与记忆 / 本地文件同一个做法）。
+    参数先过 :func:`_validate`：形状不对就别把请求发出去。
     """
-
-    def __init__(
-        self, fetcher: WebFetcher | None = None, config: WebServerConfig | None = None
-    ) -> None:
-        self.fetcher = fetcher or WebFetcher()
-        self.config = config if config is not None else WebServerConfig()
-
-    @property
-    def alive(self) -> bool:
-        """没有子进程会死。真正的失败在每次请求上如实报出来，不在这里假装健康。"""
-        return True
-
-    def stderr_tail(self) -> str:
-        """没有"子进程吐的最后几行"可给 —— 每次请求自己往 stderr 记了一行（见 :func:`_log`）。"""
-        return ""
-
-    async def start(self) -> None:
-        """没有子进程要拉。HTTP 会话留到第一次真用时才建（见 :meth:`WebFetcher._session`）。"""
-
-    async def close(self) -> None:
-        await self.fetcher.close()
-
-    async def list_tools(self) -> list[McpTool]:
-        return [
-            McpTool(
-                server=self.config.name,
-                name=spec.name,
-                description=spec.description,
-                input_schema=spec.input_schema,
-            )
-            for spec in WEB_TOOLS
-        ]
-
-    async def call_tool(
-        self, name: str, arguments: dict[str, Any], *, cancel: CancelToken | None = None
-    ) -> dict[str, Any]:
-        """跑一次联网动作。
-
-        与记忆那几张不一样：这里的 ``cancel`` **真的会用** —— 抓一个慢站点是实打实的长等待
-        （最多 :data:`DEFAULT_TIMEOUT` 秒），用户按了停止就该立刻放弃，而不是等它读完。
-
-        失败一律回 ``isError`` 文本交给模型，不往外抛：网址写错、落在禁区、对方回 404，
-        模型都能自己换个做法再试一次。**取消除外** —— :class:`~comfy_studio.cancel.Cancelled`
-        会照原样冒上去，因为它不是失败，RPC 层要把它翻成一个正常结果。
-        """
-        try:
-            kwargs = _validate(name, arguments)
-        except (WebError, McpError) as err:
-            return _error_text(str(err))
-        try:
-            if name == "search":
-                payload = await self.fetcher.search(
-                    kwargs["query"], limit=kwargs["limit"], cancel=cancel
-                )
-            elif name == "crawl":
-                payload = await self.fetcher.crawl(
-                    kwargs["url"],
-                    max_pages=kwargs["max_pages"],
-                    max_depth=kwargs["max_depth"],
-                    max_chars=kwargs["max_chars"],
-                    same_domain=kwargs["same_domain"],
-                    cancel=cancel,
-                )
-            else:
-                payload = await self.fetcher.fetch(
-                    kwargs["url"], max_chars=kwargs["max_chars"], cancel=cancel
-                )
-        except WebError as err:
-            return _error_text(str(err))
-        return {
-            "content": [
-                {"type": "text", "text": json.dumps(payload, ensure_ascii=False, default=str)}
-            ]
-        }
+    kwargs = _validate(name, arguments)
+    if name == "search":
+        return await fetcher.search(kwargs["query"], limit=kwargs["limit"])
+    if name == "crawl":
+        return await fetcher.crawl(
+            kwargs["url"],
+            max_pages=kwargs["max_pages"],
+            max_depth=kwargs["max_depth"],
+            max_chars=kwargs["max_chars"],
+            same_domain=kwargs["same_domain"],
+        )
+    return await fetcher.fetch(kwargs["url"], max_chars=kwargs["max_chars"])
 
 
 __all__ = [
     "WEB_PROMPT_RULES",
     "WEB_SERVER",
     "WEB_TOOLS",
-    "WebClient",
     "WebConfig",
     "WebError",
     "WebFetcher",
-    "WebServerConfig",
+    "WebToolSpec",
     "assert_public",
     "blocked_reason",
+    "call_web_tool",
     "decode_body",
     "html_to_text",
     "parse_rss_results",
     "parse_url",
+    "qualified_name",
     "sniff_charset",
 ]

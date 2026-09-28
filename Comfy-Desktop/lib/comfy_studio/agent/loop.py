@@ -90,7 +90,7 @@ class AgentError(RuntimeError):
 class AgentEvent:
     """流式事件：面板可以据此边跑边显示。"""
 
-    type: str  # assistant | tool_call | tool_result | final
+    type: str  # final | assistant | tool_call | tool_result | retry（清单由 tests/test_agent_events.py 守着）
     data: dict[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> dict[str, Any]:

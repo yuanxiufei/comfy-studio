@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from ..engine import EngineClient
@@ -146,3 +147,19 @@ def record_events(sink: list[str]) -> Callable[[Any], Awaitable[None]]:
         sink.append(event.type)
 
     return listener
+
+
+_PACKAGE_DIR = Path(__file__).resolve().parents[1]  # .../custom_nodes/comfy_studio
+
+
+def host_module_dir() -> Path | None:
+    """宿主侧那份落点（``Comfy-Desktop/lib/comfy_studio``），找不到回 ``None``。
+
+    从本包目录往上找，**不写死盘符路径**：引擎被单独装进另一台机器的 ComfyUI 时，那份副本
+    根本不在磁盘上 —— 那时基于它的用例要明说"跳过、因为什么"，而不是假装通过。
+    """
+    for parent in _PACKAGE_DIR.parents:
+        candidate = parent / "Comfy-Desktop" / "lib" / "comfy_studio"
+        if (candidate / "webdom.py").is_file():
+            return candidate
+    return None

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -153,6 +154,31 @@ class McpStdioTest(unittest.TestCase):
         self.assertEqual(plain["inputSchema"]["type"], "object")
         self.assertIn("ckpt_name", plain["inputSchema"]["properties"])
 
+        # 联网那三把默认就挂（没设 COMFY_NO_WEB）：外部 client 拿到的工具表里必须看得见它们，
+        # 否则"引擎侧也能联网"这句话只存在于代码里。
+        self.assertEqual(
+            [n for n in names if n.startswith("web__")], ["web__search", "web__fetch", "web__crawl"]
+        )
+        for name in ("web__search", "web__fetch", "web__crawl"):
+            schema = next(t for t in tools if t["name"] == name)["inputSchema"]
+            self.assertEqual(schema["type"], "object")
+        self.assertEqual(
+            next(t for t in tools if t["name"] == "web__search")["inputSchema"]["required"], ["query"]
+        )
+
+    def test_02b_blocked_url_is_an_is_error_result_without_touching_the_network(self) -> None:
+        """真让它抓一个禁区地址：应当如实报错，而不是超时或抛异常上来。
+
+        这里**不需要联网**：``127.0.0.1`` 在本机 / 内网闸门那一关就被挡下，请求根本不出门。
+        """
+        response = self.call(
+            20, "tools/call", {"name": "web__fetch", "arguments": {"url": "http://127.0.0.1/admin"}}
+        )
+        self.assertNotIn("error", response, "抓取失败应当是 isError 结果，不是协议错误")
+        result = response.get("result", {})
+        self.assertIs(result.get("isError"), True)
+        self.assertIn("127.0.0.1", result["content"][0]["text"])
+
     def test_03_tools_call_returns_text_content(self) -> None:
         result = self.call(3, "tools/call", {"name": "comfy_list_skills", "arguments": {}}).get("result", {})
         self.assertNotIn("isError", result)
@@ -239,7 +265,103 @@ class McpStdioTest(unittest.TestCase):
             else:
                 self.assertIsInstance(message["id"], int, message)
         # 就绪横幅走的是 stderr：这条路断了的话 stdout 会被污染成非 JSON
-        self.assertIn("MCP stdio 就绪", self.stderr_text())
+        banner = self.stderr_text()
+        self.assertIn("MCP stdio 就绪", banner)
+        # 横幅里要明说走哪条搜索路（这里没设 COMFY_SEARXNG_URL，所以是必应那条不用部署的）。
+        # "能不能上网"在三把工具是否出现里已经验过了，这条验的是"日志里说不说得清"。
+        self.assertIn("联网: 开（必应 RSS）", banner)
+
+
+@unittest.skipUnless(
+    VENV_PYTHON.exists(),
+    f"需要引擎 venv 的解释器 {VENV_PYTHON}（先跑仓库根的 npm run setup）",
+)
+class McpStdioNoWebTest(unittest.TestCase):
+    """``COMFY_NO_WEB=1`` 时联网那三把应当**一把都不挂**，其余工具照旧。
+
+    单测里验的是 ``web_enabled()`` 这个函数；这里验的是"环境变量真能一路走到工具表" ——
+    中间隔着 ``serve_stdio`` 建不建句柄、``create_server`` 传不传下去，哪一环断了都只有
+    真起进程才看得出来。
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory(prefix="comfy-studio-noweb-")
+        # skill 目录必须是"存在且至少有一个 .json"：目录不存在、或者空目录，server 都会
+        # 直接起不来（这是它的明规矩，不是这条用例要验的东西），所以随手拷一份随包 skill 进去。
+        builtin = Path(cls._tmp.name, "builtin")
+        builtin.mkdir()
+        Path(cls._tmp.name, "user").mkdir()
+        shutil.copy(
+            PACKAGE_DIR / "skills" / "workflows" / "text-to-image.json", builtin / "demo.json"
+        )
+        cls.proc = subprocess.Popen(
+            [str(VENV_PYTHON), "-X", "utf8", "-m", "comfy_studio.mcp"],
+            cwd=str(CUSTOM_NODES_DIR),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            bufsize=1,
+            env={
+                **os.environ,
+                "COMFY_NO_WEB": "1",
+                "COMFY_SKILLS_DIR": str(Path(cls._tmp.name, "builtin")),
+                "COMFY_USER_SKILLS_DIR": str(Path(cls._tmp.name, "user")),
+            },
+        )
+        cls.lines: list[dict] = []
+        cls.stderr_lines: list[str] = []
+        cls.lock = threading.Lock()
+        threading.Thread(target=cls._pump_stdout, daemon=True).start()
+        threading.Thread(target=cls._pump_stderr, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if cls.proc.stdin is not None and not cls.proc.stdin.closed:
+            cls.proc.stdin.close()
+        try:
+            cls.proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            cls.proc.kill()
+        cls._tmp.cleanup()
+
+    @classmethod
+    def _pump_stdout(cls) -> None:
+        assert cls.proc.stdout is not None
+        for line in cls.proc.stdout:
+            text = line.strip()
+            if text:
+                with cls.lock:
+                    cls.lines.append(json.loads(text))
+
+    @classmethod
+    def _pump_stderr(cls) -> None:
+        assert cls.proc.stderr is not None
+        for line in cls.proc.stderr:
+            with cls.lock:
+                cls.stderr_lines.append(line.rstrip("\n"))
+
+    def test_web_tools_are_absent_but_the_rest_stay(self) -> None:
+        assert self.proc.stdin is not None
+        self.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}) + "\n")
+        self.proc.stdin.flush()
+        deadline = time.time() + TIMEOUT
+        names: list[str] = []
+        while time.time() < deadline and not names:
+            with self.lock:
+                for message in self.lines:
+                    if message.get("id") == 1:
+                        names = [t["name"] for t in message["result"]["tools"]]
+            time.sleep(0.05)
+        with self.lock:
+            stderr_tail = "\n".join(self.stderr_lines[-20:])
+        self.assertTrue(names, f"tools/list 超时；stderr 尾部:\n{stderr_tail}")
+        self.assertEqual([n for n in names if n.startswith("web__")], [], "COMFY_NO_WEB 没生效")
+        self.assertIn("comfy_list_models", names, "关掉联网不该连本地工具一起没了")
+        # 横幅也得照实说：工具表里没有了、日志里还写着"联网: 开"，等于留了一句骗人的话。
+        self.assertIn("联网: 关（COMFY_NO_WEB）", stderr_tail)
 
 
 if __name__ == "__main__":
