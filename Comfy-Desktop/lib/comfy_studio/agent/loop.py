@@ -15,6 +15,8 @@
 from __future__ import annotations
 
 import asyncio
+import sys
+import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Awaitable, Callable, Sequence
 
@@ -138,7 +140,13 @@ class AgentSession:
         #: 人设文本，或者一个**每次重算**它的零参函数（记忆那种每轮都在变的补充段要用它）。
         self.system_prompt = system_prompt
         self._schemas = tool_schemas(tools)
-        self.messages: list[ChatMessage] = [system_message(self._system_text()), *self._restore(history)]
+        #: 上一次算出来的人设文本。逐字一样时 :meth:`ask` 就不重建 ``messages[0]``。
+        initial_prompt = self._system_text()
+        self._system_cache: str | None = initial_prompt
+        self.messages: list[ChatMessage] = [
+            system_message(initial_prompt),
+            *self._restore(history),
+        ]
 
     @staticmethod
     def _restore(history: Sequence[ChatMessage] | None) -> list[ChatMessage]:
@@ -321,7 +329,13 @@ class AgentSession:
         可用**——历史是配对的，用户可以接着问下一句。
         """
         # 人设每轮重算一次：上一轮刚记下的偏好，这一轮就得看得见（记忆是这么进提示词的）。
-        self.messages[0] = system_message(self._system_text())
+        # 但**算出来逐字一样就不动 messages[0]**：本地服务（llama.cpp / Ollama 那类）的前缀
+        # 缓存要的是"前缀一个字节都没变"，而人设动辄 3–5 万字符（见 agent/catalog.py 的预置
+        # 正文），每步都换一遍就等于让它每步从头 prefill 一次。
+        fresh = self._system_text()
+        if fresh != self._system_cache:
+            self.messages[0] = system_message(fresh)
+            self._system_cache = fresh
         self.messages.append(user_message(text))
 
         async def report_retry(attempt: int, total: int, delay: float, reason: str) -> None:
@@ -336,9 +350,25 @@ class AgentSession:
         for _step in range(self.max_steps):
             if cancel is not None:
                 cancel.raise_if_cancelled("下一轮模型请求")
+            # 记一行单次模型调用的耗时。这是排查"到底卡在哪"唯一的一手数据：面板上只画得出
+            # "正在思考"，模型慢、网络慢、还是本地服务在换页，全靠这一行来分。
+            # 要再往下拆（token 数、重试里每次尝试各花多久），看 `agent/llm.py` 打的
+            # `[llm] 第 N 次尝试` 那几行：这里是"一次调用"的合计，那里是"每次尝试"的分账。
+            started = time.monotonic()
             reply = await self.llm.complete(
                 self.messages, self._schemas, cancel=cancel, on_retry=report_retry
             )
+            elapsed = time.monotonic() - started
+            # 只记 1 秒以上的：秒回的那些说明这一步根本没卡，全记下来只是刷屏。
+            # 这里**不碰 self.model** —— 那是 `llm.config.model`，属于客户端的内部形状，
+            # 拿它来写日志会把"日志"和"客户端实现"绑在一起（替身客户端就过不去）。
+            if elapsed >= 1.0:
+                print(
+                    f"[agent] 第 {_step + 1} 次模型调用用了 {elapsed:.1f}s"
+                    f"（消息 {len(self.messages)} 条）",
+                    file=sys.stderr,
+                    flush=True,
+                )
             self.messages.append(reply)
 
             if not reply.tool_calls:

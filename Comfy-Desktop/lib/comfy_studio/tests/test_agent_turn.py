@@ -8,7 +8,9 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
+import os
 import unittest
 from functools import partial
 from typing import Any
@@ -24,9 +26,12 @@ from comfy_studio.agent import (
     LLMError,
     OpenAIChatClient,
     ToolCall,
+    usage_counts,
 )
+from comfy_studio.agent.llm import _is_local_refusal
 from comfy_studio.cancel import CancelToken, Cancelled, race
 from comfy_studio.mcp import McpHub, McpServerConfig, McpStdioClient, McpTool
+from comfy_studio.rpc import RpcError
 from comfy_studio.server import DEFAULT_SESSION, StudioHost
 from comfy_studio.skills import SkillCatalog
 
@@ -47,6 +52,26 @@ def _wants(*names: str) -> ChatMessage:
 def _text(value: str) -> dict[str, Any]:
     """MCP 的 ``tools/call`` 结果形状。"""
     return {"content": [{"type": "text", "text": value}]}
+
+
+class _RefusedConnection(OSError):
+    """"连接被拒绝"的替身，用来摆判据边界（真实形状由走真网络的用例守）。"""
+
+    os_error: BaseException
+
+    def __init__(self) -> None:
+        super().__init__("由于目标计算机积极拒绝，无法连接。")
+        self.os_error = ConnectionRefusedError(10061, "由于目标计算机积极拒绝，无法连接。")
+
+
+def _refused() -> OSError:
+    """造一个"本机端口没人监听"的连接错误。
+
+    真实那个是 aiohttp 的 ``ClientConnectorError``（继承 ``OSError`` 并带 ``os_error``）。
+    这里只保证 ``_is_local_refusal`` **真正读的那一个属性**：它按 ``os_error`` 的
+    **类型**判断，不碰 ``errno`` —— 实测 errno 是 22，拿去比 ECONNREFUSED 永远不成立。
+    """
+    return _RefusedConnection()
 
 
 class FakeHub:
@@ -92,6 +117,39 @@ class ScriptedLLM:
         cancel: CancelToken | None = None,
         on_retry: Any = None,
     ) -> ChatMessage:
+        if not self.replies:
+            raise LLMError(f"假模型没有更多回复了（历史 {len(messages)} 条）")
+        return self.replies.pop(0)
+
+
+class RetryingLLM:
+    """头一次调用先像真客户端那样回调一次 ``on_retry``，之后才吐回复。
+
+    :class:`ScriptedLLM` 不碰 ``on_retry``，所以"重试被报成事件"这条链在会话层没人验 ——
+    而它正是面板上"正在重试"那行字的唯一来源（见 :mod:`comfy_studio.agent.loop` 的
+    ``report_retry``）。返回 awaitable 的回调按真客户端的约定被 await。
+    """
+
+    def __init__(self, *replies: ChatMessage) -> None:
+        self.replies = list(replies)
+        self.calls = 0
+
+    async def close(self) -> None:
+        return None
+
+    async def complete(
+        self,
+        messages: list[ChatMessage],
+        tools: list[dict[str, Any]] | None = None,
+        *,
+        cancel: CancelToken | None = None,
+        on_retry: Any = None,
+    ) -> ChatMessage:
+        self.calls += 1
+        if self.calls == 1 and on_retry is not None:
+            reported = on_retry(1, 5, 2.0, "模型服务返回 503: local server is down")
+            if reported is not None:
+                await reported
         if not self.replies:
             raise LLMError(f"假模型没有更多回复了（历史 {len(messages)} 条）")
         return self.replies.pop(0)
@@ -190,9 +248,118 @@ class TurnTests(unittest.IsolatedAsyncioTestCase):
         tools = [m for m in session.messages if m.role == "tool"]
         self.assertEqual([str(m.content) for m in tools], ["慢的那条", "快的那条", "快的那条"])
 
+    async def test_unchanged_persona_is_not_rebuilt(self):
+        """人设每轮重算，但**算出来一样就不换 messages[0]**。
+
+        本地服务（llama.cpp / Ollama 那类）的前缀缓存认的是"前缀一个字节都没变"；每轮都塞
+        一个新对象进去，等于让对面每轮从头 prefill 一遍 —— 而预置人设是 3–5 万字符的量级
+        （见 agent/catalog.py 的 presets），这一下是看得见的慢。这里比的是**对象本身**。
+        """
+        session = AgentSession(
+            FakeHub(),
+            [_tool("a")],
+            llm=ScriptedLLM(
+                ChatMessage(role="assistant", content="在"),
+                ChatMessage(role="assistant", content="在"),
+            ),
+            system_prompt="你是个助手",
+        )
+        first = session.messages[0]
+
+        await session.ask("第一句")
+        self.assertIs(session.messages[0], first)
+        await session.ask("第二句")
+        self.assertIs(session.messages[0], first)
+
+    async def test_changed_persona_is_rebuilt(self):
+        """人设变了（记忆那种每轮现算的补充段）就必须换掉：不然刚记住的事下一轮看不见。"""
+        text = "你是个助手"
+        session = AgentSession(
+            FakeHub(),
+            [_tool("a")],
+            llm=ScriptedLLM(
+                ChatMessage(role="assistant", content="在"),
+                ChatMessage(role="assistant", content="在"),
+            ),
+            system_prompt=lambda: text,
+        )
+        first = session.messages[0]
+
+        text = "你是个助手，而且喜欢短句"
+        await session.ask("第一句")
+
+        self.assertIsNot(session.messages[0], first)
+        self.assertIn("喜欢短句", session.messages[0].content)
+
+    async def test_a_model_retry_is_reported_as_an_event(self):
+        """模型调用失败要重试时，面板得收得到 ``retry`` 事件。
+
+        一次模型调用最长能等到 5 次退避全走完，中间**一个字节都不往面板送**：没有这条
+        事件，"正在重试"和"真卡死"在界面上长得一模一样，用户只能对着不动的"正在思考"
+        干等（前端据此画的那行字见 comfyStudioChatContentScript.ts 的 onEvent）。
+        """
+        session = AgentSession(
+            FakeHub(),
+            [_tool("a")],  # 会话要求至少一个工具；这一轮模型不调它
+            llm=RetryingLLM(ChatMessage(role="assistant", content="总算答上了")),
+        )
+        events: list[dict[str, Any]] = []
+
+        async def on_event(event: Any) -> None:
+            events.append(event.to_json())
+
+        answer = await session.ask("在吗", on_event)
+
+        self.assertEqual(answer, "总算答上了")
+        retries = [e for e in events if e["type"] == "retry"]
+        self.assertEqual(len(retries), 1, events)
+        # 面板就靠这几个字段说"第 N/总共 次、N 秒后重试"，少一个那行字就说不清。
+        self.assertEqual(retries[0]["attempt"], 1)
+        self.assertEqual(retries[0]["total"], 5)
+        self.assertEqual(retries[0]["delay"], 2.0)
+        self.assertIn("503", retries[0]["reason"])
+
 
 def _ok(text: str = "好的") -> str:
     return json.dumps({"choices": [{"message": {"role": "assistant", "content": text}}]})
+
+
+def _ok_with_usage(prompt_tokens: int, completion_tokens: int, text: str = "好的") -> str:
+    """带 usage 的正常回答：日志里那个 token 维度就是从这儿进去的。"""
+    return json.dumps(
+        {
+            "choices": [{"message": {"role": "assistant", "content": text}}],
+            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens},
+        }
+    )
+
+
+class UsageCountsTests(unittest.TestCase):
+    """``usage_counts`` 是白盒：它决定日志里那个 token 数能不能信。
+
+    服务端给不出 usage 时要如实说"没给"，**不许猜**——日志里的数字是会被拿去当结论的，
+    编一个出来比不记还坏。
+    """
+
+    def test_reads_openai_shape(self) -> None:
+        self.assertEqual(usage_counts({"prompt_tokens": 12, "completion_tokens": 3}), (12, 3))
+
+    def test_ignores_fields_we_do_not_use(self) -> None:
+        usage = {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15}
+        self.assertEqual(usage_counts(usage), (12, 3))
+
+    def test_rejects_shapes_it_does_not_recognise(self) -> None:
+        """认不出来一律 ``None``：整条链路上只有这里在做判断，含糊过去就没人把关了。"""
+        for usage in (
+            None,
+            {},
+            "12",
+            {"prompt_tokens": 12},
+            {"prompt_tokens": "12", "completion_tokens": 3},
+            {"prompt_tokens": 12, "completion_tokens": None},
+        ):
+            with self.subTest(usage=usage):
+                self.assertIsNone(usage_counts(usage))
 
 
 class RetryTests(unittest.IsolatedAsyncioTestCase):
@@ -201,6 +368,8 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.requests = 0
         self.script: list[tuple[int, str, dict[str, str]]] = []
+        #: 每个请求的正文。有些参数（比如 max_tokens）只体现在线上，不看正文验不了。
+        self.payloads: list[dict[str, Any]] = []
         app = web.Application()
         app.router.add_post("/v1/chat/completions", self._completions)
         self.server = TestServer(app)
@@ -218,6 +387,7 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
 
     async def _completions(self, _request: web.Request) -> web.Response:
         self.requests += 1
+        self.payloads.append(await _request.json())
         status, body, headers = self.script.pop(0) if self.script else (200, _ok(), {})
         if status == 0:  # 挂着不回：用来验取消能把在飞的请求真的断掉
             await asyncio.sleep(2)
@@ -264,11 +434,103 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.requests, 1)
         self.assertFalse(caught.exception.retryable)
 
+    async def test_a_dead_local_port_fails_at_once_instead_of_retrying(self) -> None:
+        """本机端口没人监听：一次就报错，不要把 5 次重试加退避等满。
+
+        数值来自 2026-09-28 的实测：本机拒绝连接**一次固定 2.0 秒**（Winsock 的行为，
+        不是我们的超时），5 次尝试 10s 再加 7.9s 退避，一轮白等 18.4s，而换回来的还是
+        同一句"连不上"。这条链是"配错地址 / 服务没起"时用户最先撞到的，必须立刻给答案。
+
+        顺带把**真实 aiohttp 错误的形状**钉住：`_is_local_refusal` 若读不到它想读的东西，
+        这里就会退化成 5 次重试，`reported` 也就不止一次 —— 判据"看着对、实际永不成立"
+        这类错，靠这一条兜住。
+        """
+        dead = TestServer(web.Application())
+        await dead.start_server()
+        port = dead.port  # 必须在 close 之前读：关掉之后这个属性就没了
+        await dead.close()
+        client = OpenAIChatClient(
+            LLMConfig(base_url=f"http://127.0.0.1:{port}/v1", model="fake", timeout=3.0)
+        )
+        seen: list[tuple[Any, ...]] = []
+
+        async def on_retry(*args: Any) -> None:
+            seen.append(args)
+
+        try:
+            with mock.patch("comfy_studio.agent.llm._report_attempt") as reported:
+                with self.assertRaises(LLMError) as caught:
+                    await client.complete([ChatMessage(role="user", content="在吗")], on_retry=on_retry)
+        finally:
+            await client.close()
+
+        self.assertEqual(seen, [], "不该有重试事件")
+        reported.assert_called_once()  # 一次尝试 = 一次记账
+        self.assertFalse(caught.exception.retryable)
+        self.assertIn("没有服务在监听", str(caught.exception))
+
     async def test_empty_answer_is_retried(self) -> None:
         self._queue(200, json.dumps({"choices": [{"message": {"role": "assistant", "content": ""}}]}))
         reply = await self._ask()
         self.assertEqual(self.requests, 2)
         self.assertEqual(reply.content, "好的")
+
+    async def test_max_tokens_is_only_sent_when_configured(self) -> None:
+        """配了上限就带上去；没配就**一个字段都不加**，让服务端自己的默认值说了算。
+
+        这个上限挡的是"本地模型收不住、一段话生成十几分钟"：请求是非流式的，整段生成完
+        才有第一个字节，输出没有上限时这一等就没有头。
+        """
+        with_limit = OpenAIChatClient(
+            LLMConfig(
+                base_url=f"{self.server.make_url('/v1')}".rstrip("/"),
+                model="fake",
+                timeout=3.0,
+                max_tokens=256,
+            )
+        )
+        try:
+            await with_limit.complete([ChatMessage(role="user", content="在吗")])
+        finally:
+            await with_limit.close()
+        await self._ask()
+
+        self.assertEqual(self.payloads[0]["max_tokens"], 256)
+        self.assertNotIn("max_tokens", self.payloads[1])
+
+    async def test_usage_is_passed_through_untouched(self) -> None:
+        """``_complete_once`` 只把 usage 原样交出去：认不认得出是调用方的事。
+
+        钉的是"别在路上顺手改造它"——一旦解析挪进来，日志里那个 token 数就成了我们加工过
+        的二手数据，排查时反而不敢信。
+        """
+        self._queue(200, _ok_with_usage(12, 3))
+
+        message, usage = await self.client._complete_once(
+            [ChatMessage(role="user", content="在吗")], None
+        )
+
+        self.assertEqual(message.content, "好的")
+        self.assertEqual(usage, {"prompt_tokens": 12, "completion_tokens": 3})
+
+    async def test_success_log_carries_token_counts(self) -> None:
+        """成功日志要写上 token 数。
+
+        ``agent/loop.py`` 那行只说"用了多久"，分不出是 prefill 长（人设大）还是生成长。
+        把耗时门槛压到 0 逼它每次都记，验的就是这一行真的带上了 prompt / 生成两个数。
+        """
+        self._queue(200, _ok_with_usage(12, 3))
+        captured = io.StringIO()
+
+        with mock.patch("comfy_studio.agent.llm.ATTEMPT_LOG_THRESHOLD", 0.0), mock.patch(
+            "sys.stderr", captured
+        ):
+            await self._ask()
+
+        printed = captured.getvalue()
+        self.assertIn("[llm] 第 1 次尝试成功", printed)
+        self.assertIn("prompt 12 tok", printed)
+        self.assertIn("生成 3 tok", printed)
 
     async def test_cancel_aborts_in_flight_request(self) -> None:
         """取消要**真的断开**在飞的 HTTP 请求，而不是只把结果丢掉。"""
@@ -281,6 +543,35 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
         cancel.cancel()
         with self.assertRaises(Cancelled):
             await asyncio.wait_for(turn, timeout=2)
+
+
+class LocalRefusalTests(unittest.TestCase):
+    """``_is_local_refusal`` 是白盒：它决定"这一轮是 2 秒报错还是 18 秒报错"，两边都不能判错。
+
+    判宽了，别人的服务重启时会被当成"起不来了"直接放弃；判窄了，本机没起服务还是白等
+    18 秒 —— 而且它读不到属性时不会报错，只是悄悄退化成重试，所以边界要逐条钉住。
+    """
+
+    def test_recognises_a_dead_loopback_port(self) -> None:
+        for url in (
+            "http://127.0.0.1:1/v1/chat/completions",
+            "http://localhost:11434/v1/chat/completions",
+            "http://[::1]:11434/v1/chat/completions",
+        ):
+            with self.subTest(url=url):
+                self.assertTrue(_is_local_refusal(url, _refused()))
+
+    def test_a_refusal_elsewhere_is_still_retryable(self) -> None:
+        """别的机器拒绝连接，可能只是它正在重启 —— 这一类必须保留重试。"""
+        for url in ("http://10.0.0.5:8000/v1", "http://api.example.com/v1"):
+            with self.subTest(url=url):
+                self.assertFalse(_is_local_refusal(url, _refused()))
+
+    def test_other_failures_on_loopback_are_still_retryable(self) -> None:
+        """回环上但**不是**"被拒绝"的失败（超时、DNS、TLS）不能跟着一起放弃。"""
+        for err in (OSError("别的错"), TimeoutError("超时了"), ConnectionResetError("被重置")):
+            with self.subTest(err=type(err).__name__):
+                self.assertFalse(_is_local_refusal("http://127.0.0.1:1/v1", err))
 
 
 class AbandonTests(unittest.IsolatedAsyncioTestCase):
@@ -333,9 +624,9 @@ class ServerCancelTests(unittest.IsolatedAsyncioTestCase):
     关掉）时不会等在飞的一轮上——那一轮最长能等到工具的 1800 秒超时上。
     """
 
-    def _host(self, session: AgentSession) -> StudioHost:
+    def _host(self, session: AgentSession, **kwargs: Any) -> StudioHost:
         hub = McpHub([])  # 这里不连引擎：会话是直接塞进去的
-        host = StudioHost(hub, SkillCatalog(hub))
+        host = StudioHost(hub, SkillCatalog(hub), **kwargs)
         host._sessions[DEFAULT_SESSION] = session
         return host
 
@@ -405,6 +696,79 @@ class ServerCancelTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("宿主退出", result["reason"])
         self.assertEqual(host._sessions, {})
         self.assertEqual(host._turns, {})
+
+    async def test_a_turn_that_never_converges_is_stopped_and_explained(self) -> None:
+        """一轮跑过头：宿主自己按上限叫停它，并**说清楚**。
+
+        没有这道闸，这一轮就一直挂在那儿 —— 面板那边看上去和"卡死"一模一样，用户只能等到
+        主进程那个三十分钟的兜底（而那个兜底只是把本地记录删掉，不会通知这边）。
+        """
+        started = asyncio.Event()
+        session = self._slow_session(started)
+        host = self._host(session, turn_timeout=0.05)
+        ctx = _Ctx()
+
+        turn = asyncio.create_task(host.agent_chat({"text": "跑个慢活"}, ctx))
+        await asyncio.wait_for(started.wait(), timeout=5)
+
+        with self.assertRaises(RpcError) as caught:
+            await asyncio.wait_for(turn, timeout=5)
+
+        self.assertIn("没有收敛", str(caught.exception))
+        self.assertEqual(host._turns, {}, "被叫停的轮次不能留在在飞表里")
+        # 走的是取消令牌那条路，所以历史仍然配对，同一会话可以直接接着问
+        self.assertEqual([m.role for m in session.messages], ["system", "user", "assistant", "tool"])
+        self.assertTrue(str(session.messages[-1].content).startswith("ERROR: "), session.messages[-1].content)
+
+        session.llm = ScriptedLLM(ChatMessage(role="assistant", content="接着说"))
+        again = await asyncio.wait_for(host.agent_chat({"text": "接着说"}, ctx), timeout=5)
+        self.assertEqual(again, {"session_id": DEFAULT_SESSION, "text": "接着说", "cancelled": False})
+
+    async def test_watchdog_can_be_switched_off(self) -> None:
+        """``--turn-timeout 0`` 的语义：不设闸，让这一轮自己跑到尽头（要停就靠用户点停止）。"""
+        started = asyncio.Event()
+        session = self._slow_session(started)
+        host = self._host(session, turn_timeout=None)
+        ctx = _Ctx()
+
+        turn = asyncio.create_task(host.agent_chat({"text": "跑个慢活"}, ctx))
+        await asyncio.wait_for(started.wait(), timeout=5)
+        await asyncio.sleep(0.1)
+        self.assertFalse(turn.done(), "没设看门狗时不该有谁去叫停它")
+
+        host.agent_cancel({}, ctx)
+        result = await asyncio.wait_for(turn, timeout=5)
+        self.assertTrue(result["cancelled"])
+
+
+class ConfigEnvTests(unittest.TestCase):
+    """``LLMConfig.from_env``：配置写错了要**当场报错**，不悄悄忽略。
+
+    静默忽略最难查 —— 用户以为"这个开关没用"，实际是值写错了从来就没生效过。
+    """
+
+    @staticmethod
+    def _env(**extra: str) -> dict[str, str]:
+        return {"COMFY_STUDIO_LLM_MODEL": "fake", **extra}
+
+    def test_max_tokens_is_optional(self) -> None:
+        with mock.patch.dict(os.environ, self._env(), clear=True):
+            self.assertIsNone(LLMConfig.from_env().max_tokens)
+
+    def test_max_tokens_comes_from_env(self) -> None:
+        with mock.patch.dict(os.environ, self._env(COMFY_STUDIO_LLM_MAX_TOKENS="512"), clear=True):
+            self.assertEqual(LLMConfig.from_env().max_tokens, 512)
+
+    def test_a_non_number_max_tokens_is_an_error(self) -> None:
+        with mock.patch.dict(os.environ, self._env(COMFY_STUDIO_LLM_MAX_TOKENS="很多"), clear=True):
+            with self.assertRaises(LLMError) as caught:
+                LLMConfig.from_env()
+        self.assertIn("COMFY_STUDIO_LLM_MAX_TOKENS", str(caught.exception))
+
+    def test_a_non_positive_max_tokens_is_an_error(self) -> None:
+        with mock.patch.dict(os.environ, self._env(COMFY_STUDIO_LLM_MAX_TOKENS="0"), clear=True):
+            with self.assertRaises(LLMError):
+                LLMConfig.from_env()
 
 
 if __name__ == "__main__":  # pragma: no cover

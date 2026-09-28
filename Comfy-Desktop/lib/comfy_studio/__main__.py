@@ -19,7 +19,12 @@ import os
 import sys
 
 from .mcp import SERVERS_ENV, McpError, collect_servers
-from .server import DEFAULT_REQUEST_TIMEOUT, SERVER_NAME, serve_stdio
+from .server import (
+    DEFAULT_REQUEST_TIMEOUT,
+    DEFAULT_TURN_TIMEOUT,
+    SERVER_NAME,
+    serve_stdio,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -51,6 +56,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_REQUEST_TIMEOUT,
         help=f"单次 MCP 调用超时秒数（默认 {DEFAULT_REQUEST_TIMEOUT:g}；跑 skill 会长时间占用）",
+    )
+    parser.add_argument(
+        "--turn-timeout",
+        type=float,
+        default=DEFAULT_TURN_TIMEOUT,
+        help=(
+            f"一轮对话的上限秒数（默认 {DEFAULT_TURN_TIMEOUT:g}）：超过就用取消令牌干净地叫停这一轮"
+            "并如实报错，别让面板一直转圈。设 0 或负数 = 不设看门狗，让这一轮自己跑到尽头"
+        ),
     )
     parser.add_argument(
         "--canvas",
@@ -127,6 +141,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--no-web",
+        action="store_true",
+        help=(
+            "关掉联网（web__search / web__fetch 两张工具与系统提示词里的联网段）。"
+            "默认是开的：本地模型的知识停在训练那天，查不到的事实让它去查，别硬答。"
+            "它会往外面发请求（只抓公网地址，本机 / 内网 / 云元数据一律挡掉），"
+            "不想让它出门就加这个开关"
+        ),
+    )
+    parser.add_argument(
         "--no-history",
         action="store_true",
         help=(
@@ -189,7 +213,9 @@ def main(argv: list[str] | None = None) -> int:
                 memory=not args.no_memory,
                 memory_dir=args.memory_dir or os.environ.get("COMFY_STUDIO_MEMORY_DIR"),
                 agents_dir=args.agents_dir or os.environ.get("COMFY_STUDIO_AGENTS_DIR"),
+                web=not args.no_web,
                 history=not args.no_history,
+                turn_timeout=None if args.turn_timeout <= 0 else args.turn_timeout,
             )
         )
     except KeyboardInterrupt:  # 桌面壳正常退出时是关掉 stdin，这条只为手动 Ctrl+C

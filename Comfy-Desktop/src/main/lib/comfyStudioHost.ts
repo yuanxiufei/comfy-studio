@@ -20,6 +20,31 @@ import type { InstallationRecord } from '../installations'
  *  skill run occupies a single `skills/run` call for its whole duration. */
 export const STUDIO_REQUEST_TIMEOUT_MS = 30 * 60 * 1000
 
+/** Parent-side timeout for methods whose duration is bounded by real work: a
+ *  conversation turn (`agent/chat`), a skill run, importing a novel.
+ *
+ *  Must stay ABOVE the host's own per-turn watchdog (`DEFAULT_TURN_TIMEOUT` in
+ *  `lib/comfy_studio/server.py`, also 1800s). Whichever of the two fires first is
+ *  the one that gets to tell the truth: letting the CHILD win means the turn is
+ *  genuinely stopped and the error explains what stalled. Letting THIS one win
+ *  means a panel that unlocked while the turn kept running — this timeout only
+ *  drops the local pending entry and never notifies the child. */
+export const STUDIO_SLOW_TIMEOUT_MS = 32 * 60 * 1000
+
+/** Query-shaped methods (`agent/agents`, `agent/models`, `agent/history`, ...) answer
+ *  in milliseconds when the host is healthy. Hanging on one is a symptom, not patience:
+ *  opening a single drawer fires several of these at once, and each holds a control
+ *  disabled for as long as it is pending — so fail fast and hand the controls back. */
+export const STUDIO_QUERY_TIMEOUT_MS = 30 * 1000
+
+/** The slow set, by method name. Everything else is treated as query-shaped. */
+const SLOW_METHODS = new Set(['agent/chat', 'skills/run', 'novels/import'])
+
+/** Pick the parent-side timeout for a method (see the two constants above). */
+export function studioTimeoutForMethod(method: string): number {
+  return SLOW_METHODS.has(method) ? STUDIO_SLOW_TIMEOUT_MS : STUDIO_QUERY_TIMEOUT_MS
+}
+
 /** Grace period between closing the host's stdin (EOF ⇒ clean exit) and killing it. */
 export const STUDIO_STOP_GRACE_MS = 2000
 
@@ -156,6 +181,11 @@ export function resolveStudioCommand(installation: InstallationRecord): ComfyStu
     // (it is a JSON file under the user's data dir), so the host turns it on
     // by itself. `--memory-dir` / `--no-memory` exist for builds that need to
     // move or drop it.
+    //
+    // Web access (`web__search` / `web__fetch`) is absent for the same reason:
+    // no relay, no local dir to point at, so `--no-web` is the only switch and
+    // this shell does not pass it. That is not an oversight — if a build ever
+    // needs it off, add the flag next to the ones above.
   ]
   // Keep localfiles aligned with the engine's storage args (see
   // `resolveEngineStorageDirs`); omitted exactly when the launch omits them, so
@@ -239,7 +269,7 @@ export class ComfyStudioHost extends EventEmitter {
       return Promise.reject(new ComfyStudioError('comfy-studio 宿主没在运行：先 start()'))
     }
     const id = this.nextId++
-    const timeoutMs = this.options.requestTimeoutMs ?? STUDIO_REQUEST_TIMEOUT_MS
+    const timeoutMs = this.options.requestTimeoutMs ?? studioTimeoutForMethod(method)
     const promise = new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id)

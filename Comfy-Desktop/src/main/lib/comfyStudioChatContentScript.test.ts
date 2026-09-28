@@ -328,6 +328,72 @@ describe('getComfyStudioChatContentScript', () => {
     expect(rows('assistant')[1]?.getAttribute('data-variant')).toBe('final')
   })
 
+  it('counts the wait, and says when the host is retrying the model call', async () => {
+    installBridge({
+      request: (method: string) =>
+        method === 'agent/chat' ? new Promise(() => {}) : { ok: true, result: { text: '答案在此' } }
+    })
+    setupDom()
+    new Function(script)()
+    await openPanel()
+
+    await send('问一句')
+    expect(said('pending')[0]).toContain('已等待 0s')
+
+    // 宿主在一次模型调用失败后会报 retry（见 lib/comfy_studio/agent/loop.py 的 report_retry）。
+    // 那是"还活着、只是还没成"的唯一信号，原先面板不认这个类型 —— 于是它和卡死长得一模一样。
+    emit({
+      params: { session_id: 'default', type: 'retry', attempt: 2, total: 5, delay: 4, reason: '500' }
+    })
+    await flush()
+
+    expect(said('pending')[0]).toContain('模型没回应，4s 后重试')
+    expect(said('pending')[0]).toContain('第 2/5 次')
+    expect(document.getElementById(STATUS_ID)?.textContent).toContain('重试')
+
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(said('pending')[0], 'the wait keeps ticking while the model retries').toContain(
+      '已等待 3s'
+    )
+  })
+
+  it('offers a way out when a turn has been silent for too long', async () => {
+    installBridge({
+      request: (method: string) =>
+        method === 'agent/chat' ? new Promise(() => {}) : { ok: true, result: { text: '答案在此' } }
+    })
+    setupDom()
+    new Function(script)()
+    await openPanel()
+
+    await send('问一句')
+    const sendButton = document.getElementById(SEND_ID) as HTMLButtonElement
+    expect(sendButton.disabled, 'a turn in flight holds the composer').toBe(true)
+
+    // 这颗按钮是**提示**不是判负：宿主那一轮还攥着这个会话，自动解锁只会让下一句撞上
+    // "会话已有一轮在跑"（见 lib/comfy_studio/server.py 的 agent_chat）。所以要不要放开，
+    // 由用户自己按 —— 但门得摆在那儿，不能让面板永远等下去。
+    const escapeButton = (): HTMLButtonElement | null =>
+      document.querySelector(`#${LOG_ID} .cs-force-reset`)
+
+    await vi.advanceTimersByTimeAsync(299_000)
+    expect(escapeButton(), 'not yet: five minutes of silence is the threshold').toBeNull()
+
+    await vi.advanceTimersByTimeAsync(2000)
+    const escape = escapeButton()
+    expect(escape, 'silence long enough earns a way out').not.toBeNull()
+
+    escape?.click()
+    await flush()
+    await flush()
+
+    expect(sendButton.disabled, 'the way out really hands the composer back').toBe(false)
+    expect(rows('pending')).toHaveLength(0)
+    expect(said('error').join(''), 'it must say the host may still be running').toContain(
+      '宿主那一轮可能还在跑'
+    )
+  })
+
   describe('coming back to an older conversation', () => {
     /** 只有 `agent/history` 走自己的桩：开抽屉时面板还会问模型目录，那些保持默认。 */
     const archive = (result: unknown): RequestStub => (method) =>

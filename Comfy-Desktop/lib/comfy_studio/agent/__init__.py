@@ -16,7 +16,7 @@ from .catalog import (
     AgentProfile,
     SUMMARY_CHARS,
 )
-from .llm import LLMConfig, LLMError, OpenAIChatClient
+from .llm import ATTEMPT_LOG_THRESHOLD, LLMConfig, LLMError, OpenAIChatClient, usage_counts
 from .loop import (
     BASE_SYSTEM_PROMPT,
     CLOSING_SYSTEM_PROMPT,
@@ -35,6 +35,7 @@ from .types import ChatMessage, Role, ToolCall, system_message, tool_message, us
 
 __all__ = [
     "AGENTS_SUBDIR",
+    "ATTEMPT_LOG_THRESHOLD",
     "AgentCatalog",
     "AgentCatalogError",
     "AgentError",
@@ -67,5 +68,6 @@ __all__ = [
     "system_message",
     "tool_message",
     "tool_schemas",
+    "usage_counts",
     "user_message",
 ]

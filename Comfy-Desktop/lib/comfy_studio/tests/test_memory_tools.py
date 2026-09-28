@@ -417,6 +417,40 @@ class PromptRefreshTests(unittest.IsolatedAsyncioTestCase):
             # 人设是**替换**而不是再插一条：system 消息永远只有开头那一条。
             self.assertEqual([m.role for m in llm.seen[1]].count("system"), 1)
 
+    async def test_an_unchanged_prompt_does_not_touch_the_system_message(self) -> None:
+        """人设逐字没变时**不动** ``messages[0]`` —— 这条守的是最贵的一次回归。
+
+        实测（2026-09-28，27B + 分镜导演助手）：一轮的 prompt 是 15888 tok，其中绝大部分
+        是那份预置人设；而本地服务的前缀缓存认的是"前缀一个字节都没变"。``ask`` 里若改成
+        每步无条件重建 ``messages[0]``，缓存整段失效、每步都要从头 prefill，一次多花十几秒 ——
+        而**功能上完全正常**，没有测试盯着就不会有人发现。
+
+        断的是**对象**（``is``）而不是文本：文本相等只说明内容对，对象相同才说明真的省掉了
+        那次重建。源函数每次都新拼一个字符串（值相等、对象不同），所以这一条能过，就意味着
+        `ask` 走的是"逐字比较"而不是"每次都换"。
+        """
+        with tempfile.TemporaryDirectory(prefix="comfy-studio-memory-") as tmp:
+            store = MemoryStore(Path(tmp))
+            hub = McpHub([], extra_clients=[MemoryClient(store)])
+            await hub.start()
+            llm = _FakeLLM()
+            session = AgentSession(
+                hub,
+                hub.tools,
+                llm=llm,
+                system_prompt=lambda: compose_system_prompt(store.digest()),
+            )
+
+            # 前提：同一个源连拼两次，值相等但不是同一个对象 —— 不然下面的 `is` 断言
+            # 就算实现退化成"处处重建"也可能侥幸通过。
+            self.assertIsNot(compose_system_prompt(store.digest()), compose_system_prompt(store.digest()))
+
+            await session.ask("第一个问题")
+            await session.ask("第二个问题")
+
+        self.assertIs(llm.seen[1][0], llm.seen[0][0], "人设没变，却把 system 消息重建了一遍")
+        self.assertEqual(llm.seen[1][0].content, llm.seen[0][0].content)
+
     async def test_a_prompt_source_that_comes_out_empty_is_an_error(self) -> None:
         with tempfile.TemporaryDirectory(prefix="comfy-studio-memory-") as tmp:
             hub = McpHub([], extra_clients=[MemoryClient(MemoryStore(Path(tmp)))])

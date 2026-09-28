@@ -240,6 +240,10 @@ var CHAT_CSS =
   'border-left:2px solid ' + BORDER + ';padding-left:8px;}' +
   '#' + DRAWER_ID + ' .cs-pending{align-self:flex-start;display:flex;align-items:center;gap:6px;color:' + MUTED + ';font-size:12px;}' +
   '#' + DRAWER_ID + ' .cs-pending .cs-dot{animation:cs-pulse 1.2s ease-in-out infinite;}' +
+  // "强制复位"那颗小按钮：等太久之后才摆出来（见 offerForceReset）。
+  '#' + DRAWER_ID + ' .cs-pending .cs-force-reset{border:1px solid ' + BORDER + ';border-radius:4px;' +
+  'background:transparent;color:' + MUTED + ';cursor:pointer;font:inherit;font-size:11px;padding:1px 6px;}' +
+  '#' + DRAWER_ID + ' .cs-pending .cs-force-reset:hover{background:' + INPUT_BG + ';color:' + FG + ';}' +
   // flex:0 0 auto 跟目录行那条是同一个道理：对话流是 flex 列（见 buildDrawer 里的 log 内联样式），
   // 而这张卡上有 overflow:hidden（圆角要裁掉子元素边角），它的 automatic minimum size 因此被算成 0
   // —— 一轮里工具卡一多，几张卡就会被一起压扁，字被裁掉。卡片不参与收缩，高度由内容自己定。
@@ -1435,13 +1439,87 @@ function addPending() {
   log.appendChild(row);
   scrollLog(log);
   STATE.pending = row;
+  STATE.pendingLabel = label;
   return row;
 }
 
 function removePending() {
   var row = STATE.pending;
   STATE.pending = null;
+  STATE.pendingLabel = null;
+  STATE.forceReset = null;
   if (row && row.parentNode) row.parentNode.removeChild(row);
+}
+
+// ---- 一轮在飞时的读数 --------------------------------------------------
+
+// 宿主那边一次模型调用可以等到 180s × 最多 5 次重试（见 lib/comfy_studio/agent/llm.py），
+// 这期间**一个字节都不会往面板送** —— 除了它主动报的那句重试通知。而那句通知原先根本没被
+// 画出来（见 onEvent）：于是"在重试"和"真卡死"在界面上长得一模一样，都是那个不动的
+// "正在思考…"。这里自己走表，把"等了多久"和"正在重试"摆到脸上。
+var TURN_TICK_MS = 1000;
+
+// 等过这么多秒还没有任何回应，就把"我自己放下"的按钮摆出来。它是**提示**不是判负：
+// 宿主那一轮还攥着这个会话，自动解锁只会让下一句撞上"会话已有一轮在跑"
+// （见 lib/comfy_studio/server.py 的 agent_chat）。所以要不要放开，由用户自己按。
+var TURN_SOFT_TIMEOUT_S = 300;
+
+function stopTurnClock() {
+  if (STATE.turnTimer) {
+    window.clearInterval(STATE.turnTimer);
+    STATE.turnTimer = null;
+  }
+  STATE.turnStartedAt = 0;
+  STATE.turnNote = '';
+  STATE.softWarned = false;
+}
+
+function startTurnClock() {
+  stopTurnClock();
+  STATE.turnStartedAt = Date.now();
+  STATE.turnTimer = window.setInterval(paintTurnClock, TURN_TICK_MS);
+  paintTurnClock();
+}
+
+function turnWaitedSeconds() {
+  if (!STATE.turnStartedAt) return 0;
+  return Math.floor((Date.now() - STATE.turnStartedAt) / 1000);
+}
+
+function paintTurnClock() {
+  if (!STATE.busy || !STATE.turnStartedAt) return;
+  var label = STATE.pendingLabel;
+  if (!label) return;
+  var seconds = turnWaitedSeconds();
+  var waited = '（已等待 ' + seconds + 's）';
+  label.textContent = STATE.turnNote ? STATE.turnNote + waited : '正在思考…' + waited;
+  if (seconds >= TURN_SOFT_TIMEOUT_S) offerForceReset();
+}
+
+// 等够久了：给一条自己走得掉的路。
+function offerForceReset() {
+  if (STATE.forceReset || !STATE.pending) return;
+  var row = STATE.pending;
+  var button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'cs-force-reset';
+  button.textContent = '强制复位界面';
+  // 说清它做了什么、没做什么：它只把界面从"一直等下去"里救出来，**不会**叫停宿主那一轮
+  // （要停它请点「停止」，那条路才会告诉宿主）。
+  button.title = '只把面板从"一直等下去"里救出来：不会叫停宿主那一轮，要停它请点「停止」';
+  button.addEventListener('click', forceResetTurn);
+  row.appendChild(button);
+  STATE.forceReset = button;
+  STATE.softWarned = true;
+}
+
+function forceResetTurn() {
+  if (!STATE.busy) return;
+  // 后端那一轮**没有停**（这里没有发 agent/cancel）：只把界面放开，并把这件事说明白 ——
+  // 默默放开的话，用户下一句会撞上"会话已有一轮在跑"，那才叫莫名其妙。
+  if (typeof STATE.finishTurn === 'function') STATE.finishTurn();
+  addError('已强行复位界面：宿主那一轮可能还在跑。发下一句之前，先点「停止」或等它收敛。');
+  setStatus('界面已复位（宿主那一轮可能还在跑）', 'error');
 }
 
 // variant: final = 这一轮的回答，intermediate = 过程中的话（模型一边要工具一边说的）
@@ -2748,6 +2826,8 @@ function clearLog() {
   var log = logEl();
   if (log) log.textContent = '';
   STATE.pending = null;
+  STATE.pendingLabel = null;
+  STATE.forceReset = null;
   STATE.cards = {};
   STATE.planCard = null;
   STATE.paint = (STATE.paint || 0) + 1;
@@ -3044,6 +3124,18 @@ function onEvent(payload) {
   // 宿主上的会话可以不止一条，事件自带 session_id：别的会话在跑，别画进这个抽屉。
   if (params.session_id && params.session_id !== STATE.session) return;
   var type = params.type;
+  if (type === 'retry') {
+    // 宿主在一次模型调用失败之后按退避重试（见 lib/comfy_studio/agent/llm.py）：这是
+    // "还活着、只是还没成"的唯一信号，必须画出来 —— 不画，它和卡死就是同一幅画面。
+    var attempt = params.attempt;
+    var total = params.total;
+    var delay = params.delay;
+    STATE.turnNote =
+      '模型没回应，' + (delay || 0) + 's 后重试（第 ' + attempt + '/' + total + ' 次）';
+    paintTurnClock();
+    setStatus('模型请求失败，正在重试（第 ' + attempt + '/' + total + ' 次）', 'error');
+    return;
+  }
   if (type === 'assistant') {
     addAssistant(String(params.text || ''), 'intermediate');
     return;
@@ -3104,9 +3196,12 @@ function sendTurn() {
   STATE.cards = {};
   STATE.planCard = null;
   addPending();
+  startTurnClock();
   var finish = function () {
     // 收尾统一摘掉"正在思考"：成功时回答已经插在它前面，失败时错误行也是。
+    stopTurnClock();
     removePending();
+    STATE.finishTurn = null;
     STATE.turn = null;
     STATE.cards = {};
     STATE.planCard = null;
@@ -3126,6 +3221,8 @@ function sendTurn() {
     // 清单跟着刷新，用户才看得见"它现在叫什么"。
     loadSessions();
   };
+  // 等太久时那颗"强制复位"按钮要能叫到它（见 forceResetTurn）。
+  STATE.finishTurn = finish;
 
   // 失败不吞字：这一轮要是没发成，刚才那段话原样还回输入框（出处：ComfyUI 官方前端 agent 面板
   // 的 composables/agent/useAgentDraftSubmission.ts —— 提交失败走 composer.restorePrompt）。
@@ -6140,6 +6237,10 @@ export function getComfyStudioChatContentScript(): string {
     `window.__comfyStudioChat = { started: false, open: false, busy: false, turn: null, ` +
     `model: '', agent: '', session: 'default', sessions: null, closeArmed: false, ` +
     `remembered: '', archive: null, pending: null, paint: 0, cards: {}, planCard: null, ` +
+    // 一轮在飞时的读数：什么时候开始的、每秒刷新的计时器、宿主报的重试说明，以及等太久
+    // 之后摆出来的"强制复位"按钮（见 paintTurnClock / offerForceReset）。
+    `pendingLabel: null, turnStartedAt: 0, turnTimer: null, turnNote: '', forceReset: null, ` +
+    `finishTurn: null, softWarned: false, ` +
     // 抽屉里的三页（'chat' / 'novel' / 'project'）与小说那一页的当前状态：列表那一趟的票、
     // 正开着的是哪一篇（含它自己那趟读的票）、删除按到第二步的是哪一行。
     `view: 'chat', novels: null, novelOpen: null, novelDeleteArmed: null, novelListToken: 0, ` +

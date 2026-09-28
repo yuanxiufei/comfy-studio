@@ -121,6 +121,7 @@ from .settings import (
     SettingsStore,
 )
 from .skills import SkillCatalog, SkillsError
+from .web import WEB_PROMPT_RULES, WebClient
 
 SERVER_NAME = "comfy-studio-desktop"
 SERVER_VERSION = "0.1.0"
@@ -138,6 +139,19 @@ DEFAULT_SESSION = "default"
 
 #: 单次 MCP 调用的默认超时：跑 skill 会长时间占用这一次调用，所以给得比通常宽。
 DEFAULT_REQUEST_TIMEOUT = 1800.0
+
+#: 一轮对话（``agent/chat``）的默认上限：超过就用取消令牌**干净地叫停**这一轮，回一句明确的错，
+#: 而不是让它无声地挂着 —— 挂着的观感与"卡死"一模一样，面板那边也只有一句"正在思考"。
+#:
+#: 为什么是 1800s 而不是更短：一轮里可能夹着一次要跑满 30 分钟的 skill，而宿主等那一次 MCP
+#: 调用本身就允许 :data:`DEFAULT_REQUEST_TIMEOUT`（1800s）—— 看门狗比它短就会误杀正常的活。
+#: 它挡住的是"一轮比它内部最长的那次等待还要无限地拖下去"（模型服务半死不活、连接建好却
+#: 再也不回数据）。真要定位慢在哪一步，读 ``agent/loop.py`` 那行单次调用耗时。
+DEFAULT_TURN_TIMEOUT = 1800.0
+
+#: 看门狗叫停之后留给这一轮收尾的时间：走取消令牌那条路，``ask`` 会先把工具结果补齐成配对的
+#: 一轮（见 ``agent/loop.py`` 的取消路径），历史才喂得回去。补不完就硬取消。
+TURN_WATCHDOG_GRACE = 30.0
 
 
 def _object(params: Any, method: str) -> dict[str, Any]:
@@ -218,11 +232,13 @@ class StudioHost:
         plan: PlanChannel | None = None,
         local_files: LocalFilesClient | None = None,
         memory: MemoryClient | None = None,
+        web: WebClient | None = None,
         history: SessionHistoryStore | None = None,
         agents: AgentCatalog | None = None,
         novels: NovelLibrary | None = None,
         settings: SettingsStore | None = None,
         projects: ProjectLibrary | None = None,
+        turn_timeout: float | None = DEFAULT_TURN_TIMEOUT,
     ) -> None:
         self.hub = hub
         self.catalog = catalog
@@ -240,6 +256,9 @@ class StudioHost:
         #: 跨会话的长期记忆（默认就有，`--no-memory` 关掉）；None 时工具表里不会有 memory__*，
         #: 系统提示词里也不会带"你记得什么"那一段。
         self.memory = memory
+        #: 联网工具（默认就有，`--no-web` 关掉）；None 时工具表里不会有 web__*，
+        #: 系统提示词里也不会带"你可以联网"那一段（见 :meth:`_prompt_source`）。
+        self.web = web
         #: 对话存档（默认就有，`--no-history` 关掉）；None 时会话只活在内存里：宿主一退、
         #: 面板一重载，整段对话就没了。
         self.history = history
@@ -261,6 +280,8 @@ class StudioHost:
         self.default_source: str | None = None
         #: 面板里切过的智能体；None = 用内置的通用助手（同样只在进程内有效）。
         self.default_agent: str | None = None
+        #: 一轮对话的上限（秒）。None = 不设看门狗，让这一轮自己跑到尽头（见 :meth:`_ask_with_watchdog`）。
+        self.turn_timeout = turn_timeout
         #: 活着的会话。顺序就是"最近用过"的顺序（用得越晚排得越靠后，见 :meth:`_session`），
         #: 到上限时淘汰队首那个 —— 所以这里得是 OrderedDict，普通 dict 改键不会挪位置。
         self._sessions: OrderedDict[str, AgentSession] = OrderedDict()
@@ -360,6 +381,12 @@ class StudioHost:
             "memory_file": str(self.memory.store.path) if self.memory is not None else None,
             "memory_entries": memory_entries,
             "memory_error": memory_error,
+            # 联网默认开着（--no-web 关掉）。它没有本地落点可报，只如实说"挂没挂" ——
+            # 面板据此决定要不要显示"这个模型能上网"。
+            "web": self.web is not None,
+            "web_search_url": str(self.web.fetcher.config.search_url)
+            if self.web is not None
+            else None,
             "history": self.history is not None,
             "history_dir": str(self.history.directory) if self.history is not None else None,
         }
@@ -678,6 +705,45 @@ class StudioHost:
         self.default_agent = wanted
         return {"agent": profile.id, "changed": True, "name": profile.name, "error": None}
 
+    async def _ask_with_watchdog(
+        self,
+        session: AgentSession,
+        text: str,
+        on_event: Any,
+        cancel: CancelToken,
+    ) -> str:
+        """跑一轮，并在超过 :attr:`turn_timeout` 秒后叫停它。
+
+        为什么要**先置取消令牌、再等一会儿**，而不是直接 ``task.cancel()``：直接劈在半路，
+        历史里那句带工具调用的 assistant 就找不到配对的 tool 消息了（见 :mod:`comfy_studio.cancel`
+        开头那段）。走令牌这条路，``ask`` 会自己把账补平再抛 ``Cancelled`` —— 会话还能接着用。
+        于是超时在面板上变成一句**明确的错**，而不是一圈永远转下去的"正在思考"。
+        """
+        task = asyncio.create_task(session.ask(text, on_event, cancel=cancel))
+        timeout = self.turn_timeout
+        if timeout is None:
+            # 不设看门狗：让这一轮自己跑到尽头（--turn-timeout 0 就是这个意思）。
+            return await task
+        done, _pending = await asyncio.wait({task}, timeout=timeout)
+        if task in done:
+            return task.result()
+        cancel.cancel(f"{timeout:g} 秒上限")
+        try:
+            return await asyncio.wait_for(task, TURN_WATCHDOG_GRACE)
+        except asyncio.TimeoutError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise AgentError(
+                f"这一轮超过 {timeout:g} 秒没有收敛，已叫停（之后 {TURN_WATCHDOG_GRACE:g} 秒也没能"
+                "收拾干净）。多半是模型服务或那次工具调用卡住了：宿主 stderr 里那行单次调用耗时"
+                "能指出是哪一步。"
+            ) from None
+        except Cancelled:
+            raise AgentError(
+                f"这一轮超过 {timeout:g} 秒没有收敛，已叫停。可能卡在模型回应或那次工具调用上；"
+                "宿主 stderr 里那行单次调用耗时能指出是哪一步。"
+            ) from None
+
     async def agent_chat(self, params: Any, ctx: RpcContext) -> dict[str, Any]:
         args = _object(params, "agent/chat")
         text = _text(args, "text")
@@ -703,7 +769,7 @@ class StudioHost:
         # （`asyncio.create_task` 起的任务会继承 context）才找得到这一轮的出口。
         token = bind_emit(ctx.emit)
         try:
-            answer = await session.ask(text, on_event, cancel=cancel)
+            answer = await self._ask_with_watchdog(session, text, on_event, cancel)
         except Cancelled as err:
             # 取消**不是失败**：回一个正常结果，面板把气泡收成"已停止"就行。
             return {"session_id": session_id, "text": "", "cancelled": True, "reason": str(err)}
@@ -1422,18 +1488,25 @@ class StudioHost:
         """会话的人设来源：一个**每次重算**的零参函数（:meth:`AgentSession.ask` 每轮都会叫它）。
 
         提示词 = 底座规则 + 选中智能体的角色段 + 收尾要求（``compose_system_prompt``），
-        挂了记忆时再插一段"你记得什么"。所以这里有两件事值得每轮重算：用户可能刚换了个
-        智能体，也可能刚被记下一件新事，两个都得在下一轮就看见。
+        挂了记忆时再插一段"你记得什么"，挂了联网工具时再插一段"你可以联网查"。所以这里有三件事
+        值得每轮重算：用户可能刚换了个智能体、刚被记下一件新事、或者刚把联网关掉（启动参数），
+        都得在下一轮就看见。
 
         用的是通用助手（角色段是空串）、又没挂记忆时，拼出来就是 ``DEFAULT_SYSTEM_PROMPT``
         一个字不差 —— ``compose_system_prompt("")`` 会把空段丢掉，默认行为与从前完全一样。
         """
         store = self.memory.store if self.memory is not None else None
 
+        web = self.web is not None
+
         def current() -> str:
             sections = [self._agent_section()]
             if store is not None:
                 sections.append(store.digest())
+            if web:
+                # "你可以联网"这一段只在真挂了那两张工具时才成立：没挂却写进人设，等于教模型
+                # 去调不存在的 web__search，它会当成"网也上不了、查也查不成"。
+                sections.append(WEB_PROMPT_RULES)
             return compose_system_prompt(*sections)
 
         return current
@@ -1540,7 +1613,9 @@ async def serve_stdio(
     memory: bool = True,
     memory_dir: str | None = None,
     agents_dir: str | None = None,
+    web: bool = True,
     history: bool = True,
+    turn_timeout: float | None = DEFAULT_TURN_TIMEOUT,
 ) -> None:
     """拉起全部 MCP server，然后在 stdin/stdout 上服务到 EOF。
 
@@ -1573,6 +1648,15 @@ async def serve_stdio(
     智能体清单（:mod:`comfy_studio.agent.catalog`）也用这份数据目录：内置那几项写死在代码里，
     用户自己写的 md 放 ``agents/`` 下（``agents_dir`` 换地方）。它只决定人设里的**角色段**，
     既不进工具表也不需要谁接话，所以没有开关 —— 面板上永远有的选。
+    联网（:mod:`comfy_studio.web`：``web__search`` 搜一下、``web__fetch`` 读一页）也**默认开着**
+    —— 本地模型的知识停在训练那天，而"这个插件现在怎么装""这个报错是什么意思"这类问题本机
+    确实查不到，硬答就是编。它不需要谁接话，但会往外面发请求，所以给了 ``web=False`` 整个关掉：
+    工具表里不再有 ``web__*``，系统提示词里也不再提"你可以联网"（那一整段只在挂了它时才成立）。
+    抓哪些地址有硬闸门（本机 / 内网 / 云元数据一律不抓，跳转也要逐跳复查），细节见
+    :mod:`comfy_studio.web` 开头。
+    ``turn_timeout`` 是一轮对话的上限（默认 :data:`DEFAULT_TURN_TIMEOUT`，``None`` = 不设看门狗）：
+    超过就用取消令牌干净地叫停这一轮并如实报错。它比"面板那边一直转圈"有用得多 ——
+    卡住的轮次会变成一句说得清的错，而不是让用户对着"正在思考"干等到怀疑程序死了。
     """
     canvas_channel = CanvasChannel() if canvas else None
     review_channel = ReviewChannel() if review else None
@@ -1600,6 +1684,9 @@ async def serve_stdio(
     memory_client = (
         MemoryClient(MemoryStore(memory_dir or memory_home())) if memory else None
     )
+    # 联网那两张（web__search / web__fetch）：不需要谁接话，也没有本地落点要配，默认就挂。
+    # 逮地址的硬闸门在这一层里面（见 comfy_studio.web），关掉只能整个不挂。
+    web_client = WebClient() if web else None
     # 对话存档与记忆共用同一个数据目录（--memory-dir / COMFY_STUDIO_MEMORY_DIR 管着它俩）：
     # 记忆是平铺的 memory.json，对话按会话分文件放在 sessions/ 下。
     data_root = memory_home() if memory_dir is None else Path(memory_dir).expanduser()
@@ -1632,6 +1719,8 @@ async def serve_stdio(
         extra.append(local_files)
     if memory_client is not None:
         extra.append(memory_client)
+    if web_client is not None:
+        extra.append(web_client)
     if projects is not None:
         # 两张只读工具（查项目有什么、一部剧到什么程度）：模型据此接话，但不许替人建项目。
         extra.append(ProjectsClient(projects))
@@ -1649,11 +1738,13 @@ async def serve_stdio(
             plan=plan_channel,
             local_files=local_files,
             memory=memory_client,
+            web=web_client,
             history=history_store,
             agents=agent_catalog,
             novels=novels,
             projects=projects,
             settings=settings_store,
+            turn_timeout=turn_timeout,
         )
         # stdin 一关（面板退出）就先叫停在飞的轮次，别让退出卡在长任务上。
         host.server.on_close = lambda: host.cancel_turns("宿主退出")

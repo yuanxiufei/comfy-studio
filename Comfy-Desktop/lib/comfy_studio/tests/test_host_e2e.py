@@ -508,6 +508,10 @@ class StudioHostE2ETest(unittest.TestCase):
         # 对话存档默认开着，且跟记忆落在同一个（这里是临时）数据目录下。
         self.assertIs(info.get("history"), True)
         self.assertEqual(info.get("history_dir"), str(self.memory_dir / SESSION_SUBDIR))
+        # 联网默认开着。**这里只验状态，不真发请求**：真出门是下面 web 用例各自的事，
+        # 而端到端测试要能在断网的机器上跑，所以这两张工具在这里只验"挂上了"。
+        self.assertIs(info.get("web"), True)
+        self.assertEqual(info.get("web_search_url"), "https://www.bing.com/search")
 
     def test_02_tools_are_namespaced_by_server(self) -> None:
         tools = self.call(2, "mcp/tools").get("result", {}).get("tools", [])
@@ -519,6 +523,9 @@ class StudioHostE2ETest(unittest.TestCase):
         self.assertIn("memory__remember", names)
         self.assertIn("memory__recall", names)
         self.assertIn("memory__forget", names)
+        # 联网那两张是"不用谁接话"的那类，默认就汇进工具表（--no-web 才没有）。
+        self.assertIn("web__search", names)
+        self.assertIn("web__fetch", names)
         # 每把工具都严格是 <server>__<tool>：回程那条通道（review）也不破例。
         for tool in tools:
             self.assertTrue(tool["qualified_name"].startswith(f"{tool['server']}__"), tool)

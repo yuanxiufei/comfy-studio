@@ -17,7 +17,15 @@ vi.mock('../settings', () => ({
   defaults: settingsMock.defaults
 }))
 
-import { getBundledLibDir, resolveEngineStorageDirs, resolveStudioCommand } from './comfyStudioHost'
+import {
+  getBundledLibDir,
+  resolveEngineStorageDirs,
+  resolveStudioCommand,
+  studioTimeoutForMethod,
+  STUDIO_QUERY_TIMEOUT_MS,
+  STUDIO_REQUEST_TIMEOUT_MS,
+  STUDIO_SLOW_TIMEOUT_MS
+} from './comfyStudioHost'
 import { getVenvPythonPath } from './pythonEnv'
 import type { InstallationRecord } from '../installations'
 
@@ -135,5 +143,28 @@ describe('resolveStudioCommand', () => {
 
     expect(command.args).not.toContain('--input-dir')
     expect(command.args).not.toContain('--output-dir')
+  })
+})
+
+describe('studioTimeoutForMethod', () => {
+  it('慢方法给长超时，其余一律给查询档', () => {
+    // 一轮对话和一次 skill 运行的长度由**活**决定，不由"宿主还活着吗"决定；
+    // 其余（agent/models、agent/agents、host/info …）在健康时是毫秒级的事，吊着不放
+    // 只会让面板那排控件一直禁用 —— 开一次抽屉会同时发好几条这种请求。
+    expect(studioTimeoutForMethod('agent/chat')).toBe(STUDIO_SLOW_TIMEOUT_MS)
+    expect(studioTimeoutForMethod('skills/run')).toBe(STUDIO_SLOW_TIMEOUT_MS)
+    expect(studioTimeoutForMethod('agent/models')).toBe(STUDIO_QUERY_TIMEOUT_MS)
+    expect(studioTimeoutForMethod('agent/agents')).toBe(STUDIO_QUERY_TIMEOUT_MS)
+    expect(studioTimeoutForMethod('host/info')).toBe(STUDIO_QUERY_TIMEOUT_MS)
+  })
+
+  it('长超时排在宿主自己的轮次看门狗后面', () => {
+    // 这个先后不是审美问题：主进程这个超时只把本地记录删掉，**不会通知子进程**
+    // （见 comfyStudioHost.request）。让它先触发 = 面板解锁了、那一轮还在背后跑；
+    // 让宿主先触发 = 真的停了，而且那句错说得清是哪一步慢。
+    // `--request-timeout` 传的就是 STUDIO_REQUEST_TIMEOUT_MS，宿主看门狗默认取同一个数
+    //（lib/comfy_studio/server.py 的 DEFAULT_TURN_TIMEOUT）。
+    expect(STUDIO_SLOW_TIMEOUT_MS).toBeGreaterThan(STUDIO_REQUEST_TIMEOUT_MS)
+    expect(STUDIO_QUERY_TIMEOUT_MS).toBeLessThan(STUDIO_REQUEST_TIMEOUT_MS)
   })
 })
