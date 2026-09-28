@@ -1,5 +1,18 @@
 # -*- coding: utf-8 -*-
-"""把 `智能体搭建参考md/` 的 6 份智能体规格，**逐字移植**成 CodeBuddy 子智能体。
+"""把宿主包 `agent/presets/` 的 6 份智能体规格，**逐字移植**成 CodeBuddy 子智能体。
+
+═══════════════════════════════════════════════════════════════════
+口径：这批智能体是**通用内容生产**的 —— 与题材无关
+═══════════════════════════════════════════════════════════════════
+剧本 / 服化道 / 资产库 / 分镜 / 音频 —— 这些职责**任何题材都用得上**。
+题材（世界设定、人物谱系、ID 规范、门禁判据）住在**具体项目的规则**里，
+不住在 agent 里：换个项目 = 换一份规则，agent 本身不改一个字。
+
+⚠️ 故 **name / description / 角色段里不许出现具体题材**（"漫剧""赛博朋克"…）：
+写窄了，主 Agent 就会在别的题材上**不选它** —— 而这件事**不报错**。
+
+⚠️ 这 6 个 agent 一律**自包含**：规格正文把规则**全文内联**在 System Prompt 里，
+正文里**不出现任何仓库内路径**。同一份在本仓库、在别的项目、在别的平台都能直接跑。
 
 ═══════════════════════════════════════════════════════════════════
 为什么是"逐字移植"而不是"改写"
@@ -9,56 +22,56 @@
 所以正确做法是**加一层 CodeBuddy 的 frontmatter**，正文**原样搬运** ——
 改写只会引入偏差，还要对付"哪份是最新"的问题。
 
-⚠️ 这些智能体**不依赖** `AI漫剧智能体工作流/` 那套 Python 运行时 ——
-它们把规则**内联**在 System Prompt 里，因此在 CodeBuddy 里**开箱可用**
-（这正是"完全融合"的意思：不靠外部项目跑起来）。
+⚠️ 这 6 个智能体**不依赖任何运行时**：规则**全文内联**在 System Prompt 里，
+正文里**不出现任何仓库内路径**，因此在 CodeBuddy 里**开箱可用**，
+搬到别的项目、别的平台也是同一份。
 
-| 源规格 | 生成 | 内联与否 |
+═══════════════════════════════════════════════════════════════════
+「谁是自动入口」只看一个字段：`agentMode`
+═══════════════════════════════════════════════════════════════════
+| agent | agentMode | 对应职责 |
 |---|---|---|
-| 给"没有工具的模型" | **本目录的 6 个智能体** | ⭐ 规则**全文内联**（模型读不到文件，必须内联） |
-| 给"有工具的 agent" | `AI漫剧智能体工作流/` 那套 | 只给路径（避免同一知识两处维护） |
+| `studio-script-creator` | `agentic` | 剧本文本 |
+| `studio-costume-prop-engine` | `agentic` | 服化道（世界视觉设定，主控） |
+| `studio-storyboard-director` | `agentic` | 分镜导演 |
+| `studio-suno-lyric-master` | `agentic` | 词曲 |
+| `studio-audio-tuning-master` | `agentic` | 声音设计 |
+| `studio-asset-library` | `manual` | 服化道的**专项工具**（单件设定图） |
 
-两种形态**各有用途**，不是谁替代谁：上面这套**独立可用**；
-工作流那套**与本仓库的代码联动**（ID 分配 / 一致性 Gate / 漂移检测由代码判）。
-
-═══════════════════════════════════════════════════════════════════
-文件名有两种形态 —— **别用「带模块号」反推谁主谁次**
-═══════════════════════════════════════════════════════════════════
-| 文件名形态 | 是什么 | 谁维护 | 自动可调用 |
-|---|---|---|---|
-| `manju-0N-<职责>.md` | **联动型**：规则**只给路径**，确定性步骤调 `07-智能体运行时` 的代码 | 手写（不归本文件管） | 00 / 02 / 04 / 06 |
-| `manju-<职责>.md` | **移植型**：规则**全文内联**、自包含 | ⭐ **本文件生成** | 01 / 03 / 05 |
-
-⚠️ **带模块号 ≠ 该模块的自动入口**（反直觉，已实测踩过）：
-`manju-01-script` / `manju-03-storyboard` / `manju-05-audio` 都是 `manual` ——
-它们那个模块的**自动**入口是另一个**不带号**的移植型（两者职责重叠，
-若同时参与自动调用，同一句话会走两条路、产出不确定）。
-
-判「谁是自动入口」**只看每个文件的 `agentMode` 字段**（`agentic` = 自动）。
-唯一名册在 `AI漫剧智能体工作流/07-智能体运行时/tests/test_agents.py` 的 `EXPECTED_AUTO` ——
-新增/移动自动入口必须改那张表，测试会红。
+⚠️ 服化道方向有**两个** agent，只留**一个**自动入口：两者都能响应"出一套视觉设定"，
+同时参与自动调用会让同一句话走两条路、**行为不确定**。自动位留给
+`costume-prop-engine`（主控：世界观 + 角色 + 服装 + 道具 + 场景），
+`asset-library` 作为专项工具**手动**叫（单件角色 / 道具的标准设定图）。
+判据只有 `agentMode` 一处 —— 不另立"后台名册"（那份名册会与文件本身漂移）。
 
 ═══════════════════════════════════════════════════════════════════
-源规格有**两个**派生落点，本脚本一起管
+源在**宿主包**里，本脚本只做一条派生
 ═══════════════════════════════════════════════════════════════════
-| 派生落点 | 谁读它 | 同步方式 |
+| 角色 | 落点 | 谁读它 |
 |---|---|---|
-| `.codebuddy/agents/manju-<职责>.md`（6 个移植型 agent） | CodeBuddy 主 Agent | 加一层 frontmatter，**正文逐字**（:func:`render`） |
-| `Comfy-Desktop/lib/comfy_studio/agent/presets/`（6 份快照） | 宿主的 `agent/catalog.py`（面板下拉） | **按字节**复制（:func:`sync_presets`） |
+| **源规格**（唯一权威，写作地） | `Comfy-Desktop/lib/comfy_studio/agent/presets/*.md` | 宿主 `agent/catalog.py` 的 `PRESET_AGENTS`（面板下拉）**直接读**，零转换 |
+| 派生（本脚本生成） | `.codebuddy/agents/studio-<职责>.md` | CodeBuddy 主 Agent（加一层 frontmatter，**正文逐字**，见 :func:`render`） |
 
-⚠️ 两个落点**都必须跟上**，否则症状是"规则改了、实际部署的却没变"，而且不报错：
-前者靠 `tests/test_agents.py` 的「生成物 == 重算」抓，后者靠同文件里那条**逐字对拍**抓。
-所以不把它们留在"记得手复制"那一步 —— 改源 → 跑本脚本，两个落点一次到位。
+⚠️ 为什么源就住在**宿主包**里，而不是像从前那样另存一份在引擎侧
+（`manju/智能体搭建参考md/`）：
+
+* 宿主包要**随桌面壳分发** —— cwd 是壳自带的 lib，猜不到用户的 ComfyUI 装在哪，
+  所以这 6 份正文**必须**住在包内，删不掉；
+* 既然它必须在，再在别处留一份"权威源"就是**同一知识两处维护**，而"改了源、
+  忘了同步"既不报错也不复现（症状只是面板下拉里那个智能体按旧人设说话）；
+* 引擎侧那棵树整体删除后，那个"别处"本身也没了 —— 源就此收敛到这一处。
+
+⚠️ 本脚本**不再同步任何"预置快照"**：源就是预置本身，派生只有 `.codebuddy/agents/`
+一条。（从前它管两个落点，是因为源另在引擎侧；现在写回预置等于自己抄自己。）
 
 ═══════════════════════════════════════════════════════════════════
 用法
 ═══════════════════════════════════════════════════════════════════
-    python .codebuddy/agents/_build.py                # 生成 6 个智能体 + 同步宿主侧预置
-    python .codebuddy/agents/_build.py --预览          # 只看清单，一个字都不写
-    python .codebuddy/agents/_build.py --不同步预置     # 只更 agent，不动宿主那份快照
+    python .codebuddy/agents/_build.py           # 生成 6 个智能体
+    python .codebuddy/agents/_build.py --预览     # 只看清单，一个字都不写
 
-校验：`python AI漫剧智能体工作流/07-智能体运行时/tests/test_agents.py`
-（宿主侧那一层另有一套：`cd Comfy-Desktop/lib` 后跑
+校验：`cd ComfyUI/custom_nodes && python -m unittest comfy_studio.tests.test_agent_presets -t .`
+（宿主侧另有一套：`cd Comfy-Desktop/lib` 后跑
 `python -m unittest comfy_studio.tests.test_agents_tools`）
 """
 
@@ -73,20 +86,12 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent             # `<仓库根>/.codebuddy/agents/`
 REPO_ROOT = HERE.parent.parent                     # comfy-studio 仓库根（workspace 根）
 
-# ⚠️ 同 `_install_user.py`：本仓唯一一处写死的「仓库内相对落点」（不是机器绝对路径）。
-#    项目级 agent 必须住 workspace 根才生效，业务数据却在引擎侧扩展位下 —— 两者隔着
-#    四级目录，无法用「向上找」连起来。改布局时三处一起改（这里 / 安装器 / 测试）。
-MANJU_REL = "ComfyUI/custom_nodes/comfy_studio/manju"
-ROOT = REPO_ROOT / MANJU_REL                       # 漫剧数据根
-SRC_DIR = ROOT / "智能体搭建参考md"
-
-# ⚠️ 第二个派生落点：宿主侧的**随包预置快照**。这条相对落点在 `presets/README.md` 与
-#    07 的 `tests/test_agents.py` 里各有一份同源声明 —— 改布局时三处一起改。
-#    为什么由本脚本同步（而不是"记得手动复制"）：宿主包必须自带正文（它随桌面壳分发、
-#    cwd 是壳自带的 lib，猜不到用户的 ComfyUI 装在哪），而"改了源规格、面板下拉里还是旧
-#    人设"这件事**不报错、不复现**；唯一哨兵是 07 里那条逐字对拍，却要先有人想起来去跑。
+# ⚠️ 源规格住在**宿主包**里：宿主面板下拉直接读它当角色段（`agent/catalog.py` 的
+#    `PRESET_AGENTS`），本脚本另生成一份 CodeBuddy 子智能体 —— **一处源、两个消费者**。
+#    这条相对落点是「仓库内落点」，不是机器绝对路径（禁的是 `D:\…` 那种换台机器就
+#    静默失效的写法）：它由 `__file__` 推出仓库根后再拼，布局不变它就永远对得上。
 HOST_AGENT_REL = "Comfy-Desktop/lib/comfy_studio/agent"
-PRESETS = REPO_ROOT / HOST_AGENT_REL / "presets"    # 6 份规格快照（派生物）
+SRC_DIR = REPO_ROOT / HOST_AGENT_REL / "presets"     # 6 份源规格（权威源）
 CATALOG = REPO_ROOT / HOST_AGENT_REL / "catalog.py"  # 宿主侧清单 PRESET_AGENTS 就在这份里
 
 # ⚠️ `description` 是**主 Agent 决定何时调用你**的唯一依据（官方文档），
@@ -96,57 +101,49 @@ CATALOG = REPO_ROOT / HOST_AGENT_REL / "catalog.py"  # 宿主侧清单 PRESET_AG
 SOURCES: list[dict[str, str]] = [
     {
         "src": "AI剧本创作_完整迁移配置.md",
-        "name": "manju-script-creator",
-        "desc": "AI 漫剧剧本创作（2 分钟工业化短剧）- 当需要把原始故事 / 小说 / 一句话创意做成**可投产的 2 分钟 AI 漫剧剧本**时使用，覆盖工业化分集、10 大记忆点角色、每角色 10 项记忆资产、爆款标签、群像差异化、情绪线与黑化/成长/反转路线。例：「把这部小说改编成 AI 漫剧」「给我一份 40 集分集大纲」「这个主角怎么做出记忆点」。产出剧本 + 全人物总建模 + 分集结构 + 视觉统一方案。",
+        "name": "studio-script-creator",
+        "desc": "剧本创作（工业化短剧 / 长篇改编）- 当需要把原始故事 / 小说 / 一句话创意做成**可投产的剧本**时使用，覆盖工业化分集、10 大记忆点角色、每角色 10 项记忆资产、爆款标签、群像差异化、情绪线与黑化/成长/反转路线。例：「把这部小说改编成分集剧」「给我一份 40 集分集大纲」「这个主角怎么做出记忆点」。产出剧本 + 全人物总建模 + 分集结构 + 视觉统一方案。",
         "tools": "read_file, write_to_file, replace_in_file, search_file, search_content, list_dir",
-        "module": "01", "mode": "agentic",
+        "mode": "agentic",
     },
-    # ⚠️ **本行的来由**（值得记，因为判据变过一次）：
-    #    · 规格**旧版**（`…_FULL_PORTABLE_AGENT_SPEC_V2.md`）与工作流
-    #      `02-服化道/00-主控智能体.md` 曾**100% 同一份**（滑窗互含率 100%/100%）
-    #      → 当时判定"再生成一份内联副本 = 同一知识两处维护"，**故不移植**。
-    #    · 2026-09-26 用户**重写并改名**为 `AI漫剧服化道智能体_完整迁移配置.md`
-    #      （2093 → 2028 行；与工作流 02 的**主控与全部 23 份规则**互含率均为 **0.0%**）
-    #      → **不再是副本，而是独立内容** ⇒ **判据失效、重新移植**。
-    #    ⚠️ 教训：**判据依赖的事实会变**（源文件一更新，结论就得重算）。
-    #       故把"为什么"写在这里，而不是只留一个结果。
-    #    ⚠️ 仍设 `manual`：模块 02 的自动入口留给 `manju-02-asset` ——
-    #       它是**唯一能"用代码强制"一致性**的（ID / 版本 / Gate / 参考图链 / 漂移），
-    #       而本规格只能"描述"这些规则。**待用户确认哪份更权威后可再调**。
+    # ⚠️ 模块 02 有**两个** agent（本份 = 模块主控 + `studio-asset-library` = 专项工具）。
+    #    两者都能响应"出一套视觉设定" ⇒ 只留**一个**自动入口，本份占它
+    #    （它管全套：世界观 + 角色 + 服装 + 道具 + 场景）。
+    #    `studio-asset-library` 设 `manual`：手动叫去出单件设定图。
     {
-        "src": "AI漫剧服化道智能体_完整迁移配置.md",
-        "name": "manju-costume-prop-engine",
-        "desc": "AI 漫剧服化道引擎（完整迁移配置）—— 当需要把小说 / 剧本视觉化成**世界观 + 角色 + 服装 + 道具 + 场景**资产时使用，覆盖固定模块结构、图像生成标准、标准三视图模板、人物一致性规则、色彩与材质系统、时代一致性、双语规则、四套 Prompt 模板（角色 / 服装 / 道具 / 场景）、Negative 规则、视觉 Bible 模板与最终质量检查清单。例：「女刺客，黑衣，赛博朋克」「给这个角色出三视图」「按我这段小说出全套服化道」。产出视觉 Bible + 资产设定 + 提示词 + 图像。",
+        "src": "AI服化道智能体_完整迁移配置.md",
+        "name": "studio-costume-prop-engine",
+        "desc": "服化道引擎（世界视觉设定）- 当需要把故事 / 小说视觉化成**世界观 + 角色 + 服装 + 道具 + 场景**资产时使用，覆盖固定模块结构、图像生成标准、标准三视图模板、人物一致性规则、色彩与材质系统、时代一致性、双语规则、四套 Prompt 模板（角色 / 服装 / 道具 / 场景）、Negative 规则、视觉 Bible 模板与最终质量检查清单。例：「一位黑衣女刺客」「给这个角色出三视图」「按我这段小说出全套服化道」。产出视觉 Bible + 资产设定 + 提示词 + 图像。",
         "tools": "read_file, write_to_file, replace_in_file, search_file, search_content, list_dir, image_gen",
-        "module": "02", "mode": "manual",
+        "mode": "agentic",
     },
     {
-        "src": "AI漫剧资产库角色道具_完整迁移配置.md",
-        "name": "manju-asset-library",
-        "desc": "AI 漫剧资产库（角色 / 道具设定图）- 当需要生成**标准化、可复用、高一致性**的角色或道具设定图时使用，覆盖自动补全（年龄 / 面部 / 发型 / 服装材质 / 配色 / 装备 / 特殊身体特征）与固定版式（16:9，左侧人物特写 + 右侧正侧背三视图）。例：「红发女骑士角色设定图」「出一把赛博朋克武士刀的道具设定图」。产出补全后的设定 + 标准画布 + 提示词 + 图像。",
+        "src": "AI资产库角色道具_完整迁移配置.md",
+        "name": "studio-asset-library",
+        "desc": "资产库（角色 / 道具设定图）- 当需要生成**标准化、可复用、高一致性**的角色或道具设定图时使用，覆盖自动补全（年龄 / 面部 / 发型 / 服装材质 / 配色 / 装备 / 特殊身体特征）与固定版式（16:9，左侧人物特写 + 右侧正侧背三视图）。例：「红发女骑士角色设定图」「出一把武士刀的道具设定图」。产出补全后的设定 + 标准画布 + 提示词 + 图像。",
         "tools": "read_file, write_to_file, replace_in_file, search_file, search_content, list_dir, image_gen",
-        "module": "02", "mode": "manual",
+        "mode": "manual",
     },
     {
         "src": "Suno歌词大师_完整迁移配置.md",
-        "name": "manju-suno-lyric-master",
-        "desc": "Suno 歌词大师 - 当需要为 AI 漫剧 / 短剧写**可直接投给 Suno 的完整歌曲**时使用，覆盖歌词结构、押韵、Hook 与副歌规则、Suno 标记、Style Prompt 组成与禁忌、曲风模板、情绪递进、中英混写与商业流行优化。例：「给这部剧写一首主题曲」「一句话主题扩写成完整歌曲」「帮这段歌词配 Style Prompt」。产出歌词 + 结构标记 + Style Prompt。",
+        "name": "studio-suno-lyric-master",
+        "desc": "Suno 歌词大师 - 当需要为短剧 / 动画 / 广告等任意内容形态写**可直接投给 Suno 的完整歌曲**时使用，覆盖歌词结构、押韵、Hook 与副歌规则、Suno 标记、Style Prompt 组成与禁忌、曲风模板、情绪递进、中英混写与商业流行优化。例：「给这部剧写一首主题曲」「一句话主题扩写成完整歌曲」「帮这段歌词配 Style Prompt」。产出歌词 + 结构标记 + Style Prompt。",
         "tools": "read_file, write_to_file, replace_in_file, search_file, search_content, list_dir",
-        "module": "05", "mode": "agentic",
+        "mode": "agentic",
     },
     {
         "src": "分镜导演助手_完整迁移配置.md",
-        "name": "manju-storyboard-director",
-        "desc": "AI 漫剧分镜导演【先出分镜再出图】- 当需要把文字内容转成**可拍摄的视觉设计**时使用，按三阶段走：纯视觉 Storyboard → 专业镜头拆解 → AI 图像提示词，覆盖景别 / 机位 / 构图 / 运镜 / 光影 / 颜色 / 氛围，以及人物 Identity Lock 与场景 Environment Lock。例：「把这一场做成分镜」「这场戏需要几个镜头」「按分镜出图提示词」。产出视觉分镜 + 镜头拆解 + AI 提示词。",
+        "name": "studio-storyboard-director",
+        "desc": "分镜导演【先出分镜再出图】- 当需要把文字内容转成**可拍摄的视觉设计**时使用，按三阶段走：纯视觉 Storyboard → 专业镜头拆解 → AI 图像提示词，覆盖景别 / 机位 / 构图 / 运镜 / 光影 / 颜色 / 氛围，以及人物 Identity Lock 与场景 Environment Lock。例：「把这一场做成分镜」「这场戏需要几个镜头」「按分镜出图提示词」。产出视觉分镜 + 镜头拆解 + AI 提示词。",
         "tools": "read_file, write_to_file, replace_in_file, search_file, search_content, list_dir",
-        "module": "03", "mode": "agentic",
+        "mode": "agentic",
     },
     {
         "src": "调音大师班_完整迁移配置.md",
-        "name": "manju-audio-tuning-master",
-        "desc": "AI 漫剧调音大师班（声音设计）- 当需要做人物声线设计、环境声音、道具 Foley 或剧情声音表现时使用，覆盖年龄感 / 气息 / 颗粒感 / 情绪张力 / 语速 / 停顿 / 空间与收音 / 低频 / 特殊音色，以及标准化声音提示词结构。例：「给女主选个声线」「这段该配什么环境声」「这个人物的人声提示词怎么写」。产出声音设计方案 + 声音提示词。",
+        "name": "studio-audio-tuning-master",
+        "desc": "调音大师班（声音设计）- 当需要做人物声线设计、环境声音、道具 Foley 或剧情声音表现时使用，覆盖年龄感 / 气息 / 颗粒感 / 情绪张力 / 语速 / 停顿 / 空间与收音 / 低频 / 特殊音色，以及标准化声音提示词结构。例：「给女主选个声线」「这段该配什么环境声」「这个人物的人声提示词怎么写」。产出声音设计方案 + 声音提示词。",
         "tools": "read_file, write_to_file, replace_in_file, search_file, search_content, list_dir",
-        "module": "05", "mode": "agentic",
+        "mode": "agentic",
     },
 ]
 
@@ -182,16 +179,15 @@ def render(item: dict) -> tuple[str, int, int]:
     body = text.rstrip() + "\n"
 
     # 出处注记放**正文最前**（两行）—— 便于追源，且让"这个 agent 是自动还是手动"**可见**。
-    # ⚠️ 「服务模块」与「模式」写成**机器可读**的形式（`服务模块 **01** ｜ agentMode: manual），
-    #    供 `tests/test_agents.py` 校验「**自动入口名册**」——
-    #    不另立一张映射表（那会与"单一权威"冲突，且必然漂移）。
+    # ⚠️ `agentMode` 写成**机器可读**的形式 —— 这就是**唯一**的自动/手动判据，
+    #    想核对"哪几个是自动入口"直接读它，不另立一张会与文件本身漂移的映射表。
     manual = item["mode"] == "manual"
-    tail = ("（**手动选** —— 同模块已有一个自动可调用的 agent，两者职责重叠，"
+    tail = ("（**手动选** —— 同方向已有一个自动可调用的 agent，两者职责重叠，"
             "同时参与自动调用会让同一句话走两条路、**行为不确定**）"
             if manual else "（**自动可调用**）")
-    prov = (f"> 生成自 `智能体搭建参考md/{src.name}`"
+    prov = (f"> 生成自 `{HOST_AGENT_REL}/{SRC_DIR.name}/{src.name}`"
             f"（由 `.codebuddy/agents/_build.py` 逐字移植）。**改规则请改源规格后重新生成。**\n"
-            f"> 服务模块 **{item['module']}** ｜ `agentMode: {item['mode']}`{tail}\n\n")
+            f"> `agentMode: {item['mode']}`{tail}\n\n")
 
     vals = {FIELD_MAP[k]: item[k] for k in FIELD_MAP}
     vals.update({"agentMode": item["mode"], "enabled": "true",
@@ -206,30 +202,6 @@ def build_one(item: dict, preview: bool) -> tuple[str, int, int]:
     if not preview:
         (HERE / (item["name"] + ".md")).write_text(out, encoding="utf-8", newline="\n")
     return item["name"], n, secs
-
-
-def sync_presets(preview: bool) -> tuple[list[str], list[str]]:
-    """把 6 份源规格**按字节**同步到宿主侧随包预置目录。
-
-    返回 ``(本次同步的, 本来就是一致的)`` 两组文件名。
-
-    ⚠️ 必须走 `read_bytes` / `write_bytes`，**不要**用文本模式：宿主侧那条对拍比的是
-    **字节**（07 的 `test_agents.py` 里是 `read_bytes() == read_bytes()`），文本模式会
-    按平台把行尾换掉，于是"同步成功"却把对拍判红 —— 那是最难想通的一种失败。
-    """
-    synced: list[str] = []
-    same: list[str] = []
-    for item in SOURCES:
-        data = (SRC_DIR / item["src"]).read_bytes()      # 源不存在时这里就抛，不静默跳过
-        dst = PRESETS / item["src"]
-        if dst.is_file() and dst.read_bytes() == data:
-            same.append(item["src"])
-            continue
-        if not preview:
-            PRESETS.mkdir(parents=True, exist_ok=True)
-            dst.write_bytes(data)
-        synced.append(item["src"])
-    return synced, same
 
 
 def preset_filenames() -> set[str]:
@@ -251,16 +223,25 @@ def preset_filenames() -> set[str]:
     raise LookupError(f"{CATALOG} 里找不到 PRESET_AGENTS")
 
 
+def orphan_agents() -> list[str]:
+    """本目录里**由本脚本命名**、但已不在 `SOURCES` 里的 `studio-*.md`。
+
+    ⚠️ 抓的是"改名 / 删源规格之后遗留的孤儿"：它不在生成清单里，却还躺在 CodeBuddy
+    的 agent 目录里被主 Agent 看见 —— 照着**已经不存在的规则**干活。只报不删：
+    删文件不该由生成器偷偷做。
+    """
+    want = {it["name"] + ".md" for it in SOURCES}
+    return sorted(p.name for p in HERE.glob("studio-*.md") if p.name not in want)
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="移植 智能体搭建参考md → CodeBuddy 子智能体")
+    ap = argparse.ArgumentParser(description="移植宿主包 presets 的规格 → CodeBuddy 子智能体")
     ap.add_argument("--预览", dest="preview", action="store_true",
                     help="只打印清单，不写文件")
-    ap.add_argument("--不同步预置", dest="no_sync", action="store_true",
-                    help="只更新 .codebuddy/agents/，不动宿主侧那份快照（默认会一并同步）")
     a = ap.parse_args()
 
-    print(f"  源目录：{SRC_DIR}")
-    print(f"  源规格 {len(SOURCES)} 份 → 生成 {len(SOURCES)} 个智能体")
+    print(f"  源规格：{SRC_DIR}")
+    print(f"  {len(SOURCES)} 份 → 生成 {len(SOURCES)} 个智能体到 {HERE}")
     print()
     total = 0
     for it in SOURCES:
@@ -268,34 +249,17 @@ def main() -> int:
         total += n
         flag = "（预览）" if a.preview else ""
         tag = "手动" if it["mode"] == "manual" else "自动"
-        print(f"  ✅ {name:30s} 模块{it['module']} {tag} 正文 {n:6d} 字符 "
-              f"｜ {secs:3d} 个标题 {flag}")
+        print(f"  ✅ {name:30s} {tag} 正文 {n:6d} 字符 ｜ {secs:3d} 个标题 {flag}")
     print()
     print(f"  合计正文 {total} 字符（≈ {total / 1024:.0f} KB）")
     auto = sum(1 for it in SOURCES if it["mode"] == "agentic")
     print(f"  自动可调用 {auto} 个 · 手动 {len(SOURCES) - auto} 个"
-          f"（自动入口须与联动型一起对上「自动入口名册」，见 test_agents.py）")
-
-    # ── 派生落点之二：宿主侧随包预置快照（面板下拉读的就是它）──
-    print()
-    print("── 同步宿主侧随包预置（Comfy-Desktop/lib/comfy_studio/agent/presets/）──")
-    rc = 0
-    if a.no_sync:
-        print("  ··  --不同步预置：跳过（宿主侧那份**仍是旧内容**，改了源规格就得补跑）")
-    else:
-        synced, same = sync_presets(a.preview)
-        if synced:
-            verb = "待同步" if a.preview else "已同步"
-            for name in synced:
-                print(f"  ✅ {verb} {name}")
-            if same:
-                print(f"  ··  其余 {len(same)} 份本来就是一致的")
-        else:
-            print(f"  ✅ {len(same)} 份快照与源规格逐字节一致（无需同步）")
+          f"（自动入口的判据只有各文件的 agentMode 一处）")
 
     # ── 宿主侧清单有没有登记这 6 份（没登记 = 下拉里静默少一项）──
     print()
     print("── 宿主侧清单 PRESET_AGENTS 是否登记了这 6 份 ──")
+    rc = 0
     try:
         listed = preset_filenames()
     except Exception as exc:                                    # noqa: BLE001
@@ -312,8 +276,21 @@ def main() -> int:
         else:
             print(f"  ✅ {len(listed)} 份都登记了（与源规格同名）")
 
+    # ── 本目录有没有改名 / 删源后遗留的孤儿 ──
     print()
-    print("  校验（源侧）：python AI漫剧智能体工作流/07-智能体运行时/tests/test_agents.py")
+    print("── 本目录有没有遗留的孤儿 agent ──")
+    orphans = orphan_agents()
+    if orphans:
+        print(f"  ❌ 不在生成清单里却还躺着：{orphans}")
+        print("     它们是源规格改名 / 删除之前的产物，主 Agent 会照着**过时规则**干活；"
+              "确认无用后删掉（本脚本不代删）")
+        rc = 1
+    else:
+        print("  ✅ 没有孤儿")
+
+    print()
+    print("  校验（引擎侧）：cd ComfyUI/custom_nodes && python -m unittest "
+          "comfy_studio.tests.test_agent_presets -t .")
     print("  校验（宿主侧）：cd Comfy-Desktop/lib && python -m unittest "
           "comfy_studio.tests.test_agents_tools")
     return rc

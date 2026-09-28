@@ -1656,9 +1656,10 @@ async def serve_stdio(
     漫剧项目（:mod:`comfy_studio.projects`，面板「项目管理」那一页的活）与原文同一处父目录：
     ``project_dir`` 直接给，否则由 ``comfyui_dir`` 推出 ``manju/projects/``
     （:func:`comfy_studio.projects.default_project_dir`）。它另外还要一份**落点清单**，
-    也就是工作流里那份 ``src/project.py`` —— 默认从项目根往上退一级去找
-    （:func:`comfy_studio.projects.default_spec_path`），找不到时 ``projects/*`` 会连路径
-    带修法一起报出来，而不是装作"这个项目一个文件都没有"。
+    也就是 ``comfy_studio.projects_spec`` —— **与 projects 模块同一个包**，不需要任何人
+    接话（:func:`comfy_studio.projects.default_spec_path` 从 ``__file__`` 定位）。要换成
+    包外的实现才走 ``spec_path``。载不上时 ``projects/*`` 会连路径带修法一起报出来，
+    而不是装作"这个项目一个文件都没有"。
     长期记忆（:mod:`comfy_studio.memory`）同样不需要谁接话，而且它是这个工作台该有的
     记性，所以**默认开着**：一份落在用户数据目录的 JSON，``memory_dir`` 换地方，
     ``memory=False`` 整个关掉（工具表里就没有 memory__* 了）。

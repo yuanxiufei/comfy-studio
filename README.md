@@ -166,9 +166,13 @@ agent / skill / mcp 三件能力**前后端各有一份**，按各自项目里�
 * `projects.py` —— 漫剧**项目**的后端，面板「项目管理」那一页的门面：**一剧一目录**（落在
   `ComfyUI/custom_nodes/comfy_studio/manju/projects`，`--project-dir` / `COMFY_STUDIO_PROJECT_DIR`
   可改），把围绕**剧本**的各类流程与资料装进同一套落点 —— 剧本创建、角色设定、分镜生成、对白编排、
-  素材归档各占一格，不乱放也不靠人记。目录清单与阶段判据**一份都不抄**：整个来自 manju 工作流那份
-  `src/project.py`（`PROJECT_DIRS` / `SEED_FILES` / `scan_project` / `create_project`，由 `load_spec`
-  载入），这里只做"照着读 + 按面板的需要摆出来"；那份事实源载不上就照原文报错，不拿一份猜的清单顶上。
+  素材归档各占一格，不乱放也不靠人记。目录清单与阶段判据**一份都不抄**：整个来自**同包**的
+  `projects_spec.py`（`PROJECT_DIRS` / `SEED_FILES` / `scan_project` / `create_project` / `STAGE_SPECS`
+  与落点粒度 `DIR_SCOPES` / `SCOPE_ORDER`，`default_spec_path()` 指到它，`--spec` 可整体换一份），这里只做
+  "照着读 + 按面板的需要摆出来"；契约字段缺了就照原文报错（`_require_scan_keys`），不拿一份猜的清单顶上。
+  事实源**收进宿主包**是有意的：它原先照着引擎检出里的 `07-智能体运行时/src/project.py` 读 —— 那份不在检出
+  的时候，面板会静默空白、守卫测试还会静默跳过，谁都不会发现。项目模板（`项目README.md`、各阶段的空表）
+  同处包内 `templates/project/`，建项目时复制过去。
   落点分格（`PROJECT_SHELVES`）只是**摆法**：右侧一屏按"剧本与总纲 → 角色 → … → 素材归档 → 项目根"摆格，
   空格子照样画出来（整格不出现，人就以为这部戏不需要那份资料）。格内再按**粒度**分两组 —— **全剧级**
   （总纲、资产索引、台账：被不止一集引用）与**分集级**（剧本正文、对白、分镜：一集一份），粒度**也不抄**：

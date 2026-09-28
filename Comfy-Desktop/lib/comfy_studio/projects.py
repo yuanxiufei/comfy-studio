@@ -3,15 +3,18 @@
 为什么要有这个模块
 ------------------
 漫剧那条链路的前半段是**资料活**：剧本、角色设定、分镜、对白、素材归档各占一格，
-落点是 ``manju/projects/<剧名>/``。规则写在 AI漫剧智能体工作流 的
-``08-项目管理/项目目录规范.md``，代码侧的**唯一事实源**是同一工作流里
-``07-智能体运行时/src/project.py`` 的 ``PROJECT_DIRS``。
+落点是 ``manju/projects/<剧名>/``。落点清单的**唯一事实源**是同一个包里的
+:mod:`comfy_studio.projects_spec`（``PROJECT_DIRS`` / ``SEED_FILES`` /
+``STAGE_SPECS``）。它原先住在引擎侧工作流的 ``07-智能体运行时/src/project.py``，
+随那份工作流检出一起没了 —— 于是面板上"项目管理"这一页在真机器上只会显示
+一片空白，而且**没有任何一处报错**。搬进包内之后，宿主包自己就是完整的：
+引擎检出不在，也照样建得了项目、做得了体检。
 
 那这里为什么不抄一份落点清单
 ----------------------------
 抄一份的下场不是报错，是**两边悄悄分家**：规范里加了 ``11_AUDIO/``，
 面板这份还是老清单，少掉的那一格要么显示成"缺"，要么干脆不出现，
-而两处谁都不报错。所以本模块用 :func:`load_spec` 把那份 ``project.py``
+而两处谁都不报错。所以本模块用 :func:`load_spec` 把那份 ``projects_spec.py``
 **原样载入**来用（它只 import os/re/datetime，能独立载入）：落点、种子空表、
 阶段判据、建项目、体检全都是**它的**代码。这里只做三件事：
 
@@ -47,11 +50,9 @@ from .novels import MANJU_REL, MAX_TEXT_BYTES, NovelsError, decode_text
 #: 项目根落在 manju/ 下的哪一级（与 ``manju/novel/`` 同级）。
 PROJECT_SUBDIR = "projects"
 
-#: 工作流目录名。项目根与它**同父**（``manju/{AI漫剧智能体工作流,novel,projects}``）。
-WORKFLOW_DIRNAME = "AI漫剧智能体工作流"
-
-#: 事实源：工作流里那份 ``project.py``（``PROJECT_DIRS`` 所在处）。
-SPEC_REL = Path(WORKFLOW_DIRNAME) / "07-智能体运行时" / "src" / "project.py"
+#: 事实源的文件名：与本模块**同一个包**里的 ``projects_spec.py``（``PROJECT_DIRS`` 所在处）。
+#: 从 ``__file__`` 定位，不认工作目录 —— 宿主进程起在哪，跟包放在哪没关系。
+SPEC_NAME = "projects_spec.py"
 
 #: 面板里能点开读的后缀。剧本/设定/台账/分镜表都是这些；音视频与图片不在这条通道上 ——
 #: 面板不做播放器，读了也只能给出一堆乱码，"能点但没用"的按钮比没有更糟。
@@ -159,7 +160,7 @@ def scope_order(spec: Any) -> tuple[str, ...]:
     # 只有极老的规范才没有 SCOPE_ORDER —— 显式报错，不静默用一份写死的顺序顶上。
     raise ProjectsError(
         "事实源里没有 SCOPE_ORDER：粒度没有显示顺序，面板会把它摆成随机顺序。"
-        f"请在 {SPEC_REL} 里补上（SCOPE_ORDER = (SCOPE_WHOLE, SCOPE_EPISODE, SCOPE_MIXED)）。"
+        f"请在事实源（{SPEC_NAME}）里补上（SCOPE_ORDER = (SCOPE_WHOLE, SCOPE_EPISODE, SCOPE_MIXED)）。"
     )
 
 
@@ -176,29 +177,76 @@ def default_project_dir(comfyui_dir: str | os.PathLike[str]) -> Path:
     return Path(comfyui_dir).expanduser().resolve() / MANJU_REL / PROJECT_SUBDIR
 
 
-def default_spec_path(project_dir: str | os.PathLike[str]) -> Path:
-    """默认的事实源路径：项目根的**同级**目录里那份 ``project.py``。
+def default_spec_path() -> Path:
+    """默认的事实源路径：与本模块**同包**的 ``projects_spec.py``。
 
-    实测布局 ``<ComfyUI>/custom_nodes/comfy_studio/manju/{AI漫剧智能体工作流,novel,projects}``：
-    项目根与工作流同父，所以从项目根往上退一级就能找到它 —— 既不必知道 ComfyUI 装在哪，
-    也不必写死盘符。找不到时由 :func:`load_spec` 明确报错（不静默降级成"没有落点清单"）。
+    这里刻意**不再从项目根反推**。老做法是"项目根往上退一级，去工作流检出里找
+    ``07-智能体运行时/src/project.py``"—— 那条路径的失效模式不是报错，是
+    **换了台机器就静默没有落点清单**：工作流检出不在时，面板上就是一片空白，
+    而没有任何一处说得出为什么。包内自持之后，事实源与用它的代码同生共死。
+
+    要从外部换一份实现，走 :class:`ProjectLibrary` 的 ``spec_path`` 参数
+    （CLI 上是 ``--spec``），不要改这里的默认值。
     """
-    return Path(project_dir).expanduser().resolve().parent / SPEC_REL
+    return Path(__file__).resolve().parent / SPEC_NAME
+
+
+#: ``scan_project`` 必须给出的键。缺一个就**当面指名** —— 既不要 KeyError，也不要
+#: 静默取个默认值："事实源不合约"和"这个项目坏了"是两句完全不同的话，面板要能分开说。
+#: ``files`` / ``mtime`` 在契约里，是因为它们**必须由同一次遍历算出来**：让调用方再各走
+#: 一遍全树，就是把"同一棵树走几遍"这件事重新交回给每个调用点。
+SCAN_KEYS = ("path", "missing", "legacy", "stages", "files", "mtime")
+
+
+def _require_scan_keys(res: Any, spec_path: Path) -> None:
+    """核对 ``scan_project`` 的返回契约，不合就抛 :class:`ProjectsError`。"""
+    if not isinstance(res, dict):
+        raise ProjectsError(
+            f"事实源 {spec_path} 的 scan_project 要回一个 dict，收到的是 {type(res).__name__}。"
+        )
+    absent = [key for key in SCAN_KEYS if key not in res]
+    if absent:
+        raise ProjectsError(
+            f"事实源 {spec_path} 的 scan_project 少返回了 {absent}；"
+            f"契约是 {list(SCAN_KEYS)} 全给（见 projects_spec.scan_project）。"
+        )
+
+
+def _packaged_spec() -> Any:
+    """包内那份事实源（:mod:`comfy_studio.projects_spec`）。
+
+    默认路径下**直接 import**，不再走 :func:`load_spec` 的"按路径执行"：两者是同一份
+    代码，但按路径执行要多解析一次源码、多建一个模块对象，而 :meth:`ProjectLibrary.spec`
+    在 ``projects/list`` 这条热路径上**每部剧**都要过一遍。
+
+    导不进来时报错而不是降级 —— 降级成"没有落点清单"正是这个模块开头要防的那种失败。
+    """
+    try:
+        from . import projects_spec
+    except ImportError as err:
+        raise ProjectsError(
+            f"载不了包内的事实源 {SPEC_NAME}：{err}。这是安装不完整，不是项目有问题。"
+        ) from err
+    return projects_spec
 
 
 def load_spec(path: str | os.PathLike[str]) -> Any:
-    """把 manju 那份 ``src/project.py`` 当模块载入，回模块对象。
+    """把一份 ``projects_spec.py`` 当模块载入，回模块对象。
 
     ``PROJECT_DIRS`` 这类清单一旦在本模块里再抄一份，两边迟早分家，而且**分家不报错**
     （详见模块开头）。那份文件只 import os/re/datetime、没有包内相对导入，
-    所以用 ``importlib`` 从一个路径直接执行是安全的。
+    所以用 ``importlib`` 从一个路径直接执行是安全的 —— 这条在它变成包内模块之后
+    仍然保留，正是为了 ``--spec <路径>`` 能指向包外的一份**替换**实现（测试就这么做）。
+
+    默认那份**不走这里**：见 :meth:`ProjectLibrary.spec` —— 同包模块直接拿来用，
+    省掉一次重复解析与执行。
     """
     target = Path(path).expanduser()
     if not target.is_file():
         raise ProjectsError(
             f"找不到项目规范的事实源：{target}\n"
-            "它随仓库一起在（AI漫剧智能体工作流/07-智能体运行时/src/project.py）。"
-            "开发时用 --comfyui-dir 指到你的 ComfyUI 检出上，或用 --project-dir 直接给项目根。"
+            f"默认那份随宿主包一起在（{SPEC_NAME}，与本模块同目录）；"
+            "只有显式给了 --spec / spec_path 才会去别处找。"
         )
     spec = importlib.util.spec_from_file_location("comfy_studio_manju_project_spec", target)
     if spec is None or spec.loader is None:
@@ -269,15 +317,6 @@ def _scope_title(scope: str) -> str:
     return scope or "粒度未知"
 
 
-def _count_files(root: Path) -> int:
-    """项目里有多少个真文件（``.gitkeep`` 不算 —— 那是空目录的占位，不是资料）。"""
-    total = 0
-    for _dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d != "__pycache__"]
-        total += sum(1 for name in filenames if name != ".gitkeep")
-    return total
-
-
 def _list_files(
     root: Path,
     *,
@@ -338,21 +377,6 @@ def _file_row(base: Path, path: Path) -> dict[str, Any]:
     }
 
 
-def _latest_mtime(root: Path) -> float:
-    """项目里最近一次改动（0 表示查不到）。"""
-    newest = 0.0
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d != "__pycache__"]
-        for name in filenames + ["."]:
-            if name == ".gitkeep":
-                continue
-            try:
-                newest = max(newest, os.stat(os.path.join(dirpath, name)).st_mtime)
-            except OSError:
-                continue
-    return newest
-
-
 # ─────────────────────────────────────────────────────────────
 # 一、项目根上的五个动作
 # ─────────────────────────────────────────────────────────────
@@ -370,9 +394,10 @@ class ProjectLibrary:
         spec_path: str | os.PathLike[str] | None = None,
     ) -> None:
         self.directory = Path(directory).expanduser().resolve()
-        self.spec_path = (
-            Path(spec_path).expanduser().resolve() if spec_path else default_spec_path(self.directory)
-        )
+        #: ``None`` = 用包内那份（直接 import）；给了就在 :meth:`spec` 里按路径载入。
+        self._spec_override = Path(spec_path).expanduser().resolve() if spec_path else None
+        #: 给人看/给 ``host/info`` 看的事实源路径（默认那份也在包内）。
+        self.spec_path = self._spec_override or default_spec_path()
         #: 事实源模块（懒载入一次，见 :meth:`spec`）；载不上就把原因留在 ``_spec_error``。
         self._spec: Any = None
         self._spec_error = ""
@@ -380,10 +405,14 @@ class ProjectLibrary:
     # ---- 事实源 ---------------------------------------------------------
 
     def spec(self) -> Any:
-        """那份 ``project.py``；载不上抛 :class:`ProjectsError`（带上原文与修法）。"""
+        """那份 ``projects_spec``；载不上抛 :class:`ProjectsError`（带上原文与修法）。"""
         if self._spec is None and not self._spec_error:
             try:
-                self._spec = load_spec(self.spec_path)
+                self._spec = (
+                    load_spec(self._spec_override)
+                    if self._spec_override is not None
+                    else _packaged_spec()
+                )
             except ProjectsError as err:
                 self._spec_error = str(err)
         if self._spec is None:
@@ -446,8 +475,14 @@ class ProjectLibrary:
     # ---- 体检 -----------------------------------------------------------
 
     def _summary(self, path: Path, spec: Any) -> dict[str, Any]:
-        """一部剧的现状（列表与详情共用）。阶段判据整个交给 ``spec.scan_project``。"""
+        """一部剧的现状（列表与详情共用）。阶段判据整个交给 ``spec.scan_project``。
+
+        ``files`` / ``mtime`` **直接取它那一遍遍历的结果**，不再自己各走一遍全树。
+        口径由事实源保证（``projects_spec.PRUNE_DIRS`` / ``_seed_rel_paths``）——
+        这里要是再算一遍，两边一旦有出入又是"两处维护"。
+        """
         res = spec.scan_project(str(path))
+        _require_scan_keys(res, self.spec_path)
         stages = []
         done = 0
         for label, rel, hits in res["stages"]:
@@ -465,13 +500,13 @@ class ProjectLibrary:
         return {
             "name": path.name,
             "path": str(path),
-            "files": _count_files(path),
+            "files": res["files"],
             "missing": list(res["missing"]),
             "missing_count": len(res["missing"]),
             "stages": stages,
             "stages_done": done,
             "stages_total": len(stages),
-            "mtime": _latest_mtime(path),
+            "mtime": res["mtime"],
         }
 
     def list(self, name: Any = None, limit: Any = None) -> dict[str, Any]:
@@ -975,11 +1010,12 @@ __all__ = [
     "PROJECT_SHELVES",
     "PROJECT_SUBDIR",
     "PROJECT_SUFFIXES",
+    "SPEC_NAME",
     "ProjectLibrary",
     "ProjectsClient",
     "ProjectsError",
     "ProjectsServerConfig",
-    "WORKFLOW_DIRNAME",
+    "SCAN_KEYS",
     "default_project_dir",
     "default_spec_path",
     "load_spec",

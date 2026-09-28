@@ -6,11 +6,15 @@
 
 两组夹具，各钉一件事：
 
-* :data:`FAKE_SPEC` —— 临时目录里放一份**最小** ``project.py``，用来钉本模块**自己**的行为
-  （分格、越界、编码、登记原著、建完不覆盖）。规范那边改了内容，这组用例照样该过。
-* :class:`RealSpecTest` —— 按 ``__file__`` 往上找到仓库里那份**真** ``project.py``，
-  钉"面板的格子没漏掉任何一个落点"（:func:`shelf_gaps` 为空）。这条**只在检出里有它时跑**，
-  跳过时会打印原因：那种"存在才跑"却一声不吭的用例，是永远不跑还没人发现的用例。
+* :data:`FAKE_SPEC` —— 临时目录里放一份**最小** ``projects_spec.py``，用来钉本模块**自己**的
+  行为（分格、越界、编码、登记原著、建完不覆盖）。规范那边改了内容，这组用例照样该过。
+* :class:`RealSpecTest` —— 直接拿**包内那份真规范**（``default_spec_path()``），钉"面板的
+  格子没漏掉任何一个落点"（:func:`shelf_gaps` 为空）。这条**不许跳过**。
+
+  它过去写成"按 ``__file__`` 往上找到检出里那份 ``project.py``，没有就 skipTest" ——
+  而那份文件后来**真的**不在检出里了，于是这道唯一的守卫生效方式变成了留一个绿色的
+  "skipped"。这正是本文件开头警告的那种用例：**存在才跑，于是永远不跑**。事实源搬进
+  包内之后，它没有任何跳过的理由了。
 """
 
 from __future__ import annotations
@@ -21,14 +25,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from comfy_studio import projects as projects_module
 from comfy_studio.mcp import McpError, McpHub
 from comfy_studio.novels import MANJU_REL
 from comfy_studio.projects import (
     MAX_TREE_FILES,
     PROJECT_SHELVES,
     PROJECT_SUBDIR,
-    SPEC_REL,
-    WORKFLOW_DIRNAME,
+    SPEC_NAME,
     ProjectLibrary,
     ProjectsClient,
     ProjectsError,
@@ -118,6 +122,15 @@ def scan_project(name_or_path):
     path = name_or_path
     missing = [rel for rel in PROJECT_DIRS
                if not os.path.isdir(os.path.join(path, rel.replace("/", os.sep)))]
+    total = 0
+    newest = 0.0
+    for dirpath, dirnames, filenames in os.walk(path):
+        dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+        for fn in filenames:
+            if fn == ".gitkeep":
+                continue
+            total += 1
+            newest = max(newest, os.stat(os.path.join(dirpath, fn)).st_mtime)
     stages = []
     for label, rel, exts in _STAGES:
         full = os.path.join(path, rel.replace("/", os.sep))
@@ -129,7 +142,8 @@ def scan_project(name_or_path):
                         continue
                     hits.append(os.path.join(dirpath, fn))
         stages.append((label, rel, hits))
-    return {"path": path, "missing": missing, "stages": stages}
+    return {"path": path, "missing": missing, "legacy": [], "stages": stages,
+            "files": total, "mtime": newest}
 '''
 
 
@@ -157,12 +171,12 @@ class ProjectsLibraryTest(unittest.TestCase):
         # 不许出现哪台机器的盘符（见仓库根 README「不写死路径」那条）。
         self.assertEqual(default_project_dir(self.repo), self.repo / "custom_nodes/comfy_studio/manju/projects")
         self.assertEqual(PROJECT_SUBDIR, "projects")
-        self.assertEqual(WORKFLOW_DIRNAME, "AI漫剧智能体工作流")
-        # 事实源在项目根的**同级**：往上退一级就能找到它，不用知道 ComfyUI 装在哪。
-        spec = default_spec_path(self.root)
-        self.assertEqual(spec.parent.parts[-2:], ("07-智能体运行时", "src"))
-        self.assertEqual(spec.name, "project.py")
-        self.assertEqual(spec.relative_to(self.repo).parts[0], "custom_nodes")
+        # 事实源与 projects 模块**同包**：从 __file__ 定位 —— 不用知道 ComfyUI 装在哪，
+        # 也不许受当前工作目录影响（换台机器、换检出照样成立）。
+        spec = default_spec_path()
+        self.assertEqual(spec.name, SPEC_NAME)
+        self.assertEqual(spec.parent, Path(projects_module.__file__).resolve().parent)
+        self.assertTrue(spec.is_file(), f"默认那份事实源必须随包一起在：{spec}")
 
     def test_missing_spec_is_reported_not_swallowed(self) -> None:
         library = ProjectLibrary(self.root, spec_path=self.root / "没有这份.py")
@@ -523,22 +537,24 @@ class ProjectsToolTableTest(unittest.IsolatedAsyncioTestCase):
 
 
 class RealSpecTest(unittest.TestCase):
-    """对仓库里那份**真**规范：面板的格子必须一个落点都不漏。
+    """对**真**那份规范：面板的格子必须一个落点都不漏，种子空表必须都在。
 
-    这条是"两处清单分家"的唯一机械守卫（分家不报错，只能靠它报）。
-    检出里没有那份文件时跳过，并且**打印原因**。
+    这是"两处清单分家"的唯一机械守卫（分家不报错，只能靠它报），所以它**不许跳过**。
     """
 
     def setUp(self) -> None:
-        self.repo = Path(__file__).resolve().parents[4]
-        self.comfyui = self.repo / "ComfyUI"
-        self.spec_path = default_spec_path(default_project_dir(self.comfyui))
-        if not self.spec_path.is_file():
-            self.skipTest(f"检出里没有那份规范，跳过：{self.spec_path}")
+        self.spec_path = default_spec_path()
+        self.assertTrue(
+            self.spec_path.is_file(),
+            f"包内事实源必须随包一起在，否则面板在真机器上会'没有落点清单'：{self.spec_path}",
+        )
 
-    def test_the_default_spec_path_finds_the_real_one(self) -> None:
-        # 默认探测法（项目根往上退一级）必须真的指到它：否则面板在真机器上会"没有落点清单"。
-        self.assertEqual(self.spec_path, self.comfyui / MANJU_REL / SPEC_REL)
+    def test_the_default_spec_path_is_the_packaged_one(self) -> None:
+        # 默认事实源必须与 projects 模块同一个包：不能靠往上退目录猜（那条路径一旦
+        # 猜空就是"没有落点清单"），也不能因为当前工作目录不同而指到别处。
+        self.assertEqual(self.spec_path.parent, Path(projects_module.__file__).resolve().parent)
+        self.assertEqual(self.spec_path.name, SPEC_NAME)
+        self.assertEqual(ProjectLibrary(Path(tempfile.gettempdir())).spec_path, self.spec_path)
 
     def test_shelves_cover_every_drop_point_of_the_real_spec(self) -> None:
         spec = load_spec(self.spec_path)
@@ -547,6 +563,30 @@ class RealSpecTest(unittest.TestCase):
         self.assertEqual(shelf_unknown(dirs), (), "面板的格子里写了规范里没有的落点")
         self.assertGreaterEqual(len(dirs), 11)
         self.assertIn("00_PROJECT/01_剧本", dirs)
+
+    def test_every_seed_file_has_a_template_on_disk(self) -> None:
+        # 自持之后，"模板在不在"也是这条守卫的一部分：`SEED_FILES` 指的空表必须真能在
+        # 包内找到，否则**建项目**会在第一步就抛 —— 而那是只有用户才会撞见的那一步。
+        spec = load_spec(self.spec_path)
+        template_dir = Path(spec.TEMPLATE_DIR)
+        self.assertTrue(template_dir.is_dir(), f"模板目录不在：{template_dir}")
+        absent = tuple(src for src, _dst in spec.SEED_FILES
+                       if not (template_dir / src).is_file())
+        self.assertEqual(absent, (), "种子空表的模板缺了，建项目会当场失败")
+
+    def test_seed_files_never_land_inside_a_stage_drop_point(self) -> None:
+        # 体检里"这份文件还算空表吗"只检查种子文件（省掉读每一个产物）。这条断言钉死
+        # 那个优化的**前提**：种子路径与任何阶段的 check_dirs 都不重叠。哪天有人把种子
+        # 放进 check_dirs，那条优化就不再等价 —— 这里会先炸。
+        spec = load_spec(self.spec_path)
+        seeds = [dst for _src, dst in spec.SEED_FILES]
+        claimed = [rel for _label, rels, _exts in spec.STAGE_OUTPUTS for rel in rels]
+        for seed in seeds:
+            for rel in claimed:
+                self.assertFalse(
+                    seed == rel or seed.startswith(rel + "/"),
+                    f"种子 {seed} 落进了阶段落点 {rel} —— 体检里'跳过空表'那条优化不再等价",
+                )
 
 
 class ProjectsRpcTest(unittest.TestCase):
