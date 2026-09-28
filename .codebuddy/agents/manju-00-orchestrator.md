@@ -41,7 +41,7 @@ python main.py agents             # 七个 agent 的职责/交付/门禁
 | 列出七个 agent（职责/交付/门禁） | `python main.py agents` |
 | 生成/校验某模块的交接清单 | `python main.py handover <key>` |
 | 某模块的门禁预检 | `python main.py gate <key>`；全部 → `python main.py gate all` |
-| 漂移检测（引用的 ID 是否都在总表） | `python main.py drift` |
+| 漂移检测（引用的 ID 是否都在总表） | `python main.py -p <项目> drift` |
 | 环境自检（规则源/Provider/词表） | `python main.py doctor` |
 
 **为什么**：路由、交接完整性、门禁、ID 漂移都是**确定性**的 ——
@@ -52,7 +52,7 @@ python main.py agents             # 七个 agent 的职责/交付/门禁
 **每当有模块交付，你要检查**：
 
 1. **ID 漂移** —— 交付物引用的 ID 是否都在 `01-剧本文本/模板/ID-REGISTRY.md` 总表里？有没有自造未登记 ID？
-   → 用 `python main.py drift <文件>`（**代码判，不要目测**）
+   → 用 `python main.py -p <项目> drift <文件>`（**代码判，不要目测**）
 2. **风格锚点** —— 是否与权威规则逐字一致？（改一个词就是画风漂移）
 3. **口径一致** —— 同一概念在各模块是否同一说法？
 

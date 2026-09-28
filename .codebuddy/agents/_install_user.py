@@ -107,7 +107,7 @@ def _rules(abs_root: str) -> list[tuple[str, str]]:
         (SPEC_REL, f"{abs_root}/{SPEC_REL}"),           # `智能体搭建参考md/…`
         # ⚠️ 生成脚本在 **agents 根**（= 仓库根）下，不在数据根下 —— 它是本目录的邻居。
         (BUILD_REL, f"{REPO_ROOT.as_posix()}/{BUILD_REL}"),
-        (RUN_REL, f"{wf}/{RUN_REL}"),                   # 裸写法 `07-智能体运行时/assets/`
+        (RUN_REL, f"{wf}/{RUN_REL}"),                   # 裸写法 `07-智能体运行时/main.py`
     ]
     return sorted(pairs, key=lambda kv: len(kv[0]), reverse=True)
 

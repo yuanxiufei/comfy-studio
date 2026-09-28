@@ -49,7 +49,7 @@ python main.py handover script         # 该交给下游什么
 | 登记角色/场景/道具 ID | 写进 `ID-REGISTRY.md` 总表（**格式见 `00-总控路由.md` §四**） |
 | 门禁自检 | `python main.py gate script` |
 | 交付校验 | `python main.py handover script` |
-| 与下游对 ID | `python main.py drift <你的交付物>` |
+| 与下游对 ID | `python main.py -p <项目> drift <你的交付物>` |
 
 # 产物落在哪
 

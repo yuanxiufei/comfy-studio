@@ -55,7 +55,7 @@ python main.py handover storyboard
 | 取主控规则与九列定义 | `doc 03-分镜导演/视觉分镜引擎.md` |
 | 找镜头技法（景别/运镜/构图） | `03-分镜导演/引擎/镜头技法扩充库.md`（按需读某节，别整份塞进来） |
 | 用户镜头号 ↔ `SHT_` 映射 | 按主控要求产出**映射表**（用户说"第 3 镜"要能对上 `SHT_`） |
-| 引用的 ID 是否正确 | `python main.py drift <你的分镜表>` |
+| 引用的 ID 是否正确 | `python main.py -p <项目> drift <你的分镜表>` |
 | 门禁自检 / 交付校验 | `python main.py gate storyboard` · `handover storyboard` |
 
 # 产物落在哪

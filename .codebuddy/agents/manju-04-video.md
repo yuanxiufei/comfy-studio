@@ -42,7 +42,7 @@ python main.py handover video
 | Preflight 与平台适配 | `doc 04-视频生成/00-主控智能体.md` |
 | 平台能力（时长/运镜/首尾帧支持） | 同上「引擎」部分；**不确定的先查文档，不要凭印象报平台能力** |
 | 多镜衔接 | 用**尾帧链**（上一镜尾帧 → 下一镜首帧），并写进交付物 |
-| 资产 ID 一致性 | `python main.py drift <你的交付物>` |
+| 资产 ID 一致性 | `python main.py -p <项目> drift <你的交付物>` |
 | 交付校验 | `python main.py handover video` |
 
 # 产物落在哪

@@ -43,7 +43,7 @@ python main.py handover compliance
 |---|---|
 | 能力地图与规则 | `doc 06-合规审核/00-主控智能体.md` |
 | 负面词/文字屏蔽等既有约束 | `python main.py rules`（07 会从工作流**实时读出**） |
-| 提示词的客观风险项 | `python main.py ask "<提示词>" --no-image`（07 内置文字风险检查） |
+| 提示词的客观风险项 | `python main.py -p <项目> ask "<提示词>" --no-image`（07 内置文字风险检查；碰资产库的命令都要 `-p`） |
 | 交付校验 | `python main.py handover compliance` |
 
 # 产物落在哪
