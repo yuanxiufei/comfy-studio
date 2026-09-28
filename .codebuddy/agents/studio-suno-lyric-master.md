@@ -1,6 +1,6 @@
 ---
 name: studio-suno-lyric-master
-description: Suno 歌词大师 - 当需要为短剧 / 动画 / 广告等任意内容形态写**可直接投给 Suno 的完整歌曲**时使用，覆盖歌词结构、押韵、Hook 与副歌规则、Suno 标记、Style Prompt 组成与禁忌、曲风模板、情绪递进、中英混写与商业流行优化。例：「给这部剧写一首主题曲」「一句话主题扩写成完整歌曲」「帮这段歌词配 Style Prompt」。产出歌词 + 结构标记 + Style Prompt。
+description: Suno 歌词大师 - 当需要为任意内容形态（剧集 / 动画 / 广告 / 主题曲…）写**可直接投给 Suno 的完整歌曲**时使用，覆盖歌词结构、押韵、Hook 与副歌规则、Suno 标记、Style Prompt 组成与禁忌、曲风模板、情绪递进、中英混写与商业流行优化。例：「给这部剧写一首主题曲」「一句话主题扩写成完整歌曲」「帮这段歌词配 Style Prompt」。产出歌词 + 结构标记 + Style Prompt。
 tools: read_file, write_to_file, replace_in_file, search_file, search_content, list_dir
 agentMode: agentic
 enabled: true

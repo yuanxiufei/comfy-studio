@@ -10,12 +10,12 @@ r"""把本目录（`.codebuddy/agents/`）的子智能体**安装到 CodeBuddy �
 
   ① **标注派生关系**：写明权威源与重装命令，防止有人直接改用户级那份
      （改了会在下次安装时**静默丢失**）；
-  ② **声明自包含**：这 6 个 agent 的正文把规则**全文内联**，不引用本仓库任何路径 ——
+  ② **声明自包含**：这 7 个 agent 的正文把规则**全文内联**，不引用本仓库任何路径 ——
      正因如此，安装**不需要**做任何路径绝对化：`render` 只加一段注记，一个字都不改正文。
 
 ⚠️ 从前这里有一套「路径绝对化」（相对写法 → 机器绝对路径 + `cd /d` 改写），服务的对象是
 那批**联动型** agent（`manju-0N-*`：只给规则路径、真干活靠本仓库 `07-智能体运行时/` 的代码）。
-它们随引擎侧 `AI漫剧智能体工作流/` 一并删除后，用户级只剩自包含的这 6 个，
+它们随引擎侧 `AI漫剧智能体工作流/` 一并删除后，用户级只剩自包含的这 7 个，
 那套机制**再无对象** —— 留着反而危险（它会把正文里偶然出现的路径串改写成机器路径）。
 故已整体移除，只留下一条**反向守卫**：正文里出现本仓库路径就报错（见 :data:`REPO_PATH`）。
 
@@ -82,7 +82,7 @@ def render(src: Path) -> tuple[str, int]:
     ⭐ 安装与 `--校验` **共用这一份** —— 否则"校验用的算法"与"安装用的算法"
     会各自漂移，校验就成了摆设。
 
-    ⚠️ **不改正文**：只把注记插在 frontmatter 之后。自包含是这 6 份的既有性质，
+    ⚠️ **不改正文**：只把注记插在 frontmatter 之后。自包含是这 7 份的既有性质，
     这里只负责**核对**它（见 :data:`REPO_PATH`），不负责"改造成自包含"。
     """
     text = src.read_text(encoding="utf-8").replace("\r\n", "\n").rstrip() + "\n"
@@ -95,7 +95,11 @@ def render(src: Path) -> tuple[str, int]:
     # ⚠️ 「自包含」说的是**规格正文**（那份要能整份带走）；而 `_build.py` 注入的出处注记
     #    以 `> 生成自 ` 开头，它里面**必须**写仓库落点（那是它的用处）—— 核对前先剥掉，
     #    否则每个文件都会被自己那行出处判红。
-    spec = body
+    # ⚠️ frontmatter 与注记之间隔着一个**空行**，所以 `body` 的第一个字符是 `\n`：
+    #    核对前必须先 `lstrip("\n")`，否则 `startswith("> 生成自 ")` 恒为假、注记剥不掉，
+    #    7 个文件会被各自那行出处**全部**判红（2026-09-28 实测：报的首个是
+    #    `studio-asset-library.md` 位置 8，恰好是注记里那个 `Comfy-Desktop/`）。
+    spec = body.lstrip("\n")
     if spec.startswith("> 生成自 "):
         cut = spec.find("\n\n")
         spec = spec[cut + 2:] if cut != -1 else spec
@@ -224,7 +228,7 @@ def main() -> int:
     print()
     rc = install(files, dest_dir, a.preview)
     if not a.preview:
-        print("  ⚠️ 用户级 agent 对本机**所有项目**生效；这 6 份自包含，换项目不用改一个字")
+        print("  ⚠️ 用户级 agent 对本机**所有项目**生效；这 7 份自包含，换项目不用改一个字")
         print("  校验（项目级）：cd ComfyUI/custom_nodes && python -m unittest "
               "comfy_studio.tests.test_agent_presets -t .")
         print("  校验（用户级）：python .codebuddy/agents/_install_user.py --校验")

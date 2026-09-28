@@ -34,6 +34,11 @@
 ``novels/search``        ``{name, query, limit?}`` → 这串字在原文里的位置（面板据此跳过去）
 ``novels/import``        ``{path, name?, overwrite?}`` → 把本机一份 txt/md 接进原文目录
 ``novels/delete``        ``{name}`` → 删掉一篇原文（面板先问一次再调它）
+``pipeline/plan``        ``{name, novel?, episodes?}`` → 这一部剧的 S0–S7 计划
+                         （谁做 · 产出落哪 · 哪几段还要引擎侧渲染；不调模型、不落盘）
+``pipeline/run``         ``{name, novel?, episodes?, from?, to?, force?}`` → 跑流水线；
+                         过程中推 ``pipeline/event`` 通知（与 ``agent/event`` 一个路子）
+``pipeline/state``       ``{name}`` → 进度账：哪一段跑过、产物是哪一份
 ======================  ==============================================
 
 ``agent/canvas_result`` / ``agent/answer`` / ``agent/plan_result`` 是三条「回程」：桌面壳要
@@ -97,6 +102,14 @@ from .novels import (
     NovelLibrary,
     NovelsError,
     default_novel_dir,
+    resolve_novel,
+)
+from .pipeline import (
+    NovelToVideoPipeline,
+    PipelineClient,
+    PipelineError,
+    plan_payload,
+    state_payload,
 )
 from .plan import PlanChannel, PlanClient
 from .projects import (
@@ -333,6 +346,9 @@ class StudioHost:
         self.server.on("projects/create", self.projects_create)
         self.server.on("projects/link_novel", self.projects_link_novel)
         self.server.on("projects/brief", self.projects_brief)
+        self.server.on("pipeline/plan", self.pipeline_plan)
+        self.server.on("pipeline/run", self.pipeline_run)
+        self.server.on("pipeline/state", self.pipeline_state)
 
     # ---- 方法 -----------------------------------------------------------
 
@@ -1301,6 +1317,106 @@ class StudioHost:
         except ProjectsError as err:
             raise RpcError(INTERNAL_ERROR, str(err)) from err
 
+    # ---- 从小说到视频的流水线 -------------------------------------------
+
+    def _pipeline_novel_path(self, name: str | None) -> str | None:
+        """把面板给的原文名还原成文件路径；没给就回 None（不挂原著）。
+
+        「按名字取原文」这条规则**只有一份**（:func:`comfy_studio.novels.resolve_novel`）：
+        面板这条 RPC 与对话里的 ``pipeline__run`` 共用它 —— 两边各写一份的话，"哪种名字算
+        存在"就会慢慢分家，而分家时不报错，只是某一边安静地取不到书。不自己拼路径：越界那类
+        （``../``、绝对路径、隐藏项）由原文库统一挡（``NovelLibrary._resolve``）。
+        """
+        if name is None:
+            return None
+        if self.novels is None:
+            raise RpcError(
+                INVALID_PARAMS, "宿主没挂原文目录，没法按名字取原文；要么别传 novel，要么先配好原著库"
+            )
+        try:
+            return resolve_novel(self.novels, name)
+        except NovelsError as err:
+            raise RpcError(INVALID_PARAMS, str(err)) from err
+
+    def _make_pipeline(
+        self, args: dict[str, Any], method: str, *, config: LLMConfig | None
+    ) -> NovelToVideoPipeline:
+        """按 RPC 参数造一台流水线。**不跑** —— 跑不跑由调用方决定。"""
+        novel = args.get("novel")
+        if novel is not None and not isinstance(novel, str):
+            raise RpcError(INVALID_PARAMS, "novel 必须是字符串（原文库里的名字）")
+        episodes = _int_param(args, "episodes", DEFAULT_EPISODES, low=1, high=9999, method=method)
+        try:
+            return NovelToVideoPipeline(
+                _text(args, "name"),
+                self._pipeline_novel_path(novel),
+                config=config,
+                episodes=episodes,
+            )
+        except PipelineError as err:
+            raise RpcError(INTERNAL_ERROR, str(err)) from err
+
+    @staticmethod
+    def _pipeline_slice(
+        args: dict[str, Any],
+    ) -> tuple[str | None, str | None, bool]:
+        """``from`` / ``to`` / ``force`` 三个开关。形状不对就在 RPC 这层挡掉。"""
+        picked: list[str | None] = []
+        for key in ("from", "to"):
+            value = args.get(key)
+            if value is not None and not isinstance(value, str):
+                raise RpcError(INVALID_PARAMS, f"{key} 必须是阶段代码（S0–S7）")
+            picked.append(value)
+        force = args.get("force")
+        if force is not None and not isinstance(force, bool):
+            raise RpcError(INVALID_PARAMS, "force 必须是布尔值")
+        return picked[0], picked[1], bool(force)
+
+    def pipeline_plan(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
+        """这一部剧的 S0–S7 计划：谁做、产出落哪、哪几段还要引擎侧渲染。
+
+        **不调模型、不落盘** —— 面板点开就能看，不会因为看一眼就花钱。
+        形状由 :func:`comfy_studio.pipeline.plan_payload` 定，**与对话里的 ``pipeline__plan``
+        同一份** —— 各写一份的失效模式是"面板说还差 S4、模型说跑完了"，而它不报错。
+        """
+        args = _object(params, "pipeline/plan")
+        pipeline = self._make_pipeline(args, "pipeline/plan", config=None)
+        try:
+            return plan_payload(pipeline)
+        except PipelineError as err:
+            raise RpcError(INTERNAL_ERROR, str(err)) from err
+
+    def pipeline_state(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
+        """这一部剧的进度账：哪一段跑过、产物是哪一份。形状同样是
+        :func:`comfy_studio.pipeline.state_payload`（``pipeline__plan`` 也只从这一份取它的
+        ``state`` 字段）。"""
+        args = _object(params, "pipeline/state")
+        pipeline = self._make_pipeline(args, "pipeline/state", config=None)
+        try:
+            return state_payload(pipeline)
+        except PipelineError as err:
+            raise RpcError(INTERNAL_ERROR, str(err)) from err
+
+    async def pipeline_run(self, params: Any, ctx: RpcContext) -> dict[str, Any]:
+        """跑一段流水线；进度用 ``pipeline/event`` 推给面板（与 ``agent/event`` 一个路子）。
+
+        模型配置取**当前生效的那一套**（:meth:`_session_config`）—— 与面板聊天同一份，
+        不另开一条取配置的路。取不到就当场报错，不猜一个"大概能用"的。
+        """
+        args = _object(params, "pipeline/run")
+        from_code, to_code, force = self._pipeline_slice(args)
+        config = self._session_config()
+        pipeline = self._make_pipeline(args, "pipeline/run", config=config)
+
+        async def on_event(payload: dict[str, Any]) -> None:
+            await ctx.emit("pipeline/event", payload)
+
+        pipeline.on_event = on_event
+        try:
+            return await pipeline.run(from_code=from_code, to_code=to_code, force=force)
+        except PipelineError as err:
+            raise RpcError(INTERNAL_ERROR, str(err)) from err
+
     # ---- 生命周期 -------------------------------------------------------
 
     def _extra_sources(self) -> tuple[ModelSource, ...]:
@@ -1617,6 +1733,22 @@ class StudioHost:
         self._turns.clear()
 
 
+def _pipeline_tool_config(host_box: list[StudioHost]) -> LLMConfig:
+    """对话里的流水线工具取模型配置那条路：与面板聊天**同一份**
+    （:meth:`StudioHost._session_config`），不另开一条"大概能用"的。
+
+    两种"取不到"都翻成 :class:`~comfy_studio.pipeline.PipelineError`：工具层只认它
+    （见 ``PipelineClient.call_tool`` 的 ``except``）—— 让 :class:`RpcError` 冒出去，它会穿出
+    MCP 循环，用户看到的就不是一句说得清的工具错误，而是一次莫名其妙的调用失败。
+    """
+    if not host_box:  # pragma: no cover - 工具只可能在宿主起来之后被调到
+        raise PipelineError("宿主还没起来，取不到模型配置")
+    try:
+        return host_box[0]._session_config()
+    except RpcError as err:
+        raise PipelineError(str(err)) from err
+
+
 async def serve_stdio(
     configs: list[McpServerConfig],
     request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
@@ -1762,6 +1894,19 @@ async def serve_stdio(
     if projects is not None:
         # 两张只读工具（查项目有什么、一部剧到什么程度）：模型据此接话，但不许替人建项目。
         extra.append(ProjectsClient(projects))
+    # 流水线两张（``pipeline__plan`` 看计划 / ``pipeline__run`` 真去跑）：模型有了它，才能把
+    # "一部小说"一路推到"一套可投产的提示词"，而不只是念面板上的结果。``run`` **自己**会先弹
+    # 一次确认，只有用户明确点头才开跑（见 ``comfy_studio.pipeline`` 里 ``RUN_AGREE`` 那段），
+    # 所以模型替不了人按这个键。这里 host 还没建出来，而"当前生效的那套模型配置"长在 host 上
+    # —— 先用一个盒子占位，host 一建好就填进去：run 只可能在宿主起来之后被调到，那时盒子非空。
+    host_box: list[StudioHost] = []
+    extra.append(
+        PipelineClient(
+            novels=novels,
+            review=review_channel,
+            config_provider=lambda: _pipeline_tool_config(host_box),
+        )
+    )
     hub = McpHub(configs, request_timeout=request_timeout, extra_clients=extra)
     await hub.start()
     host: StudioHost | None = None
@@ -1786,6 +1931,9 @@ async def serve_stdio(
         )
         # stdin 一关（面板退出）就先叫停在飞的轮次，别让退出卡在长任务上。
         host.server.on_close = lambda: host.cancel_turns("宿主退出")
+        # 流水线那张 ``run`` 工具要取"当前生效的模型配置"，而它长在刚建好的 host 上（见上面
+        # 那个 ``host_box`` 的说明）。
+        host_box.append(host)
         names = ", ".join(str(s["name"]) for s in hub.servers())
         print(
             f"[{SERVER_NAME}] MCP server: {names}；工具 {len(hub.tools)} 个",

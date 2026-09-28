@@ -34,6 +34,16 @@ const VIEWS_ID = 'comfy-desktop-studio-views'
 const VIEWS_TITLE_ID = 'comfy-desktop-studio-views-title'
 const VIEWS_BACK_ID = 'comfy-desktop-studio-views-back'
 const PROJECT_VIEW_ID = 'comfy-desktop-studio-project-view'
+const PIPELINE_VIEW_ID = 'comfy-desktop-studio-pipeline-view'
+const PIPELINE_HINT_ID = 'comfy-desktop-studio-pipeline-hint'
+const PIPELINE_OVERVIEW_ID = 'comfy-desktop-studio-pipeline-overview'
+const PIPELINE_LIST_ID = 'comfy-desktop-studio-pipeline-list'
+const PIPELINE_PROJECT_ID = 'comfy-desktop-studio-pipeline-project'
+const PIPELINE_FORM_ID = 'comfy-desktop-studio-pipeline-form'
+const PIPELINE_FORM_TEXT_ID = 'comfy-desktop-studio-pipeline-form-text'
+const PIPELINE_FROM_ID = 'comfy-desktop-studio-pipeline-from'
+const PIPELINE_TO_ID = 'comfy-desktop-studio-pipeline-to'
+const PIPELINE_FORCE_ID = 'comfy-desktop-studio-pipeline-force'
 const PROJECT_HINT_ID = 'comfy-desktop-studio-project-hint'
 const PROJECT_FORM_ID = 'comfy-desktop-studio-project-form'
 const PROJECT_FORM_NAME_ID = 'comfy-desktop-studio-project-form-name'
@@ -137,9 +147,16 @@ describe('getComfyStudioChatContentScript', () => {
 
   type RequestStub = (method: string, params: unknown) => unknown
 
+  /**
+   * 面板的事件订阅挂了**两份**：对话那条（onEvent）与流水线那条（onPipelineEvent，见 start）——
+   * 后者不能挂进前者，因为 onEvent 头一句就是"没有一轮在跑就直接丢"。所以这个桩得把事件喂给
+   * **所有**注册者：只记最后一条的话，后挂的那份会把前一份挤掉，跑起来活像"对话再也收不到
+   * 宿主的通知"，而真正的原因在测试桩里，不在被测代码里。
+   */
   const installBridge = (
     overrides: { status?: unknown; request?: unknown | RequestStub } = {}
   ): StudioBridge => {
+    const listeners: Array<(payload: unknown) => void> = []
     const bridge: StudioBridge = {
       status: vi.fn(() =>
         Promise.resolve(
@@ -156,8 +173,14 @@ describe('getComfyStudioChatContentScript', () => {
         )
       ),
       onEvent: vi.fn((callback: (payload: unknown) => void) => {
-        emit = callback
-        return vi.fn()
+        listeners.push(callback)
+        emit = (payload: unknown): void => {
+          listeners.forEach((listener) => listener(payload))
+        }
+        return vi.fn(() => {
+          const at = listeners.indexOf(callback)
+          if (at >= 0) listeners.splice(at, 1)
+        })
       })
     }
     Reflect.set(window, '__comfyDesktop2', { ComfyStudio: bridge })
@@ -259,7 +282,12 @@ describe('getComfyStudioChatContentScript', () => {
     const bridge = installBridge()
     setupDom()
     new Function(script)()
-    expect(bridge.onEvent).toHaveBeenCalledOnce()
+    // 两份：对话一份、流水线一份（见 start）。流水线那份不能挂在对话那份里 ——
+    // onEvent 头一句是"没有一轮在跑就直接丢"，而流水线跑起来时对话那边根本没在跑。
+    expect(bridge.onEvent).toHaveBeenCalledTimes(2)
+    bridge.onEvent.mock.results.forEach((entry, at) => {
+      expect(typeof entry.value, '第 ' + (at + 1) + ' 份订阅得能单独退掉').toBe('function')
+    })
     const state = Reflect.get(window, '__comfyStudioChat') as { unsubscribe?: () => void }
     expect(typeof state.unsubscribe).toBe('function')
   })
@@ -5485,6 +5513,308 @@ describe('getComfyStudioChatContentScript', () => {
     })
   })
 
+  describe('流水线', () => {
+    /** 宿主 projects/list 里的一行。这一页只借它填下拉，别的栏用不上。 */
+    const projectRow = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+      name: '长夜',
+      path: 'D:/comfy/custom_nodes/comfy_studio/manju/projects/长夜',
+      files: 3,
+      missing: [],
+      missing_count: 0,
+      stages: [],
+      stages_done: 1,
+      stages_total: 1,
+      mtime: 1758900000,
+      ...over
+    })
+
+    const listing = (projects: unknown[]): unknown => ({
+      ok: true,
+      result: {
+        dir: 'D:/comfy/custom_nodes/comfy_studio/manju/projects',
+        exists: true,
+        query: '',
+        matched: projects.length,
+        returned: projects.length,
+        truncated: false,
+        limit: 200,
+        projects
+      }
+    })
+
+    /**
+     * pipeline/plan 里的一段。栏名照 lib/comfy_studio/pipeline.py 的 plan_payload 抄 ——
+     * 面板画的就是那几栏，名字对不上就成了一条永远空着的行。
+     */
+    const stage = (code: string, over: Record<string, unknown> = {}): Record<string, unknown> => ({
+      code,
+      name: code + ' 那一段',
+      owner: 'script',
+      agent: 'studio-script',
+      actor: '剧本智能体',
+      artifact: '落点-' + code,
+      needs_render: false,
+      brief: '',
+      check_dirs: [],
+      check_exts: [],
+      ...over
+    })
+
+    /** 三段的计划：S2 跑完还得回引擎侧出图。 */
+    const planStages = (): Record<string, unknown>[] => [
+      stage('S0'),
+      stage('S1'),
+      stage('S2', { needs_render: true, actor: '分镜智能体' })
+    ]
+
+    const plan = (over: Record<string, unknown> = {}): unknown => ({
+      ok: true,
+      result: {
+        project: '长夜',
+        novel: '长夜.txt',
+        stages: planStages(),
+        state: {},
+        render_required: ['S2'],
+        ...over
+      }
+    })
+
+    /** 只有流水线那几件事走自己的桩；开抽屉时要问的那些保持默认。 */
+    const host =
+      (handlers: Record<string, unknown>): RequestStub =>
+      (method, params) =>
+        method in handlers
+          ? typeof handlers[method] === 'function'
+            ? (handlers[method] as RequestStub)(method, params)
+            : handlers[method]
+          : { ok: true, result: { text: '答案在此' } }
+
+    const view = (id: string): HTMLElement => document.getElementById(id) as HTMLElement
+    const hint = (): HTMLElement => view(PIPELINE_HINT_ID)
+    const tab = (label: string): HTMLButtonElement | undefined =>
+      Array.from(document.querySelectorAll<HTMLButtonElement>(`#${TABS_ID} .cs-tab`)).find(
+        (b) => b.textContent === label
+      )
+    const barButton = (text: string): HTMLButtonElement | null =>
+      Array.from(
+        document.querySelectorAll<HTMLButtonElement>(`#${PIPELINE_VIEW_ID} .cs-proj-bar button`)
+      ).find((b) => b.textContent === text) ?? null
+    const formButton = (text: string): HTMLButtonElement | null =>
+      Array.from(document.querySelectorAll<HTMLButtonElement>(`#${PIPELINE_FORM_ID} button`)).find(
+        (b) => b.textContent === text
+      ) ?? null
+    const card = (code: string): HTMLElement | null =>
+      document.querySelector<HTMLElement>(
+        `#${PIPELINE_LIST_ID} .cs-pipe-stage[data-code="${code}"]`
+      )
+    const cards = (): HTMLElement[] =>
+      Array.from(document.querySelectorAll<HTMLElement>(`#${PIPELINE_LIST_ID} .cs-pipe-stage`))
+    const asks = (bridge: StudioBridge, method: string): unknown[][] =>
+      bridge.request.mock.calls.filter((call: unknown[]) => call[0] === method)
+
+    const openPipeline = async (): Promise<void> => {
+      tab('流水线')?.click()
+      await flush()
+    }
+
+    it('only asks the host once that page is opened', async () => {
+      const bridge = installBridge({
+        request: host({ 'projects/list': listing([projectRow()]) })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      expect(view(PIPELINE_VIEW_ID).style.display).toBe('none')
+      expect(asks(bridge, 'pipeline/plan'), '没打开这一页就别去问它跑到哪儿了').toHaveLength(0)
+
+      await openPipeline()
+
+      expect(view(CHAT_VIEW_ID).style.display).toBe('none')
+      expect(view(PIPELINE_VIEW_ID).style.display).toBe('flex')
+      expect(tab('流水线')?.dataset.active).toBe('true')
+      // 下拉里是宿主 projects/list 那几行（哪个目录算一部戏是宿主判的），默认挑第一部。
+      expect((view(PIPELINE_PROJECT_ID) as HTMLSelectElement).value).toBe('长夜')
+      // 剧目与集数是这一页的下拉给的；原文留空就不带 —— 宿主那边缺省是它自己的默认。
+      expect(bridge.request).toHaveBeenCalledWith('pipeline/plan', { name: '长夜', episodes: 12 })
+    })
+
+    it('paints the stage list exactly as the host reported it', async () => {
+      installBridge({
+        request: host({ 'projects/list': listing([projectRow()]), 'pipeline/plan': plan() })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openPipeline()
+
+      expect(cards().map((one) => one.dataset.code)).toEqual(['S0', 'S1', 'S2'])
+      // 谁做、落点、要不要回引擎侧渲染，全照 plan 那几栏写 —— 面板不自己判一遍。
+      expect(card('S2')?.textContent).toContain('分镜智能体')
+      expect(card('S2')?.textContent).toContain('落点-S2')
+      expect(card('S2')?.textContent).toContain('跑完还要回引擎侧出图/视频/音频')
+      expect(card('S0')?.textContent).not.toContain('跑完还要回引擎侧')
+      // 「哪几段跑完还得渲染」在总览那一行也报一遍：扫一眼就够，不用一段段翻。
+      expect(view(PIPELINE_OVERVIEW_ID).textContent).toContain('S2')
+    })
+
+    it('marks the stages the host recorded as settled', async () => {
+      installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'pipeline/plan': plan({
+            state: { S0: { status: 'done', artifact: '落点-S0', at: 62 } }
+          })
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openPipeline()
+
+      expect(card('S0')?.dataset.status).toBe('done')
+      expect(card('S0')?.textContent).toContain('跑过了')
+      expect(card('S1')?.dataset.status).toBe('todo')
+      expect(card('S1')?.textContent).toContain('还没跑')
+      expect(view(PIPELINE_OVERVIEW_ID).textContent).toContain('跑过了 1/3 段')
+    })
+
+    it('asks before running: how many stages, how many will be skipped', async () => {
+      installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'pipeline/plan': plan({ state: { S0: { status: 'done', artifact: '落点-S0', at: 62 } } })
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openPipeline()
+
+      barButton('开跑…')?.click()
+      await flush()
+
+      expect(view(PIPELINE_FORM_ID).dataset.open).toBe('1')
+      const words = view(PIPELINE_FORM_TEXT_ID).textContent ?? ''
+      expect(words).toContain('共 3 段')
+      expect(words).toContain('算跑过的是 S0')
+      expect(words).toContain('1 段得回引擎侧出图/视频')
+      // 起止两个下拉的选项就是这一趟的段，默认从头跑到尾（与宿主 run 的缺省一致）。
+      expect((view(PIPELINE_FROM_ID) as HTMLSelectElement).value).toBe('S0')
+      expect((view(PIPELINE_TO_ID) as HTMLSelectElement).value).toBe('S2')
+    })
+
+    it('sends the run with the stages the person picked', async () => {
+      const bridge = installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'pipeline/plan': plan(),
+          'pipeline/run': () => new Promise(() => {})
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openPipeline()
+
+      barButton('开跑…')?.click()
+      await flush()
+      const to = view(PIPELINE_TO_ID) as HTMLSelectElement
+      const force = view(PIPELINE_FORCE_ID) as HTMLInputElement
+      to.value = 'S1'
+      force.checked = true
+      formButton('继续跑')?.click()
+      await flush()
+
+      expect(view(PIPELINE_FORM_ID).dataset.open).toBe('0')
+      expect(bridge.request).toHaveBeenCalledWith('pipeline/run', {
+        name: '长夜',
+        episodes: 12,
+        from: 'S0',
+        to: 'S1',
+        force: true
+      })
+      // 跑起来的时候那几颗按钮按下去了：不按，人会以为"再点一下能催它快一点"。
+      expect(barButton('开跑…')?.disabled).toBe(true)
+    })
+
+    it('lights each stage up from the events the host pushes', async () => {
+      const bridge = installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'pipeline/plan': plan(),
+          'pipeline/run': () => new Promise(() => {})
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openPipeline()
+      barButton('开跑…')?.click()
+      await flush()
+      formButton('继续跑')?.click()
+      await flush()
+
+      emit({ params: { type: 'pipeline', phase: 'start', project: '长夜', stages: ['S0', 'S1'] } })
+      emit({ params: { type: 'pipeline', phase: 'stage_start', code: 'S0', actor: '剧本智能体' } })
+      await flush()
+
+      expect(card('S0')?.dataset.status).toBe('running')
+      expect(hint().textContent).toContain('正在跑 S0')
+
+      emit({ params: { type: 'pipeline', phase: 'stage', code: 'S0', status: 'done' } })
+      await flush()
+
+      expect(card('S0')?.dataset.status).toBe('done')
+      expect(card('S0')?.textContent).toContain('跑过了')
+      expect(card('S1')?.dataset.status).toBe('todo')
+
+      // 跑完之后那趟回话才到：这时候按钮得放开，而且计划要重问一遍
+      // —— "现在跑到哪儿了"唯一的事实源是宿主那份进度账，不是这一趟的快照。
+      expect(bridge.request).toHaveBeenCalledWith('pipeline/run', {
+        name: '长夜',
+        episodes: 12,
+        from: 'S0',
+        to: 'S2'
+      })
+    })
+
+    it('ignores pipeline events when nothing is running here', async () => {
+      installBridge({
+        request: host({ 'projects/list': listing([projectRow()]), 'pipeline/plan': plan() })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openPipeline()
+      const before = card('S0')?.dataset.status
+
+      // stage / stage_start 那两条**不带项目名**，没法核对是哪部戏；拿"这一页跑着没有"当门。
+      // 不设这道门，隔壁窗口跑起来的进度会画到这一页上。
+      emit({ params: { type: 'pipeline', phase: 'stage_start', code: 'S0', actor: '剧本智能体' } })
+      await flush()
+
+      expect(card('S0')?.dataset.status).toBe(before)
+    })
+
+    it('says why it cannot plan instead of painting an empty table', async () => {
+      installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'pipeline/plan': { ok: false, error: { code: 'no_project', message: '没有「长夜」' } }
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openPipeline()
+
+      expect(hint().getAttribute('data-tone')).toBe('error')
+      expect(hint().textContent).toContain('没有「长夜」')
+      expect(cards()).toHaveLength(0)
+    })
+  })
+
   describe('键盘', () => {
     const view = (id: string): HTMLElement => document.getElementById(id) as HTMLElement
     const tabOf = (name: string): HTMLButtonElement =>
@@ -5641,11 +5971,12 @@ describe('getComfyStudioChatContentScript', () => {
         new KeyboardEvent('keydown', { key: 'End', bubbles: true, cancelable: true })
       )
       await flush()
-      expect(view(PROJECT_VIEW_ID).style.display).toBe('flex')
-      expect(document.activeElement).toBe(tabOf('project'))
+      // End 落到最后一页：现在是「流水线」（它排在项目管理后面）
+      expect(view(PIPELINE_VIEW_ID).style.display).toBe('flex')
+      expect(document.activeElement).toBe(tabOf('pipeline'))
 
       // 到头了绕回第一页
-      tabOf('project').dispatchEvent(
+      tabOf('pipeline').dispatchEvent(
         new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true })
       )
       await flush()
@@ -5663,9 +5994,11 @@ describe('getComfyStudioChatContentScript', () => {
       expect(tabOf('chat').getAttribute('role')).toBe('tab')
       expect(tabOf('chat').getAttribute('aria-controls')).toBe(CHAT_VIEW_ID)
       expect(tabOf('project').getAttribute('aria-controls')).toBe(PROJECT_VIEW_ID)
+      expect(tabOf('pipeline').getAttribute('aria-controls')).toBe(PIPELINE_VIEW_ID)
       expect(tabOf('chat').getAttribute('aria-selected')).toBe('true')
       expect(view(CHAT_VIEW_ID).getAttribute('role')).toBe('tabpanel')
       expect(view(PROJECT_VIEW_ID).getAttribute('role')).toBe('tabpanel')
+      expect(view(PIPELINE_VIEW_ID).getAttribute('role')).toBe('tabpanel')
     })
   })
 })

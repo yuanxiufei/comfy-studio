@@ -612,6 +612,27 @@ class NovelLibrary:
         return target
 
 
+def resolve_novel(library: NovelLibrary, name: str) -> str:
+    """按名字取一份原文的路径；比不中就报错，并**列出现在有什么**。
+
+    名字拿去比 :meth:`NovelLibrary.list` 的 ``name`` 那一列，**不自己拼路径**：越界那类
+    （``../``、绝对路径、隐藏项）由 :meth:`NovelLibrary._resolve` 统一挡，在这儿再实现一遍
+    就是两份规则，早晚分家。名字是面板给的，也是对话里的流水线工具给的 —— 两个入口共用
+    这一条，免得"哪种名字算存在"两边各有一套。
+    """
+    listing = library.list(limit=MAX_LIST_LIMIT)
+    entries = listing.get("novels", [])
+    names = [entry.get("name") for entry in entries]
+    for entry in entries:
+        if entry.get("name") != name:
+            continue
+        if not entry.get("text"):
+            raise NovelsError(f"{name!r} 不是 txt/md，读不了")
+        return str(entry.get("path"))
+    known = "、".join(str(item) for item in names if item) or "（一本都没有）"
+    raise NovelsError(f"原文库里没有 {name!r}；现在有的是：{known}")
+
+
 __all__ = [
     "CACHE_MAX_ENTRIES",
     "CHAPTER_RE",
@@ -636,4 +657,5 @@ __all__ = [
     "TEXT_SUFFIXES",
     "decode_text",
     "default_novel_dir",
+    "resolve_novel",
 ]

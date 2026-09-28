@@ -37,8 +37,14 @@ export const STUDIO_SLOW_TIMEOUT_MS = 32 * 60 * 1000
  *  disabled for as long as it is pending — so fail fast and hand the controls back. */
 export const STUDIO_QUERY_TIMEOUT_MS = 30 * 1000
 
-/** The slow set, by method name. Everything else is treated as query-shaped. */
-const SLOW_METHODS = new Set(['agent/chat', 'skills/run', 'novels/import'])
+/** The slow set, by method name. Everything else is treated as query-shaped.
+ *
+ *  `pipeline/run` belongs here for the same reason `agent/chat` does: it walks
+ *  S0–S7 and each stage is one model call, so its duration is decided by the
+ *  work, not by whether the host is alive. Left query-shaped it would be dropped
+ *  at 30s while the run kept going in the child — the panel would report a
+ *  timeout for a pipeline that actually completed. */
+const SLOW_METHODS = new Set(['agent/chat', 'skills/run', 'novels/import', 'pipeline/run'])
 
 /** Pick the parent-side timeout for a method (see the two constants above). */
 export function studioTimeoutForMethod(method: string): number {

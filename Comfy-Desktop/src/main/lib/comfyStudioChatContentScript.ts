@@ -182,6 +182,25 @@ var NOVEL_BATCH_DELETE_ID = 'comfy-desktop-studio-novel-batch-delete';
 var VIEWS_ID = 'comfy-desktop-studio-views';
 var VIEWS_TITLE_ID = 'comfy-desktop-studio-views-title';
 var VIEWS_BACK_ID = 'comfy-desktop-studio-views-back';
+// 「流水线」那一页（见 buildPipelineView）：把 S0–S7 接到随包那七位智能体上，一段一段跑。
+// 这一页**一条规则都不抄**：阶段、谁做、落点、要不要引擎侧渲染，全来自宿主 pipeline/plan
+// 那一趟回话（形状由 lib/comfy_studio/pipeline.py 的 plan_payload 定，与对话里
+// pipeline__plan 同一份）—— 面板自己写一张阶段表，就会出现"面板说还差 S4、模型说跑完了"。
+var PIPELINE_VIEW_ID = 'comfy-desktop-studio-pipeline-view';
+var PIPELINE_HINT_ID = 'comfy-desktop-studio-pipeline-hint';
+var PIPELINE_OVERVIEW_ID = 'comfy-desktop-studio-pipeline-overview';
+var PIPELINE_LIST_ID = 'comfy-desktop-studio-pipeline-list';
+var PIPELINE_PROJECT_ID = 'comfy-desktop-studio-pipeline-project';
+var PIPELINE_NOVEL_ID = 'comfy-desktop-studio-pipeline-novel';
+var PIPELINE_EPISODES_ID = 'comfy-desktop-studio-pipeline-episodes';
+var PIPELINE_FROM_ID = 'comfy-desktop-studio-pipeline-from';
+var PIPELINE_TO_ID = 'comfy-desktop-studio-pipeline-to';
+var PIPELINE_FORCE_ID = 'comfy-desktop-studio-pipeline-force';
+// 跑之前那张确认卡（见 askPipelineRun）：这一页要按段调模型、动辄十几分钟，按下去之前
+// 把人话摆出来 —— 跑几段、跳几段、哪几段跑完还得引擎侧渲染。
+var PIPELINE_FORM_ID = 'comfy-desktop-studio-pipeline-form';
+var PIPELINE_FORM_HINT_ID = 'comfy-desktop-studio-pipeline-form-hint';
+var PIPELINE_FORM_TEXT_ID = 'comfy-desktop-studio-pipeline-form-text';
 // 输入框上方那一栏引用卡（见 paintQuotes / composeQuotes：引用原文那条通道）。
 var QUOTE_BAR_ID = 'comfy-desktop-studio-quote-bar';
 // 抽屉左沿那只调宽的手（见 installResizeGrip）。
@@ -500,6 +519,27 @@ var CHAT_CSS =
   '#' + DRAWER_ID + ' .cs-proj-note[data-tone="next"]{color:' + FG + ';}' +
   '#' + DRAWER_ID + ' .cs-proj-note[data-tone="action"]{color:#ff8080;}' +
   '#' + DRAWER_ID + ' .cs-proj-note[data-tone="bug"]{color:#e0b400;}' +
+  // 「流水线」那一页（见 buildPipelineView）：一段一张卡 —— 阶段号、名字、谁做、产出落哪儿、
+  // 要不要引擎侧渲染，以及这一段现在的归宿（跑着 / 跑过 / 跳过 / 栽了 / 还没跑）。
+  // 归宿不只靠颜色表意：状态那一枚签本身就写着字（见 pipeStatusChip），色盲与黑白打印都分得出来。
+  '#' + DRAWER_ID + ' .cs-pipe-list{flex:1;min-height:0;overflow-y:auto;display:flex;' +
+  'flex-direction:column;gap:6px;padding:0 12px 8px;}' +
+  '#' + DRAWER_ID + ' .cs-pipe-stage{border:1px dashed ' + BORDER + ';border-radius:4px;' +
+  'padding:6px 8px;display:flex;flex-direction:column;gap:3px;}' +
+  '#' + DRAWER_ID + ' .cs-pipe-stage[data-status="running"]{border-style:solid;' +
+  'border-color:' + MUTED + ';background:' + INPUT_BG + ';}' +
+  '#' + DRAWER_ID + ' .cs-pipe-stage[data-status="done"],' +
+  '#' + DRAWER_ID + ' .cs-pipe-stage[data-status="skipped"]{border-style:solid;}' +
+  '#' + DRAWER_ID + ' .cs-pipe-stage[data-status="failed"]{border-style:solid;border-color:#ff8080;}' +
+  '#' + DRAWER_ID + ' .cs-pipe-head{display:flex;align-items:baseline;gap:6px;flex-wrap:wrap;}' +
+  '#' + DRAWER_ID + ' .cs-pipe-code{font-family:var(--cs-mono);color:' + MUTED + ';font-size:11px;}' +
+  '#' + DRAWER_ID + ' .cs-pipe-name{color:' + FG + ';font-size:12px;font-weight:600;}' +
+  '#' + DRAWER_ID + ' .cs-pipe-meta{color:' + MUTED + ';font-size:11px;line-height:1.45;' +
+  'word-break:break-all;}' +
+  '#' + DRAWER_ID + ' .cs-pipe-note{color:' + MUTED + ';font-size:11px;line-height:1.45;' +
+  'word-break:break-word;}' +
+  '#' + DRAWER_ID + ' .cs-pipe-note[data-tone="warn"]{color:#e0b400;}' +
+  '#' + DRAWER_ID + ' .cs-pipe-note[data-tone="error"]{color:#ff8080;}' +
   '#' + DRAWER_ID + ' .cs-proj-meter-note{color:' + MUTED + ';}' +
   '#' + DRAWER_ID + ' .cs-proj-shelves{flex:1;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:4px;}' +
   '#' + DRAWER_ID + ' .cs-proj-shelf{flex:0 0 auto;border:1px solid ' + BORDER + ';border-radius:4px;' +
@@ -648,7 +688,25 @@ var CHAT_CSS =
   // 正文页内找字：命中处包一层 <mark>（正文是整块重画的，不是增量卡，所以敢动它的 DOM ——
   // 对话那一页的 [data-hit] 只标行不插字，原因在那儿写着）。
   '#' + DRAWER_ID + ' .cs-proj-hit{background:#6b5b00;color:inherit;border-radius:2px;}' +
-  '#' + DRAWER_ID + ' .cs-proj-hit[data-cur="true"]{background:#b58900;color:#1a1a1a;}';
+  '#' + DRAWER_ID + ' .cs-proj-hit[data-cur="true"]{background:#b58900;color:#1a1a1a;}' +
+  // 流水线那页：一段一张卡，纵着排（阶段是有先后的，横排读不出"跑到哪一段了"）。
+  // 卡左沿那道色条就是归宿：跑着黄 / 跑过绿 / 栽了红。但签上也写着字（见 pipeChip）——
+  // 颜色只是让人一眼扫过去，不是唯一的凭据。
+  '#' + DRAWER_ID + ' .cs-pipe-list{flex:1;min-height:0;overflow:auto;display:flex;' +
+  'flex-direction:column;gap:6px;padding:0 12px 12px;}' +
+  '#' + DRAWER_ID + ' .cs-pipe-stage{border:1px solid ' + BORDER + ';border-left-width:3px;' +
+  'border-radius:var(--cs-radius);padding:6px 8px;display:flex;flex-direction:column;gap:4px;}' +
+  '#' + DRAWER_ID + ' .cs-pipe-stage[data-status="running"]{border-left-color:#e0b400;}' +
+  '#' + DRAWER_ID + ' .cs-pipe-stage[data-status="done"]{border-left-color:#3fa34d;}' +
+  '#' + DRAWER_ID + ' .cs-pipe-stage[data-status="failed"]{border-left-color:#d9534f;}' +
+  '#' + DRAWER_ID + ' .cs-pipe-head{display:flex;align-items:center;gap:6px;}' +
+  '#' + DRAWER_ID + ' .cs-pipe-code{font-family:var(--cs-mono);font-size:12px;color:' + MUTED + ';}' +
+  '#' + DRAWER_ID + ' .cs-pipe-name{flex:1;min-width:0;font-size:12px;}' +
+  '#' + DRAWER_ID + ' .cs-pipe-meta{color:' + MUTED + ';font-size:11px;word-break:break-word;}' +
+  '#' + DRAWER_ID + ' .cs-pipe-note{color:' + MUTED + ';font-size:11px;line-height:1.4;' +
+  'word-break:break-word;}' +
+  '#' + DRAWER_ID + ' .cs-pipe-note[data-tone="warn"]{color:#e0b400;}' +
+  '#' + DRAWER_ID + ' .cs-pipe-note[data-tone="error"]{color:#ff8080;}';
 
 function ensureStyle() {
   if (document.getElementById(STYLE_ID)) return;
@@ -3659,17 +3717,18 @@ function closeDrawer() {
 // 曾在这里手抄过一份 4000 —— 两份数对不上时是**静默**的：翻页会跳字或原地打转，
 // 而面板和宿主谁都不会报错，正是最该避开的那类错。
 
-//: 三页的名字与先后（tablist 的顺序、方向键绕圈、Home/End 都照它来）。
-var VIEW_ORDER = ['chat', 'novel', 'project'];
+//: 四页的名字与先后（tablist 的顺序、方向键绕圈、Home/End 都照它来）。
+var VIEW_ORDER = ['chat', 'novel', 'project', 'pipeline'];
 
 //: 页名 → 给人看的页名。标签栏、占满窗口那一层的标题栏都读它 ——
 //: 抄成两份的话，标签上写着「管理小说」、铺开那一层的标题却写着别的，而没人会报错。
-var VIEW_LABELS = { chat: '对话', novel: '管理小说', project: '项目管理' };
+var VIEW_LABELS = { chat: '对话', novel: '管理小说', project: '项目管理', pipeline: '流水线' };
 
 //: 页名 → 那一页容器的 id（tab 的 aria-controls 用它，见 buildTabs）。
 function viewIdOf(view) {
   if (view === 'novel') return NOVEL_VIEW_ID;
   if (view === 'project') return PROJECT_VIEW_ID;
+  if (view === 'pipeline') return PIPELINE_VIEW_ID;
   return CHAT_VIEW_ID;
 }
 
@@ -3801,13 +3860,16 @@ function buildTabs() {
 }
 
 function switchView(view) {
-  STATE.view = view === 'novel' || view === 'project' ? view : 'chat';
+  STATE.view =
+    view === 'novel' || view === 'project' || view === 'pipeline' ? view : 'chat';
   var chat = document.getElementById(CHAT_VIEW_ID);
   var novel = document.getElementById(NOVEL_VIEW_ID);
   var project = document.getElementById(PROJECT_VIEW_ID);
+  var pipeline = document.getElementById(PIPELINE_VIEW_ID);
   if (chat) chat.style.display = STATE.view === 'chat' ? 'flex' : 'none';
   if (novel) novel.style.display = STATE.view === 'novel' ? 'flex' : 'none';
   if (project) project.style.display = STATE.view === 'project' ? 'flex' : 'none';
+  if (pipeline) pipeline.style.display = STATE.view === 'pipeline' ? 'flex' : 'none';
   var tabs = document.querySelectorAll('#' + DRAWER_ID + ' .cs-tab');
   for (var index = 0; index < tabs.length; index += 1) {
     var on = tabs[index].dataset.view === STATE.view;
@@ -3832,6 +3894,9 @@ function switchView(view) {
     loadProjects();
     if (STATE.projectOpen) openProject(STATE.projectOpen.name);
   }
+  // 流水线那页同理：项目目录、原文库、进度账全是别的程序（编辑器、生成脚本、别的智能体）
+  // 也会动的东西，拿上回那份当准数，就会出现"计划上写着还差 S4、其实早跑过了"。
+  if (STATE.view === 'pipeline') loadPipeline();
 }
 
 // 「管理小说」与「项目管理」共用的那一层：**占满窗口**。
@@ -3876,6 +3941,8 @@ function buildViewsOverlay() {
   layer.appendChild(head);
   layer.appendChild(buildNovelView());
   layer.appendChild(buildProjectView());
+  // 流水线也是"翻资料 + 按键"的地方：一张八段的表加上每段的落点，窄缝里放不下。
+  layer.appendChild(buildPipelineView());
   return layer;
 }
 
@@ -5072,6 +5139,575 @@ function projectEmpty(text) {
   empty.className = 'cs-proj-empty';
   empty.textContent = text;
   return empty;
+}
+
+// ---- 流水线（S0–S7 接到随包那七位智能体上）-------------------------------
+//
+// 这一页是"从小说到成片"那条链的**按键处**。阶段表、每段谁做、产出落哪儿、要不要回引擎侧渲染
+// （第一步只出提示词，图/视频/音频得回引擎里出），全部来自宿主 pipeline/plan 那一趟回话 ——
+// 形状与对话里 pipeline__plan 是同一份（见 lib/comfy_studio/pipeline.py 的 plan_payload）。
+// **面板不自己写一张阶段表**：抄一份就会跟宿主分家，而分家的表现是"面板上写着还差 S4、
+// 模型说早跑完了"，两边都不报错，只有人白等一场。
+//
+// 跑起来之后宿主一段一段推 pipeline/event（start / stage_start / stage / finished），
+// 这一页拿它们逐段改卡片。**进度不靠轮询**：一段跑十几分钟，轮询要么太吵要么太钝；
+// 而这几条通知就是 run 自己 emit 出来的，与它落进度账的时机同源。
+
+// 这一页的提示行：文案是这一页的事，语气交给 hintLine（全页同一套）。
+// 确认卡盖住了页顶那条，所以同一句话在卡片里也写一份 —— 一个调用写两处，不是一个来源变两个。
+function pipelineHint(text, tone) {
+  hintLine(PIPELINE_FORM_HINT_ID, text, tone);
+  return hintLine(PIPELINE_HINT_ID, text, tone);
+}
+
+// 一段的归宿 → 卡片上那枚签（文字 + 语气）。归宿不只靠颜色：签本身就写着字，色盲或黑白打印
+// 都分得出来。status 是宿主报的那几个码（见 pipeline.py 的 STATUS_DONE / STATUS_SKIPPED /
+// STATUS_FAILED），认不出来就照原样写出来 —— 没见过的码是宿主那边新加的，
+// 藏起来只会让人以为这一段压根没跑。
+function pipeChip(status) {
+  if (status === 'running') return projectChip('跑着…', 'action');
+  if (status === 'done') return projectChip('跑过了', '');
+  if (status === 'skipped') return projectChip('跳过', '');
+  if (status === 'failed') return projectChip('栽了', 'warn');
+  if (status) return projectChip(String(status), 'warn');
+  return projectChip('还没跑', 'zero');
+}
+
+// 一段一张卡：阶段号、名字、归宿、谁做、产出落哪儿。
+// 归宿先看这一趟跑出来的（run），没有再退回进度账（past）—— 跑的时候进度账还没落盘，
+// 只看进度账的话，正在跑的那一段永远写着"还没跑"。
+function pipeStageCard(stage, run, past) {
+  var code = String(stage.code || '');
+  var live = run && run[code] ? run[code] : null;
+  var done = past && past[code] ? past[code] : null;
+  var status = live ? live.status : done ? done.status : '';
+
+  var card = document.createElement('div');
+  card.className = 'cs-pipe-stage';
+  card.dataset.code = code;
+  card.dataset.status = status || 'todo';
+
+  var head = document.createElement('div');
+  head.className = 'cs-pipe-head';
+  var codeEl = document.createElement('span');
+  codeEl.className = 'cs-pipe-code';
+  codeEl.textContent = code;
+  var nameEl = document.createElement('span');
+  nameEl.className = 'cs-pipe-name';
+  nameEl.textContent = String(stage.name || '');
+  head.appendChild(codeEl);
+  head.appendChild(nameEl);
+  head.appendChild(pipeChip(status));
+  card.appendChild(head);
+
+  // 谁做 = 随包那七位里的哪一位；没接智能体的段写它自己的模块名（宿主给的 owner）。
+  var bits = ['谁做：' + String(stage.actor || stage.agent || stage.owner || '—')];
+  bits.push('落点：' + String(stage.artifact || '—'));
+  if (stage.needs_render === true) bits.push('跑完还要回引擎侧出图/视频/音频');
+  var meta = document.createElement('div');
+  meta.className = 'cs-pipe-meta';
+  meta.textContent = bits.join(' · ');
+  card.appendChild(meta);
+
+  var note = '';
+  var tone = '';
+  if (live) {
+    if (live.error) {
+      note = String(live.error);
+      tone = 'error';
+    } else if (live.note) {
+      note = String(live.note);
+    }
+    if (live.render_pending === true) {
+      note = (note ? note + ' · ' : '') + '这一步只出了提示词，图/视频得回引擎侧出';
+      tone = tone || 'warn';
+    }
+  } else if (done) {
+    // 进度账上每段只有这四栏（status / artifact / at / error，见 pipeline.py 的 state）；
+    // 没有 note —— 那是 run 那一刻的回话里的东西，账上不存。
+    if (done.error) {
+      note = String(done.error);
+      tone = 'error';
+    }
+    if (done.at) note = (note ? note + ' · ' : '') + formatTime(done.at) + ' 跑的';
+  }
+  if (note) {
+    var line = document.createElement('div');
+    line.className = 'cs-pipe-note';
+    line.textContent = note;
+    if (tone) line.dataset.tone = tone;
+    card.appendChild(line);
+  }
+  return card;
+}
+
+// 跑之前那张卡。它是**这一页自己的确认**，不是宿主 review 通道那一套：面板里按键的是人自己，
+// 与对话里"模型想替人按"是两回事（后者才必须有人点头，见 pipeline.py 顶部那段）。但这一趟
+// 一跑十几分钟、花的是模型的钱，所以按下去之前把话摆清：跑几段、跳几段、哪几段还得回引擎侧。
+function buildPipelineRunForm() {
+  var popup = buildPopup(PIPELINE_FORM_ID, PIPELINE_FORM_HINT_ID, '这一趟要跑的段');
+
+  var text = document.createElement('div');
+  text.id = PIPELINE_FORM_TEXT_ID;
+  text.className = 'cs-pipe-note';
+  popup.body.appendChild(text);
+
+  // 起止段只在这张卡里给：页顶那条窄缝塞不下四个控件，而"只补中间某一段"是常事。
+  var from = document.createElement('select');
+  from.id = PIPELINE_FROM_ID;
+  from.className = 'cs-proj-input';
+  from.title = '从这一段起';
+  var to = document.createElement('select');
+  to.id = PIPELINE_TO_ID;
+  to.className = 'cs-proj-input';
+  to.title = '跑到这一段为止';
+  popup.body.appendChild(popupField('从哪一段起', from));
+  popup.body.appendChild(popupField('跑到哪一段', to));
+
+  var force = document.createElement('input');
+  force.type = 'checkbox';
+  force.id = PIPELINE_FORCE_ID;
+  force.title = '不勾就是跳过：产物还在的段不重做';
+  var forceLabel = document.createElement('label');
+  forceLabel.className = 'cs-popup-check';
+  forceLabel.appendChild(force);
+  var forceText = document.createElement('span');
+  forceText.textContent = '跑过的也重做（默认跳过产物还在的段）';
+  forceLabel.appendChild(forceText);
+  popup.body.appendChild(forceLabel);
+
+  popup.actions.appendChild(
+    projectButton('先别跑', '退出去，什么都不做', function () {
+      togglePopup(PIPELINE_FORM_ID, PIPELINE_FORM_HINT_ID, null, false);
+    })
+  );
+  var go = projectButton('继续跑', '从这一段起往下跑；跑的时候这一页逐段亮起来', function () {
+    runPipeline();
+  });
+  go.dataset.primary = '1';
+  popup.actions.appendChild(go);
+  return popup.layer;
+}
+
+function buildPipelineView() {
+  var view = document.createElement('div');
+  view.id = PIPELINE_VIEW_ID;
+  view.style.cssText = 'flex:1;min-height:0;display:none;flex-direction:column;';
+  view.setAttribute('role', 'tabpanel');
+
+  var bar = document.createElement('div');
+  bar.className = 'cs-proj-bar';
+
+  // 剧目：选项是宿主 projects/list 那一趟的行（哪个目录算一部戏是宿主判的，见 projects.py）。
+  var project = document.createElement('select');
+  project.id = PIPELINE_PROJECT_ID;
+  project.className = 'cs-proj-input';
+  project.title = '跑哪一部戏；换一部会自动重新看一遍计划';
+  project.addEventListener('change', function () {
+    STATE.pipelineProject = project.value || '';
+    planPipeline();
+  });
+  bar.appendChild(project);
+
+  // 原文：可选。留空就用项目里那份（S1 自己有默认落点）。
+  var novel = document.createElement('select');
+  novel.id = PIPELINE_NOVEL_ID;
+  novel.className = 'cs-proj-input';
+  novel.title = '这一部用哪篇原文（可选，留空就用项目里那份）';
+  bar.appendChild(novel);
+
+  // 集数：与建项目表单同一个默认（那边也是 12）。它只进提示词里的"目标集数"。
+  var episodes = document.createElement('input');
+  episodes.id = PIPELINE_EPISODES_ID;
+  episodes.className = 'cs-proj-input';
+  episodes.type = 'number';
+  episodes.min = '1';
+  episodes.max = '9999';
+  episodes.value = '12';
+  episodes.title = '目标集数：写进提示词，实际做多少集是你自己的事';
+  bar.appendChild(episodes);
+
+  bar.appendChild(
+    projectButton('看计划', '问一遍宿主：这八段现在跑到哪儿了、哪几段跑完还得回引擎侧渲染', function () {
+      planPipeline();
+    })
+  );
+  bar.appendChild(
+    projectButton('开跑…', '从没跑过的那一段往下跑；按之前先让你看一眼这一趟要跑几段、跳几段', function () {
+      askPipelineRun();
+    })
+  );
+
+  view.appendChild(bar);
+
+  var hint = document.createElement('div');
+  hint.id = PIPELINE_HINT_ID;
+  hint.className = 'cs-proj-hint';
+  hint.textContent = '';
+  view.appendChild(hint);
+
+  var overview = document.createElement('div');
+  overview.id = PIPELINE_OVERVIEW_ID;
+  overview.className = 'cs-proj-overview';
+  view.appendChild(overview);
+
+  var list = document.createElement('div');
+  list.id = PIPELINE_LIST_ID;
+  list.className = 'cs-pipe-list';
+  view.appendChild(list);
+
+  view.appendChild(buildPipelineRunForm());
+  return view;
+}
+
+// 这一页三个请求共用的参数：剧目（必给）、原文（可选）、集数（可选）。
+// 空的一律不带 —— 宿主那边缺省就是它自己的默认（见 pipeline.py 的 plan / run 签名）。
+function pipelineArgs() {
+  var params = {};
+  var project = String(STATE.pipelineProject || '').trim();
+  if (project) params.name = project;
+  var novel = document.getElementById(PIPELINE_NOVEL_ID);
+  if (novel && novel.value) params.novel = novel.value;
+  var episodes = document.getElementById(PIPELINE_EPISODES_ID);
+  var count = episodes ? parseInt(episodes.value, 10) : 0;
+  if (count > 0) params.episodes = count;
+  return params;
+}
+
+// 剧目与原文两个下拉：都从宿主现取（projects/list、novels/list），面板不存自己的一份清单 ——
+// 存一份就得操心它什么时候过期，而"这部戏刚被删掉"这种事没人会记得同步。
+// 已选中的那部戏留着：切页回来不该把挑好的东西丢掉；它已经不在列表里也照留，并写清
+// "目录里没这一部"，让后面那句报错有的放矢，而不是悄悄换成另一部戏跑起来。
+function loadPipelineOptions() {
+  var projectSelect = document.getElementById(PIPELINE_PROJECT_ID);
+  var novelSelect = document.getElementById(PIPELINE_NOVEL_ID);
+  var keepProject = String(STATE.pipelineProject || '');
+  var keepNovel = novelSelect ? novelSelect.value || '' : '';
+  var asked = [bridge.request('projects/list', {}), bridge.request('novels/list', {})];
+  return Promise.all(asked).then(function (answers) {
+    var listed = answers[0] && answers[0].ok === true ? answers[0].result || {} : null;
+    if (projectSelect && listed) {
+      var rows = listed.projects || [];
+      projectSelect.textContent = '';
+      rows.forEach(function (row) {
+        var option = document.createElement('option');
+        option.value = row.name;
+        option.textContent = row.name;
+        projectSelect.appendChild(option);
+      });
+      if (!keepProject && rows.length) keepProject = rows[0].name;
+      var listedNow = rows.some(function (row) {
+        return row.name === keepProject;
+      });
+      if (keepProject && !listedNow) {
+        var gone = document.createElement('option');
+        gone.value = keepProject;
+        gone.textContent = keepProject + '（项目目录里没这一部）';
+        projectSelect.insertBefore(gone, projectSelect.firstChild);
+      }
+      projectSelect.value = keepProject;
+      STATE.pipelineProject = keepProject;
+    }
+    var novels = answers[1] && answers[1].ok === true ? (answers[1].result || {}).novels || [] : [];
+    if (novelSelect) {
+      novelSelect.textContent = '';
+      var none = document.createElement('option');
+      none.value = '';
+      none.textContent = novels.length ? '（用项目里那份原文）' : '原文库里没有原文（S1 会用它自己的落点）';
+      novelSelect.appendChild(none);
+      novels.forEach(function (row) {
+        var option = document.createElement('option');
+        option.value = row.name;
+        option.textContent = row.name;
+        novelSelect.appendChild(option);
+      });
+      if (keepNovel) novelSelect.value = keepNovel;
+    }
+    return true;
+  });
+}
+
+// 切到这一页时走这一趟：先补两个下拉，再看计划。看计划没成也留着下拉 —— 下拉是它的前置条件，
+// 而"挑哪一部戏"这件事跟"这一部跑到哪儿了"是两回事，后者失败不该把前者也收走。
+function loadPipeline() {
+  pipelineHint('正在看这一步跑到哪儿了…', 'info');
+  return loadPipelineOptions().then(function () {
+    if (!STATE.pipelineProject) {
+      STATE.pipeline = null;
+      STATE.pipelineStages = null;
+      paintPipeline(null);
+      pipelineHint('还没有可以跑的戏：先去「项目管理」那一页建一部，这里才有阶段表。', 'info');
+      return null;
+    }
+    return planPipeline();
+  });
+}
+
+// 问一遍宿主（pipeline/plan）要那张阶段表。票与 loadProjects 那一套同理：
+// 连点两下、或者连着换几部戏，先发的请求后回来会把新计划盖成旧的。
+function planPipeline() {
+  var params = pipelineArgs();
+  if (!params.name) {
+    paintPipeline(null);
+    pipelineHint('先挑一部戏。', 'error');
+    return Promise.resolve(null);
+  }
+  STATE.pipelineToken = (STATE.pipelineToken || 0) + 1;
+  var ticket = STATE.pipelineToken;
+  // 上一趟（换戏之前那部）的实时归宿在这里作废：留着的话，新计划会顶着旧状态画出来。
+  STATE.pipelineStages = null;
+  pipelineHint('正在看「' + params.name + '」跑到哪儿了…', 'info');
+  var asked = Promise.resolve(bridge.request('pipeline/plan', params));
+  return asked.then(
+    function (response) {
+      if (STATE.pipelineToken !== ticket) return null;
+      if (!response || response.ok !== true) {
+        var error = (response && response.error) || {};
+        STATE.pipeline = null;
+        paintPipeline(null);
+        pipelineHint('看不了计划：' + (error.message || '未知错误'), 'error');
+        return null;
+      }
+      STATE.pipeline = response.result || null;
+      paintPipeline(STATE.pipeline);
+      pipelineHint('计划在这儿了。按「开跑…」之前先看一眼这一趟要跑哪几段。', 'info');
+      return STATE.pipeline;
+    },
+    function (err) {
+      if (STATE.pipelineToken !== ticket) return null;
+      STATE.pipeline = null;
+      paintPipeline(null);
+      pipelineHint('看不了计划：' + message(err), 'error');
+      return null;
+    }
+  );
+}
+
+// 画这一页：总览那一行 + 一段一张卡。payload 是 pipeline/plan 的回话，null 表示没得跑。
+// 实时归宿（STATE.pipelineStages）在这里叠上去：跑着的时候进度账还没落盘，只看它就会
+// 让正在跑的那一段一直写着"还没跑"。
+function paintPipeline(payload) {
+  var overview = document.getElementById(PIPELINE_OVERVIEW_ID);
+  var list = document.getElementById(PIPELINE_LIST_ID);
+  if (overview) overview.textContent = '';
+  if (!list) return;
+  list.textContent = '';
+  var stages = (payload && payload.stages) || [];
+  if (stages.length === 0) {
+    list.appendChild(projectEmpty('这里还没有阶段表。'));
+    return;
+  }
+  var past = (payload && payload.state) || {};
+  var run = STATE.pipelineStages || null;
+  var found = 0;
+  stages.forEach(function (stage) {
+    var live = run && run[stage.code] ? run[stage.code] : null;
+    var was = past[stage.code] || null;
+    var status = live ? live.status : was ? was.status : '';
+    if (status === 'done') found += 1;
+  });
+  if (overview) {
+    overview.appendChild(projectChip('跑过了 ' + found + '/' + stages.length + ' 段'));
+    var waiting = (payload && payload.render_required) || [];
+    if (waiting.length) {
+      overview.appendChild(document.createTextNode(' '));
+      overview.appendChild(
+        projectChip('跑完还要回引擎侧出图/视频：' + waiting.join('、'), 'warn')
+      );
+    }
+    if (payload && payload.novel) {
+      overview.appendChild(document.createTextNode(' '));
+      overview.appendChild(projectChip('原文：' + payload.novel));
+    }
+  }
+  stages.forEach(function (stage) {
+    list.appendChild(pipeStageCard(stage, run, past));
+  });
+}
+
+// 按「开跑…」：手里有这一部的最新计划就直接用那份，没有才去问一趟 ——
+// 每按一次都重问，人按下到看清字之间界面会白跳一下，而刚才看过的计划并没有过期。
+function askPipelineRun() {
+  var open = function (payload) {
+    if (!payload) return null;
+    fillPipelineRunForm(payload);
+    togglePopup(PIPELINE_FORM_ID, PIPELINE_FORM_HINT_ID, PIPELINE_FROM_ID, true);
+    return null;
+  };
+  if (STATE.pipeline && STATE.pipeline.project) return open(STATE.pipeline);
+  return planPipeline().then(open);
+}
+
+// 填那张确认卡：一段话 + 起止段两个下拉。话里那几个数全出自 plan 的回话（跑过的段、待渲染的段），
+// 面板不自己算 —— 自己算就得再判一次"哪一段算跑过"，而那个判据在宿主手里（产物在不在）。
+function fillPipelineRunForm(payload) {
+  var stages = (payload && payload.stages) || [];
+  var past = (payload && payload.state) || {};
+  var codes = stages.map(function (stage) {
+    return String(stage.code || '');
+  });
+  var settled = codes.filter(function (code) {
+    return past[code] && past[code].status === 'done';
+  });
+  var text = document.getElementById(PIPELINE_FORM_TEXT_ID);
+  if (text) {
+    text.textContent =
+      '一段一段跑下来要不少时间（这次的表共 ' + codes.length + ' 段）。' +
+      '产物还在的段会跳过，现在算跑过的是 ' +
+      (settled.length ? settled.join('、') : '一段都没有') +
+      '；跑完还有 ' + ((payload && payload.render_required) || []).length +
+      ' 段得回引擎侧出图/视频。';
+  }
+  // 起止下拉的选项就是这一趟的段，顺序照宿主给的来（S0 → S7）；
+  // 默认从头跑到尾，跟宿主 run 没给 from/to 时的默认一致。
+  [
+    { id: PIPELINE_FROM_ID, pick: 'first' },
+    { id: PIPELINE_TO_ID, pick: 'last' },
+  ].forEach(function (spec) {
+    var select = document.getElementById(spec.id);
+    if (!select) return;
+    select.textContent = '';
+    codes.forEach(function (code) {
+      var option = document.createElement('option');
+      option.value = code;
+      option.textContent = code;
+      select.appendChild(option);
+    });
+    select.value = spec.pick === 'first' ? codes[0] || '' : codes[codes.length - 1] || '';
+  });
+  // 每次都从"不重做"起（宿主那边也是这样：没给 force 就跳过已落盘的）。
+  var force = document.getElementById(PIPELINE_FORCE_ID);
+  if (force) force.checked = false;
+}
+
+// 跑的时候把这一页那几颗按钮按下去：不按的话，人会以为"再按一下能催它快一点"，
+// 而它按下去只会撞上宿主那道同项目互斥（见 pipeline.py 的 RUNNING_PROJECTS）。
+function lockPipelineButtons(busy) {
+  var view = document.getElementById(PIPELINE_VIEW_ID);
+  if (!view) return;
+  var buttons = view.querySelectorAll('.cs-proj-bar button');
+  for (var i = 0; i < buttons.length; i += 1) buttons[i].disabled = !!busy;
+}
+
+// 真跑。参数与确认卡上看到的逐项对应：起止段、要不要重做跑过的。
+// 跑的过程**不靠这一趟的回话来画**（它要十几分钟才回），而是靠宿主逐段推的 pipeline/event。
+function runPipeline() {
+  if (STATE.pipelineBusy) {
+    pipelineHint('上一趟还在跑，等它跑完。', 'error');
+    return null;
+  }
+  var params = pipelineArgs();
+  if (!params.name) {
+    pipelineHint('先挑一部戏。', 'error');
+    return null;
+  }
+  var from = document.getElementById(PIPELINE_FROM_ID);
+  var to = document.getElementById(PIPELINE_TO_ID);
+  var force = document.getElementById(PIPELINE_FORCE_ID);
+  if (from && from.value) params.from = from.value;
+  if (to && to.value) params.to = to.value;
+  if (force && force.checked) params.force = true;
+
+  togglePopup(PIPELINE_FORM_ID, PIPELINE_FORM_HINT_ID, null, false);
+  STATE.pipelineBusy = true;
+  STATE.pipelineStages = {};
+  lockPipelineButtons(true);
+  paintPipeline(STATE.pipeline);
+  pipelineHint(
+    '跑起来了：' + (params.from || '头') + ' → ' + (params.to || '尾') + '。这一页会一段一段亮起来。',
+    'info'
+  );
+
+  var asked = Promise.resolve(bridge.request('pipeline/run', params));
+  return asked.then(
+    function (response) {
+      STATE.pipelineBusy = false;
+      STATE.pipelineStages = null;
+      lockPipelineButtons(false);
+      if (!response || response.ok !== true) {
+        var error = (response && response.error) || {};
+        pipelineHint('跑不动：' + (error.message || '未知错误'), 'error');
+        return null;
+      }
+      var report = response.result || {};
+      // 收尾一律重问一遍计划：run 的回话是它自己那一刻的快照，而"现在到底跑到哪儿了"
+      // 唯一的事实源是宿主那份进度账（它顺便会把刚落盘的段一起算进来）。
+      planPipeline();
+      pipelineHint(
+        '这一趟跑完了：' + (report.ran || []).length + ' 段有产物、' +
+          (report.not_ran || []).length + ' 段没动，其中 ' +
+          (report.render_required || []).length + ' 段还得回引擎侧出图/视频。',
+        'info'
+      );
+      return report;
+    },
+    function (err) {
+      STATE.pipelineBusy = false;
+      STATE.pipelineStages = null;
+      lockPipelineButtons(false);
+      pipelineHint('跑不动：' + message(err), 'error');
+      return null;
+    }
+  );
+}
+
+// 改一段的归宿，只重画那一张卡：一段一段跑十几分钟，人正盯着某一段时整页重画会把滚动位置
+// 一起掀掉。卡还没画过（或者计划还没到手）就退回整页重画，代价是多刷一次。
+function setPipelineStage(code, outcome) {
+  var key = String(code || '');
+  if (!key) return;
+  STATE.pipelineStages = STATE.pipelineStages || {};
+  STATE.pipelineStages[key] = outcome;
+  var list = document.getElementById(PIPELINE_LIST_ID);
+  var stages = (STATE.pipeline && STATE.pipeline.stages) || [];
+  var stage = null;
+  stages.forEach(function (row) {
+    if (String(row.code) === key) stage = row;
+  });
+  if (!list || !stage) {
+    paintPipeline(STATE.pipeline);
+    return;
+  }
+  var card = pipeStageCard(stage, STATE.pipelineStages, (STATE.pipeline && STATE.pipeline.state) || {});
+  var old = list.querySelector('[data-code="' + key + '"]');
+  if (old) list.replaceChild(card, old);
+  else list.appendChild(card);
+}
+
+// 宿主逐段推过来的进度（pipeline/event）。**只认这一页正在跑的那一趟**：
+// stage 与 stage_start 这两条**不带项目名**（只有 start / finished 带），没法核对是哪部戏，
+// 所以用"这一页现在跑着没有"当门 —— 而 run 与面板是一对一（同项目第二条会被宿主拒），
+// 这道门就够把别处跑起来的进度挡在外面。不设门，隔壁窗口的进度会画到这一页上。
+function onPipelineEvent(payload) {
+  var params = (payload && payload.params) || {};
+  if (params.type !== 'pipeline') return;
+  if (!STATE.pipelineBusy) return;
+  var phase = String(params.phase || '');
+  if (phase === 'start') {
+    // start 带的是这一趟要跑哪几段（代码）。拿它先把卡片复位成"还没跑"，
+    // 免得上一趟留下的"跑过了"顶在这一趟的第一段上。
+    STATE.pipelineStages = {};
+    (params.stages || []).forEach(function (code) {
+      STATE.pipelineStages[String(code)] = { status: 'todo' };
+    });
+    paintPipeline(STATE.pipeline);
+    return;
+  }
+  if (phase === 'stage_start') {
+    setPipelineStage(params.code, { status: 'running' });
+    pipelineHint(
+      '正在跑 ' + String(params.code || '') + ' ' + String(params.name || '') +
+        '（' + String(params.actor || '') + '）…',
+      'info'
+    );
+    return;
+  }
+  if (phase === 'stage') {
+    setPipelineStage(params.code, params);
+    return;
+  }
+  // finished 带的是整趟的 report，与 run 的回话同一份 —— 收尾统一在 runPipeline 的 then 里做。
+  // 两条路都写一遍的话，事件先到、回话后到，同一句话会被说两次。
 }
 
 function buildProjectView() {
@@ -6308,6 +6944,10 @@ function start() {
   // 而宿主那边那段对话还在 —— 不认回来，下一句就说到默认那段上去了。
   restoreSession();
   STATE.unsubscribe = bridge.onEvent(onEvent);
+  // 流水线的事件**另挂一份**：onEvent 头一句就是"没有一轮在跑就直接丢"（那是对话那条路的
+  // 守卫），而流水线跑起来的时候对话那边根本没在跑 —— 挂在那里面等于一条都收不到。
+  // preload 那个 onEvent 是 ipcRenderer.on，可以挂多份，各自退各自的。
+  STATE.pipelineUnsub = bridge.onEvent(onPipelineEvent);
 
   var injected = inject();
   var tries = 0;
@@ -6758,12 +7398,17 @@ export function getComfyStudioChatContentScript(): string {
     // 界面已经放手、宿主那一轮却还占着这个会话（强行复位之后就是这个局面，见 forceResetTurn）。
     // 它决定"停止"键以哪种身份露面（见 setStopVisible），也决定那颗键还能不能按。
     `detached: false, ` +
-    // 抽屉里的三页（'chat' / 'novel' / 'project'）与小说那一页的当前状态：列表那一趟的票、
-    // 正开着的是哪一篇（含它自己那趟读的票）、删除按到第二步的是哪一行。
+    // 抽屉里的四页（'chat' / 'novel' / 'project' / 'pipeline'）与小说那一页的当前状态：
+    // 列表那一趟的票、正开着的是哪一篇（含它自己那趟读的票）、删除按到第二步的是哪一行。
     `view: 'chat', novels: null, novelOpen: null, novelDeleteArmed: null, novelListToken: 0, ` +
     // 项目那一页的当前状态：项目列表那一趟的票、正开着的是哪一部（含它那趟 tree 的票、
     // 正读着哪份文件与第几页）。票都是为了防止"慢回话盖掉新界面"：换一部剧时旧请求还在飞。
     `projects: null, projectOpen: null, projectListToken: 0, projectFind: '', projectFindTimer: null, ` +
+    // 流水线那一页（见 buildPipelineView）：计划那一趟的票、下拉里选中的剧目、
+    // 跑起来之后逐段收到的归宿（按阶段代码索引，pipeline/event 推一条更新一格）、
+    // 以及"现在跑着没有"。跑的时候这一页不接受第二次按键 —— 宿主那边同项目第二条本来也会拒。
+    `pipeline: null, pipelineToken: 0, pipelineProject: '', pipelineStages: null, ` +
+    `pipelineBusy: false, ` +
     // 项目正文里的"页内找字"（见 paintProjectReader）：找的是哪串字、命中在哪几处、现在停在第几处。
     `projectFileFind: '', projectFileFindHits: [], projectFileFindAt: -1, ` +
     // 左栏（目录树 / 搜索结果）：开着没有，以及里面是哪一篇的哪一趟（含它自己那趟的票）。
