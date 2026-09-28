@@ -176,6 +176,12 @@ var NOVEL_BATCH_ID = 'comfy-desktop-studio-novel-batch';
 var NOVEL_BATCH_ALL_ID = 'comfy-desktop-studio-novel-batch-all';
 var NOVEL_BATCH_NONE_ID = 'comfy-desktop-studio-novel-batch-none';
 var NOVEL_BATCH_DELETE_ID = 'comfy-desktop-studio-novel-batch-delete';
+// 「管理小说」与「项目管理」这两页**占满窗口**的那一层（见 buildViewsOverlay）。
+// 它们是"翻资料"的地方 —— 一篇原文、一列落点、一份分镜表都要地方，
+// 挤在抽屉那条窄缝里读长文，人只会把抽屉拖宽到盖住整页，那还不如一开始就占满。
+var VIEWS_ID = 'comfy-desktop-studio-views';
+var VIEWS_TITLE_ID = 'comfy-desktop-studio-views-title';
+var VIEWS_BACK_ID = 'comfy-desktop-studio-views-back';
 // 输入框上方那一栏引用卡（见 paintQuotes / composeQuotes：引用原文那条通道）。
 var QUOTE_BAR_ID = 'comfy-desktop-studio-quote-bar';
 // 抽屉左沿那只调宽的手（见 installResizeGrip）。
@@ -233,6 +239,20 @@ var CHAT_CSS =
   '#' + DRAWER_ID + ' .cs-model-btn{border:1px solid ' + BORDER + ';border-radius:4px;' +
   'background:transparent;color:' + MUTED + ';cursor:pointer;font:inherit;font-size:11px;padding:2px 8px;}' +
   '#' + DRAWER_ID + ' .cs-model-btn:hover{background:' + INPUT_BG + ';color:' + FG + ';}' +
+  // 「管理小说」「项目管理」占满窗口的那一层（见 buildViewsOverlay）：
+  // fixed 是**这里的关键**（相对视口铺满，不是相对抽屉），z-index 高过抽屉自己的 2000，
+  // 底色用同一块背景板 —— 换成纯黑会在页面上撕出一块"洞"。
+  '#' + DRAWER_ID + ' .cs-views{position:fixed;inset:0;z-index:2001;display:none;' +
+  'flex-direction:column;box-sizing:border-box;background:' + SURFACE + ';color:' + FG + ';}' +
+  '#' + DRAWER_ID + ' .cs-views[data-open="1"]{display:flex;}' +
+  '#' + DRAWER_ID + ' .cs-views-head{flex:0 0 auto;display:flex;align-items:center;gap:6px;' +
+  'padding:8px 12px;border-bottom:1px solid ' + BORDER + ';}' +
+  '#' + DRAWER_ID + ' .cs-views-title{flex:1;min-width:0;color:' + FG + ';font-size:13px;' +
+  'font-weight:600;word-break:break-all;}' +
+  '#' + DRAWER_ID + ' .cs-views-back{border:1px solid ' + BORDER + ';border-radius:4px;' +
+  'background:transparent;color:' + MUTED + ';cursor:pointer;font:inherit;font-size:12px;' +
+  'padding:3px 8px;white-space:nowrap;}' +
+  '#' + DRAWER_ID + ' .cs-views-back:hover{background:' + INPUT_BG + ';color:' + FG + ';}' +
   '#' + DRAWER_ID + ' .cs-row{white-space:pre-wrap;word-break:break-word;padding:6px 8px;border-radius:var(--cs-radius);}' +
   '#' + DRAWER_ID + ' .cs-user{align-self:flex-end;max-width:85%;background:var(--comfy-input-bg,#3a3a3a);}' +
   '#' + DRAWER_ID + ' .cs-agent{align-self:flex-start;max-width:90%;background:transparent;}' +
@@ -505,6 +525,12 @@ var CHAT_CSS =
   '#' + DRAWER_ID + ' .cs-proj-shelf[data-empty="1"] .cs-proj-shelf-count{border-color:transparent;}' +
   '#' + DRAWER_ID + ' .cs-proj-files{display:none;flex-direction:column;border-top:1px solid ' + BORDER + ';' +
   'padding:2px 4px 4px;}' +
+  // 一格里的粒度小标题（全剧级 / 分集级，见 projectGroupLabel）：它是**分节线**，不是又一行文件，
+  // 所以左沿立一条竖线、字号再小一号 —— 跟文件行（可点、有 hover）一眼分得开。
+  '#' + DRAWER_ID + ' .cs-proj-group{display:flex;align-items:baseline;gap:6px;margin:3px 0 1px;' +
+  'padding:0 4px 0 6px;border-left:2px solid ' + BORDER + ';color:' + MUTED + ';font-size:10px;' +
+  'white-space:nowrap;}' +
+  '#' + DRAWER_ID + ' .cs-proj-group-count{margin-left:auto;}' +
   '#' + DRAWER_ID + ' .cs-proj-shelf[data-open="1"] .cs-proj-files{display:flex;}' +
   '#' + DRAWER_ID + ' .cs-proj-file{flex:0 0 auto;display:flex;align-items:baseline;gap:6px;width:100%;' +
   'text-align:left;border:none;border-radius:3px;background:transparent;color:inherit;cursor:pointer;' +
@@ -715,7 +741,12 @@ function buildPopup(layerId, hintId, title) {
     if (event.target === layer) togglePopup(layerId, hintId, null, false);
   });
   card.addEventListener('keydown', function (event) {
-    if (event.key === 'Escape') togglePopup(layerId, hintId, null, false);
+    if (event.key === 'Escape') {
+      // 别让这一按继续冒到 document：那边还有一层 Esc 处理（见 onShortcut），
+      // 两边都动手的话，按一下会把弹窗和"我正在看的那一页"一起收走。
+      event.stopPropagation();
+      togglePopup(layerId, hintId, null, false);
+    }
   });
 
   layer.appendChild(card);
@@ -881,6 +912,9 @@ function buildDrawer() {
     'width:' + WIDTH_STEPS[0] + 'px;height:100%;box-sizing:border-box;' +
     'background:' + SURFACE + ';color:' + FG + ';border-left:1px solid ' + BORDER + ';' +
     'font-size:13px;line-height:1.5;';
+  // 记着"哪面抽屉是我建的"：快捷键（见 onShortcut）与占满窗口那一层都靠它判断
+  // 这一份实例还算不算数 —— 只认 id 的话，宿主刷新网页之后新旧两份会同时上手。
+  STATE.drawer = drawer;
 
   var header = document.createElement('div');
   header.style.cssText =
@@ -1181,8 +1215,8 @@ function buildDrawer() {
   drawer.appendChild(header);
   drawer.appendChild(buildTabs());
   drawer.appendChild(chatView);
-  drawer.appendChild(buildNovelView());
-  drawer.appendChild(buildProjectView());
+  // 另外两页收在占满窗口的那一层里（见 buildViewsOverlay）：抽屉里只留对话。
+  drawer.appendChild(buildViewsOverlay());
   document.body.appendChild(drawer);
   // 引用栏的显隐只有 paintQuotes 一个作者：摆上架就先按"一张卡都没有"画一次，
   // 不然空栏的内联状态是空的，跟它实际收着的样子对不上（一眼看不出它现在是开是合）。
@@ -3628,6 +3662,10 @@ function closeDrawer() {
 //: 三页的名字与先后（tablist 的顺序、方向键绕圈、Home/End 都照它来）。
 var VIEW_ORDER = ['chat', 'novel', 'project'];
 
+//: 页名 → 给人看的页名。标签栏、占满窗口那一层的标题栏都读它 ——
+//: 抄成两份的话，标签上写着「管理小说」、铺开那一层的标题却写着别的，而没人会报错。
+var VIEW_LABELS = { chat: '对话', novel: '管理小说', project: '项目管理' };
+
 //: 页名 → 那一页容器的 id（tab 的 aria-controls 用它，见 buildTabs）。
 function viewIdOf(view) {
   if (view === 'novel') return NOVEL_VIEW_ID;
@@ -3676,6 +3714,10 @@ function typingSomewhere() {
 
 function onShortcut(event) {
   if (STATE.open !== true) return;
+  // 自己那面抽屉已经不在页面上了（宿主刷新了网页、又注入了一份新脚本）：这一按不归我管。
+  // 少了这一句，上一份实例会照着 id 摸到**新的**那面抽屉动手 —— 同一个 Esc 被新旧两只手
+  // 各收一层，一次按键收掉两层，而两边都觉得自己没错。
+  if (!STATE.drawer || STATE.drawer.isConnected !== true) return;
   var key = String(event.key || '');
   if ((event.ctrlKey || event.metaKey) && !event.altKey && key.toLowerCase() === 'f') {
     var target = findTargetForView();
@@ -3688,8 +3730,31 @@ function onShortcut(event) {
   }
   if (key === 'Escape' && !typingSomewhere()) {
     event.preventDefault();
+    // 一次 Esc 只收一层，从眼前最近的一层往回收：
+    // 弹窗（导入 / 新建项目）→ 占满窗口那两页 → 抽屉自己。
+    // 一次收两层的话，填了一半的表单会和"我正看的那一页"一起消失，人得从头找回来。
+    if (closeOpenPopup()) return;
+    if (STATE.view !== 'chat') {
+      switchView('chat');
+      return;
+    }
     closeDrawer();
   }
+}
+
+// 有没有正开着的弹窗（导入原文 / 新建项目…）。弹窗自己也在 Esc 上收（见 buildPopup），
+// 这里再查一遍是为了兜住另一种情形：焦点被 Tab 挪到了卡片外面 —— 那时卡片上的监听
+// 收不到这一按，只剩这里能把弹窗收掉（不收的话，Esc 会把抽屉关了、弹窗却还开着）。
+function closeOpenPopup() {
+  var pairs = [[NOVEL_FORM_ID, toggleNovelForm], [PROJECT_FORM_ID, toggleProjectForm]];
+  for (var index = 0; index < pairs.length; index += 1) {
+    var layer = document.getElementById(pairs[index][0]);
+    if (layer && layer.dataset.open === '1') {
+      pairs[index][1](false);
+      return true;
+    }
+  }
+  return false;
 }
 
 // 挂一次就够（抽屉是常驻的，见 start），所以跟宽度监听一个套路。
@@ -3707,7 +3772,9 @@ function buildTabs() {
   tabs.id = TABS_ID;
   tabs.className = 'cs-tabs';
   tabs.setAttribute('role', 'tablist');
-  [['chat', '对话'], ['novel', '管理小说'], ['project', '项目管理']].forEach(function (pair) {
+  VIEW_ORDER.map(function (view) {
+    return [view, VIEW_LABELS[view]];
+  }).forEach(function (pair) {
     var tab = document.createElement('button');
     tab.type = 'button';
     tab.className = 'cs-tab';
@@ -3749,6 +3816,13 @@ function switchView(view) {
     tabs[index].setAttribute('aria-selected', on ? 'true' : 'false');
     tabs[index].tabIndex = on ? 0 : -1;
   }
+  // 「管理小说」「项目管理」不在这条窄缝里显示，而是把**占满窗口**的那一层铺开
+  // （见 buildViewsOverlay）：那两层自己的显隐仍旧由上面那两行管着 ——
+  // 这一层只负责"要不要占满窗口"，两件事分开，各自都只有一处作者。
+  var layer = document.getElementById(VIEWS_ID);
+  if (layer) layer.dataset.open = STATE.view === 'chat' ? '0' : '1';
+  var layerTitle = document.getElementById(VIEWS_TITLE_ID);
+  if (layerTitle) layerTitle.textContent = VIEW_LABELS[STATE.view];
   // 每次切到这一页都重新列一遍：原文是别的程序（编辑器、git、别的工具）也会动的东西，
   // 拿上回那份列表当准数，就会出现"点了半天打开的是个已经不存在的文件"。
   if (STATE.view === 'novel') loadNovels();
@@ -3758,6 +3832,51 @@ function switchView(view) {
     loadProjects();
     if (STATE.projectOpen) openProject(STATE.projectOpen.name);
   }
+}
+
+// 「管理小说」与「项目管理」共用的那一层：**占满窗口**。
+//
+// 为什么挂抽屉里而不是挂到 document.body 上：面板这几百条样式全收在 DRAWER_ID 那一条
+// （见 CHAT_CSS 的头一条注释），挂到 body 上就得把整套选择器再写一遍 —— 两处维护，
+// 改一处忘一处。能挂抽屉里是因为 position:fixed：抽屉自己没有 transform / filter /
+// will-change 这类会造"包含块"的东西（见 buildDrawer 的内联样式），所以固定定位在这里
+// **就是**相对视口，inset:0 即铺满窗口。哪天给抽屉加上动画位移，这一层会**悄悄**缩回
+// 抽屉那条窄缝里 —— 那正是这里写清楚这条前提的原因。
+//
+// 标题栏不是摆设：这一层铺满窗口时，抽屉顶上那排标签也被盖住了，得有一个说清
+// "我现在在哪一页、按哪儿回去"的地方（各页工具栏里那个「去对话」在滚动区里，会滚走）。
+function buildViewsOverlay() {
+  var layer = document.createElement('div');
+  layer.id = VIEWS_ID;
+  layer.className = 'cs-views';
+  layer.dataset.open = '0';
+
+  var head = document.createElement('div');
+  head.className = 'cs-views-head';
+
+  var title = document.createElement('div');
+  title.id = VIEWS_TITLE_ID;
+  title.className = 'cs-views-title';
+  // 标题由 switchView 填（同一个来源 VIEW_LABELS）：这里不先写死一句"管理小说"，
+  // 否则第一帧显示的是上一次那一页的名字。
+  title.textContent = '';
+  head.appendChild(title);
+
+  var back = document.createElement('button');
+  back.id = VIEWS_BACK_ID;
+  back.type = 'button';
+  back.className = 'cs-views-back';
+  back.textContent = '返回对话';
+  back.title = '回到对话那一页（这一层只是收起来，里面的选择都还在）';
+  back.addEventListener('click', function () {
+    switchView('chat');
+  });
+  head.appendChild(back);
+
+  layer.appendChild(head);
+  layer.appendChild(buildNovelView());
+  layer.appendChild(buildProjectView());
+  return layer;
 }
 
 function buildNovelView() {
@@ -5607,6 +5726,7 @@ function shelfBlock(shelf) {
   var files = document.createElement('div');
   files.className = 'cs-proj-files';
   var dirs = shelf.dirs && shelf.dirs.length > 0 ? shelf.dirs : [];
+  var groups = shelf.groups && shelf.groups.length > 0 ? shelf.groups : [];
   if (shelf.count === 0) {
     files.appendChild(
       projectEmpty(
@@ -5615,18 +5735,51 @@ function shelfBlock(shelf) {
     );
   }
   // 分组格（一个标题下好几个落点）与根格（只有文件、没有落点）形状不同，这里统一成一种。
-  var buckets = dirs.length > 0 ? dirs : [{ rel: '', files: shelf.files || [], truncated: false }];
-  buckets.forEach(function (bucket) {
-    (bucket.files || []).forEach(function (file) {
-      files.appendChild(projectFileRow(file));
+  // 一格里的落点再按**粒度**（全剧级 / 分集级）分段 —— 数据由宿主给（见 projects.py 的 tree），
+  // 面板这边不判"哪个落点是哪一级"：判错了不会报错，只会把一集的东西摆进"全剧共用"那一栏。
+  // 只有一段时不摆小标题：一条"分集级"标题底下全是分集级，那是噪声（空着那格同理，
+  // 一句"还空着"已经说完了，再来两个"还空着"的分段只是把格子撑长）。
+  var sections;
+  if (dirs.length === 0) {
+    sections = [{ title: '', count: shelf.count, dirs: [{ rel: '', files: shelf.files || [], truncated: false }] }];
+  } else if (groups.length > 1 && shelf.count > 0) {
+    sections = groups.map(function (group) {
+      return { title: group.title, count: group.count, dirs: group.dirs || [] };
     });
-    if (bucket.truncated === true) {
-      files.appendChild(projectEmpty('这里只列了前 ' + (bucket.files || []).length + ' 个，还有更多没列出来。'));
-    }
+  } else {
+    sections = [{ title: '', count: shelf.count, dirs: dirs }];
+  }
+  sections.forEach(function (section) {
+    if (section.title) files.appendChild(projectGroupLabel(section));
+    section.dirs.forEach(function (bucket) {
+      (bucket.files || []).forEach(function (file) {
+        files.appendChild(projectFileRow(file));
+      });
+      if (bucket.truncated === true) {
+        files.appendChild(projectEmpty('这里只列了前 ' + (bucket.files || []).length + ' 个，还有更多没列出来。'));
+      }
+    });
   });
   box.appendChild(head);
   box.appendChild(files);
   return box;
+}
+
+// 一格里的粒度小标题（全剧级 / 分集级）。旁边带一段这一组有几个文件 ——
+// 光秃秃一个小标题，人会以为下面那几行就是这一格的全部，其实这一格还有别的组。
+function projectGroupLabel(section) {
+  var label = document.createElement('div');
+  label.className = 'cs-proj-group';
+  label.dataset.scope = section.title;
+  var name = document.createElement('span');
+  name.className = 'cs-proj-group-name';
+  name.textContent = section.title;
+  var count = document.createElement('span');
+  count.className = 'cs-proj-group-count';
+  count.textContent = section.count > 0 ? section.count + ' 个文件' : '还空着';
+  label.appendChild(name);
+  label.appendChild(count);
+  return label;
 }
 
 function projectFileRow(file) {
@@ -6621,7 +6774,10 @@ export function getComfyStudioChatContentScript(): string {
     // 要占住显存，叠着跑只会两边都慢）。
     `skills: null, skill: '', skillRunning: '', ` +
     // 抽屉宽度（像素，0 = 占满整屏）与"窗口变窄要收回来"的监听装没装。
-    `width: 0, widthWatcher: false, shortcuts: false };\n` +
+    `width: 0, widthWatcher: false, shortcuts: false, ` +
+    // 这一份实例建的那面抽屉（见 buildDrawer）。宿主刷新网页后旧实例还在监听按键，
+    // 靠它认得出"我已经不在页面上了"，不至于伸手去动新实例那面抽屉。
+    `drawer: null };\n` +
     STUDIO_CHAT_MAIN_JS +
     `})();\n`
   return cachedScript

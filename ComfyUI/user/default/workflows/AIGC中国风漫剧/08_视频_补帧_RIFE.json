@@ -1,0 +1,193 @@
+{
+  "last_node_id": 9,
+  "last_link_id": 10,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LoadVideo",
+      "pos": [0, 0],
+      "size": [420, 82],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        { "name": "file", "type": "COMBO" }
+      ],
+      "outputs": [
+        { "name": "VIDEO", "type": "VIDEO", "links": [1], "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "LoadVideo" },
+      "widgets_values": ["AI漫剧_待补帧.mp4"],
+      "title": "载入待补帧视频（先把 mp4 放进 ComfyUI/input/ 再在此选它）"
+    },
+    {
+      "id": 2,
+      "type": "GetVideoComponents",
+      "pos": [0, 140],
+      "size": [420, 126],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        { "name": "video", "type": "VIDEO", "link": 1 }
+      ],
+      "outputs": [
+        { "name": "images", "type": "IMAGE", "links": [3], "slot_index": 0 },
+        { "name": "audio", "type": "AUDIO", "links": [9], "slot_index": 1 },
+        { "name": "fps", "type": "FLOAT", "links": [6], "slot_index": 2 },
+        { "name": "bit_depth", "type": "INT", "links": null, "slot_index": 3 },
+        { "name": "color_space", "type": "COMBO", "links": null, "slot_index": 4 }
+      ],
+      "properties": { "Node name for S&R": "GetVideoComponents" },
+      "widgets_values": [],
+      "title": "拆帧（取 帧/音频/帧率）"
+    },
+    {
+      "id": 3,
+      "type": "FrameInterpolationModelLoader",
+      "pos": [0, 320],
+      "size": [420, 58],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        { "name": "model_name", "type": "COMBO" }
+      ],
+      "outputs": [
+        { "name": "INTERP_MODEL", "type": "INTERP_MODEL", "links": [2], "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "FrameInterpolationModelLoader" },
+      "widgets_values": ["rife_v4.26.safetensors"],
+      "title": "补帧模型（RIFE 4.26）"
+    },
+    {
+      "id": 4,
+      "type": "FrameInterpolate",
+      "pos": [500, 0],
+      "size": [420, 100],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        { "name": "interp_model", "type": "INTERP_MODEL", "link": 2 },
+        { "name": "images", "type": "IMAGE", "link": 3 },
+        { "name": "multiplier", "type": "INT", "link": 4 }
+      ],
+      "outputs": [
+        { "name": "IMAGE", "type": "IMAGE", "links": [7], "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "FrameInterpolate" },
+      "widgets_values": [2],
+      "title": "补帧（倍率来自左侧 PrimitiveInt，单一事实源）"
+    },
+    {
+      "id": 5,
+      "type": "PrimitiveInt",
+      "pos": [500, 180],
+      "size": [220, 82],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        { "name": "value", "type": "INT" }
+      ],
+      "outputs": [
+        { "name": "INT", "type": "INT", "links": [4, 5], "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "PrimitiveInt" },
+      "widgets_values": [2, "fixed"],
+      "title": "补帧倍率（2 = 帧率翻倍）"
+    },
+    {
+      "id": 6,
+      "type": "ComfyMathExpression",
+      "pos": [500, 310],
+      "size": [300, 78],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        { "name": "values.a", "type": "FLOAT", "link": 6 },
+        { "name": "values.b", "type": "INT", "link": 5 }
+      ],
+      "outputs": [
+        { "name": "FLOAT", "type": "FLOAT", "links": [8], "slot_index": 0 },
+        { "name": "INT", "type": "INT", "links": null, "slot_index": 1 }
+      ],
+      "properties": { "Node name for S&R": "ComfyMathExpression" },
+      "widgets_values": ["min(abs(b), 16) * a"],
+      "title": "目标帧率 = 源帧率 × 倍率（官方蓝图表达式原样）"
+    },
+    {
+      "id": 7,
+      "type": "CreateVideo",
+      "pos": [1000, 0],
+      "size": [420, 150],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        { "name": "images", "type": "IMAGE", "link": 7 },
+        { "name": "fps", "type": "FLOAT", "link": 8 },
+        { "name": "audio", "type": "AUDIO", "link": 9 },
+        { "name": "bit_depth", "type": "INT" }
+      ],
+      "outputs": [
+        { "name": "VIDEO", "type": "VIDEO", "links": [10], "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "CreateVideo" },
+      "widgets_values": [48, 8],
+      "title": "合成视频（音频原样带走，24fps 源 ×2 记 48）"
+    },
+    {
+      "id": 8,
+      "type": "SaveVideo",
+      "pos": [1000, 220],
+      "size": [420, 250],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        { "name": "video", "type": "VIDEO", "link": 10 },
+        { "name": "filename_prefix", "type": "STRING" },
+        { "name": "format", "type": "COMBO" },
+        { "name": "codec", "type": "COMBO" }
+      ],
+      "outputs": [
+        { "name": "VIDEO", "type": "VIDEO", "links": null, "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "SaveVideo" },
+      "widgets_values": ["AI漫剧/视频/补帧_48fps", "auto", "auto"],
+      "title": "存盘（mp4）"
+    },
+    {
+      "id": 9,
+      "type": "MarkdownNote",
+      "pos": [1500, 0],
+      "size": [520, 560],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": ["# 08 视频 · 补帧（RIFE 4.26）\n\n## 用途\nH3 出的片子帧率偏低或想要慢动作时，帧率翻倍让运动变丝滑；接在 04/05（成片）或 06（多镜）之后跑。\n\n## 组合与出处\n- 模型：`rife_v4.26.safetensors`（共享池 frame_interpolation/），本机已有；官方蓝图 `blueprints/Frame Interpolation.json` 默认写的 film_net 我们池里没有，所以换 RIFE —— `comfy_extras/nodes_frame_interpolation.py` 里 FrameInterpolationModelLoader 对 RIFE 的 IFNet 权重做过前缀重映射（`module.` / `flownet.`），可直接加载。\n- 拓扑照官方蓝图：GetVideoComponents 拆帧 → FrameInterpolate 补帧 → ComfyMathExpression 算目标帧率（表达式 `min(abs(b), 16) * a` 原样照抄）→ CreateVideo 带上原音频重新合成。\n- 官方蓝图里 `enable_fps_multiplier` 那个 ComfySwitchNode + PrimitiveBoolean 我们**没有搬**：本项目固定按「开」用，直接连数学节点的结果，少两个节点少两处出错点。\n\n## 倍率只有一个事实源\n补帧倍率写在 `PrimitiveInt.value = 2`，它同时喂给 FrameInterpolate.multiplier 和数学表达式；要改倍率只改这一个框（FrameInterpolate 里显示的 2 只是 UI 冗余值）。上限 16 倍是官方表达式里的钳位。\n\n## 输入从哪来\nLoadVideo 只列 `ComfyUI/input/` 下的文件；H3 出片落在 `ComfyUI/output/AI漫剧/视频/`，先在文件管理器里把 mp4 拷/传到 input，再在这个节点下拉里选。\n"]
+    }
+  ],
+  "links": [
+    [1, 1, 0, 2, 0, "VIDEO"],
+    [2, 3, 0, 4, 0, "INTERP_MODEL"],
+    [3, 2, 0, 4, 1, "IMAGE"],
+    [4, 5, 0, 4, 2, "INT"],
+    [5, 5, 0, 6, 1, "INT"],
+    [6, 2, 2, 6, 0, "FLOAT"],
+    [7, 4, 0, 7, 0, "IMAGE"],
+    [8, 6, 0, 7, 1, "FLOAT"],
+    [9, 2, 1, 7, 2, "AUDIO"],
+    [10, 7, 0, 8, 0, "VIDEO"]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {},
+  "version": 0.4
+}

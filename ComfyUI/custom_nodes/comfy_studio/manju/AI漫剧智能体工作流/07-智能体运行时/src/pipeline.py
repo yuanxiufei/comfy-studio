@@ -7,7 +7,7 @@
 
     | 阶段 | 干什么 | 需要 LLM | 落点（对齐 `生产流程规范（S0-S7）.md` §一） |
     |---|---|---|---|
-    | S0 建纲 | 小说 → 分集大纲／每集剧本／角色小传／ID 注册表／未决项表 | ✅ | `00_PROJECT/01_剧本/` `03_台账/` |
+    | S0 建纲 | 小说 → 分集大纲／每集剧本／角色小传／ID 注册表／未决项表 | ✅ | `00_PROJECT/01_剧本/`（分集正文）· `00_PROJECT/01_剧本/00_总纲/`（全剧级）· `03_台账/` |
     | S1 资产 | 剧本 → 视觉圣经 + 四张索引 + 生图提示词 | ✅ | `00_PROJECT/02_资产索引/` `04_交付与出图/` |
     | S4 分镜 | 剧本 → 九列分镜表 + `shots_<EP>.json` | 可选 | `08_STORYBOARDS/` |
     | S4 首帧 | 每镜首帧 PNG（文生图，有资产图时挂参考图） | ❌ | `08_STORYBOARDS/frames_<EP>/` |
@@ -23,8 +23,16 @@
    S4 的 LLM 增强是可选的，失败只在分镜表里记一行警告。
 
 ⚠️ 本模块**不代做** S3（表情/动作派生，只在主 ID ≥ DRAFT 时才建）与
-S6（音频，口径在 `05-音乐音频/`），那两段留给各自 agent：
-`python main.py run expression|audio`。
+S6（音频，口径在 `05-音乐音频/`）—— 那两段各有入口，只是不在流水线里：
+
+    S3（表情 / 动作）  python main.py ask "给 CHR_001 出一套表情集"
+                       python main.py run asset "给 CHR_001 出一套动作集"   # 02 的 asset agent 认得 expression/pose
+    S6（音频）         python main.py run audio "把 EP01 的对白配出来"
+
+> 这里原写的是 `python main.py run expression|audio` —— 注册表里**没有** `expression`
+> 这个 agent（只有 `asset`），那句话是指向不存在入口的。`tests/test_stages.py`
+> 现在会逮住这类写法（阶段全表与入口在 `src/project.py` 的 `STAGE_SPECS`）。
+> 看全表：`python main.py flow --阶段表`
 """
 
 from . import film, registry as agent_registry, storyboard
@@ -273,7 +281,9 @@ class Flow:
     # S0 建纲：小说 → 分集大纲 / 每集剧本 / 角色小传 / ID 注册表 / 未决项表
     # ═════════════════════════════════════════════════════════
 
-    OUTLINE_JSON = "00_PROJECT/01_剧本/_分集大纲.json"
+    #: 大纲是**全剧级**数据（被每一集引用），落 `00_总纲/` —— 见规范 §二 的粒度判据。
+    #: v1 时它与分集正文平铺在 `01_剧本/` 一层；`project migrate` 会把它搬过来。
+    OUTLINE_JSON = f"{SCRIPT_META_DIR}/_分集大纲.json"
 
     def novel_path(self) -> str:
         """小说原文：`--小说` > 工作区 `novel/` 下跟项目同名的文件 > 那儿唯一的文件。"""
@@ -334,7 +344,7 @@ class Flow:
                      f"{'…' if len(made) > 4 else ''}")
 
         eps = self.episodes_of()
-        plan_md = self.p(SCRIPT_DIR, "分集大纲与三表.md")
+        plan_md = self.p(SCRIPT_META_DIR, "分集大纲与三表.md")
 
         # ① 分集大纲 —— JSON 是事实源（给后续"只补 EP03"用），md 是给人看的样子
         if self._keep(plan_path):

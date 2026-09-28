@@ -464,9 +464,9 @@ def _agent(name: str):
 # ─────────────────────────────────────────────────────────────
 
 def cmd_project(a: argparse.Namespace) -> int:
-    """项目管理：按规范建项目落点、列项目、体检。
+    """项目管理：按规范建项目落点、v1→v2 结构迁移、列项目、体检。
 
-    落点清单与体检判据都在 `src/project.py`（唯一事实源），本函数只管打印。
+    落点清单、迁移映射与体检判据都在 `src/project.py`（唯一事实源），本函数只管打印。
     """
     try:
         if a.action == "list":
@@ -487,7 +487,13 @@ def cmd_project(a: argparse.Namespace) -> int:
             res = project.scan_project(a.name)
             hr(f"🩺 项目体检 · {os.path.basename(res['path'])}")
             print(project.format_report(res))
-            return 1 if res["missing"] else 0
+            # v1 老结构也算"不合格" —— 它是静默的（落点一个不缺，只是粒度混着）
+            return 1 if (res["missing"] or res["legacy"]) else 0
+
+        if a.action == "migrate":
+            hr(f"🚚 {'预演（不落盘）' if a.dry else '结构迁移'} v1 → v2 · {a.name}")
+            res = project.migrate_project(a.name, dry=a.dry)
+            return 0 if res["ok"] else 1
 
         hr(f"🏗️ {'预演（不落盘）' if a.dry else '新建'}项目 · {a.name}")
         project.create_project(a.name, episodes=a.episodes,
@@ -510,13 +516,25 @@ def cmd_flow(a: argparse.Namespace) -> int:
     from src.pipeline import ORDER, STAGES, Flow, StageError, list_projects, projects_root
 
     if a.show_stages:
-        hr("🧩 全流程阶段（S0–S5，可单跑也可串跑）")
+        hr("🧩 生产阶段一览（S0–S7）—— 每一段**怎么跑**")
+        # 先列流水线能串跑的那几段（取自 flow_core，**唯一事实源**）。
         for s in STAGES:
-            print(f"  {s.code}  {s.key:<4s} {s.what}"
+            print(f"  {s.code}  flow --阶段 {s.key:<4s} {s.what}"
                   f"{'   ← 需要 LLM' if s.llm else ''}")
+        # 再列流水线**不覆盖**的阶段：它们的入口在别处，照样念出来 ——
+        # 否则用户照着 `流程与落点映射.md` 敲 `--阶段 表情`，只会拿到
+        # argparse 一句 "invalid choice"，而没有任何一处告诉他 S3 该走什么。
+        covered = {s.code for s in STAGES}
+        for spec in project.STAGE_SPECS:
+            if spec.code in covered:
+                continue
+            how = " / ".join(e.cmd for e in spec.entries)
+            print(f"  {spec.code}  {how}")
         print(f"\n  串跑顺序：{' → '.join(ORDER)}")
         print(f"  单跑某段：python main.py flow -p <项目> --阶段 分镜")
         print(f"  跑一段区间：python main.py flow -p <项目> --从 分镜 --到 成片")
+        print(f"  流水线只覆盖上面带 `flow --阶段` 的那几段；其余阶段的入口"
+              f"见它后面那条命令（口径：src/project.py 的 STAGE_SPECS）")
         return 0
     if a.show_projects:
         hr("📁 可用项目")
@@ -737,9 +755,42 @@ def cmd_outline(a: argparse.Namespace) -> int:
 # ─────────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
-    # 阶段名从 `src/pipeline.ORDER` 取（**唯一事实源**），不在这里抄一份 ——
+    # 阶段名从 `src.pipeline.ORDER` 取（**唯一事实源**），不在这里抄一份 ——
     # 抄一份的下场是"CLI 认得的阶段"和"真能跑的阶段"悄悄不是一回事。
     from src.pipeline import ORDER as ORDER_FOR_CLI
+
+    def _stage_arg(text: str) -> str:
+        """`--阶段` 的取值：流水线段名照收；**别的阶段名收不了，但要给出正确入口**。
+
+        这里原先直接 `choices=ORDER_FOR_CLI`。它的失效模式不是报错、而是**报得太少**：
+        用户是照着 `流程与落点映射.md` 的阶段名敲的（"S3 表情 / 动作"也在那张表里），
+        拿到的却只有一句 `invalid choice: '表情'` —— 没有任何一处告诉他 S3 走
+        `main.py ask`。阶段全表（含各自入口）在 `src/project.py` 的 `STAGE_SPECS`。
+        """
+        if text in ORDER_FOR_CLI:
+            return text
+        want = text.strip()
+        code = want.split(" ")[0]
+        for spec in project.STAGE_SPECS:
+            if not (code == spec.code or want == spec.name or want in spec.name):
+                continue
+            flow_keys = [e.key for e in spec.entries if e.kind == "flow"]
+            if flow_keys:
+                # 文档口径与流水线段名不同名（S0 建纲 ↔ 段名「建纲」、S1 资产设计 ↔
+                # 段名「资产」）：告诉他流水线里那一段叫什么。
+                raise argparse.ArgumentTypeError(
+                    f"「{text}」= {spec.code} {spec.name}。它在流水线里那一段叫 "
+                    f"{'、'.join(flow_keys)} —— 敲 `--阶段 {flow_keys[0]}`。")
+            how = " / ".join(e.cmd for e in spec.entries)
+            raise argparse.ArgumentTypeError(
+                f"「{text}」= {spec.code} {spec.name}。这一段**不在流水线里**，"
+                f"它的入口是：\n    {how}")
+        raise argparse.ArgumentTypeError(
+            f"没有「{text}」这个阶段。\n"
+            f"  流水线能串跑的：{'、'.join(ORDER_FOR_CLI)}\n"
+            f"  生产阶段（S0–S7）：{'、'.join(project.STAGE_ORDER)}"
+            f"（看全表与各自入口：python main.py flow --阶段表）")
+
     p = argparse.ArgumentParser(
         prog="AI漫剧资产库Agent",
         description="把一句话变成可复用的 AI 漫剧视觉资产（中英提示词 + 资产卡 + 图像）",
@@ -813,33 +864,38 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("doctor", help="环境自检")
 
     # ── 项目管理（建项目 / 列项目 / 体检）──
-    pj = sub.add_parser("project", help="项目管理：建项目落点 / 列项目 / 体检",
+    pj = sub.add_parser("project", help="项目管理：建项目落点 / 迁移 / 列项目 / 体检",
                         description="按 `08-项目管理/项目目录规范.md` 建全套落点与预置空表，"
                                     "并体检「缺哪个落点 / 哪一阶段还没产物」。"
-                                    "新建项目**不覆盖任何已有文件**（幂等）。")
-    pj.add_argument("action", choices=["new", "list", "check"],
-                    help="new 按规范建项目 · list 列出项目 · check 落点与产物体检")
-    pj.add_argument("name", nargs="?", help="项目名（new / check 必给；也可给路径）")
+                                    "新建项目**不覆盖任何已有文件**（幂等）。"
+                                    "迁移把 v1 老项目里与分集正文平铺在一层的**全剧级**设定"
+                                    "收进 `01_剧本/00_总纲/`：只移动、不覆盖、可反复跑。")
+    pj.add_argument("action", choices=["new", "list", "check", "migrate"],
+                    help="new 建项目 · migrate v1→v2 结构迁移 · list 列项目 · check 体检")
+    pj.add_argument("name", nargs="?", help="项目名（new / check / migrate 必给；也可给路径）")
     pj.add_argument("--集数", dest="episodes", type=int, default=12,
                     help="new：本剧集数（写进入口文件，默认 12）")
     pj.add_argument("--升级", dest="upgrade", action="store_true",
                     help="new：目标已存在时只补**缺的**落点与空表（不覆盖已有文件）")
     pj.add_argument("--预演", dest="dry", action="store_true",
-                    help="new：只打印会建什么，不落盘")
+                    help="new / migrate：只打印会建什么、会动什么，不落盘")
 
     # ── 全流程编排 ──
     fl = sub.add_parser("flow", help="全流程：小说 → 剧本 → 资产 → 分镜 → 首帧 → 出片 → 成片",
-                        description="一条流水线跑完 S0–S5。默认从「分镜」往后跑"
+                        description="一条流水线跑完它覆盖的那几段（S0 建纲 / S1 资产 / "
+                                    "S4 分镜 + 首帧 / S5 出片 + 成片）。默认从「分镜」往后跑"
                                     "（前面 S0/S1 要模型、要钱，且产物是给人改的）；"
-                                    "要连前面一起跑就 `--从 建纲`。")
+                                    "要连前面一起跑就 `--从 建纲`。"
+                                    "**S2 出图 / S3 表情·动作 / S6 音频 / S7 合规不在流水线里** —— "
+                                    "那几段各有入口，敲 `--阶段表` 看全表。")
     fl.add_argument("-p", "--项目", dest="project", default="",
                     help="项目名（在 projects/ 下）或直接给路径")
     fl.add_argument("--集", dest="ep", default="", help="集号，如 EP01（默认取项目里最小的一集）")
-    fl.add_argument("--阶段", dest="stage", choices=ORDER_FOR_CLI,
-                    help="只跑这一段")
-    fl.add_argument("--从", dest="from_stage", choices=ORDER_FOR_CLI,
+    fl.add_argument("--阶段", dest="stage", type=_stage_arg,
+                    help="只跑这一段（敲了流水线不覆盖的阶段，会告诉你该走哪条命令）")
+    fl.add_argument("--从", dest="from_stage", type=_stage_arg,
                     help="从这个阶段开始跑")
-    fl.add_argument("--到", dest="to_stage", choices=ORDER_FOR_CLI,
+    fl.add_argument("--到", dest="to_stage", type=_stage_arg,
                     help="跑到这个阶段为止")
     fl.add_argument("--状态", dest="status", action="store_true",
                     help="只看体检表（每阶段有多少产物），不跑任何东西")

@@ -29,6 +29,10 @@ WORKFLOW_ROOT = ROOT.parent                        # `AI漫剧智能体工作流
 # ── 项目骨架落点（`08-项目管理/项目目录规范.md` §一）──
 PROJ = "00_PROJECT"
 SCRIPT_DIR = f"{PROJ}/01_剧本"
+#: 剧本的**全剧级**设定（分集大纲、角色小传）—— 与上面的分集正文分开住。
+#: 判据见规范 §二：**被不止一集引用的，一律全剧级**（v1 时两者平铺在
+#: `01_剧本/` 一层，谁属于谁只能靠文件名猜，这就是 v2 要修的东西）。
+SCRIPT_META_DIR = f"{SCRIPT_DIR}/00_总纲"
 INDEX_DIR = f"{PROJ}/02_资产索引"
 LEDGER_DIR = f"{PROJ}/03_台账"
 DELIVERY_DIR = f"{PROJ}/04_交付与出图"

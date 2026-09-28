@@ -51,6 +51,7 @@ import os
 
 PROJECT_DIRS = (
     "00_PROJECT/01_剧本",
+    "00_PROJECT/01_剧本/00_总纲",
     "00_PROJECT/06_对白",
     "00_PROJECT/07_素材归档",
     "02_CHARACTERS",
@@ -58,6 +59,20 @@ PROJECT_DIRS = (
     "09_SHOTS",
     "11_AUDIO",
 )
+SCOPE_WHOLE = "全剧级"
+SCOPE_EPISODE = "分集级"
+SCOPE_MIXED = "混合"
+SCOPE_ORDER = (SCOPE_WHOLE, SCOPE_EPISODE, SCOPE_MIXED)
+DIR_SCOPES = {
+    "00_PROJECT/01_剧本": SCOPE_EPISODE,
+    "00_PROJECT/01_剧本/00_总纲": SCOPE_WHOLE,
+    "00_PROJECT/06_对白": SCOPE_EPISODE,
+    "00_PROJECT/07_素材归档": SCOPE_WHOLE,
+    "02_CHARACTERS": SCOPE_WHOLE,
+    "08_STORYBOARDS": SCOPE_EPISODE,
+    "09_SHOTS": SCOPE_EPISODE,
+    "11_AUDIO": SCOPE_EPISODE,
+}
 SEED_FILES = (
     ("对白表_EPxx.md", "00_PROJECT/06_对白/对白表_EP01.md"),
     ("素材来源登记.md", "00_PROJECT/07_素材归档/素材来源登记.md"),
@@ -291,6 +306,48 @@ class ProjectsLibraryTest(unittest.TestCase):
         self.assertFalse(shelves["index"]["exists"])
         self.assertEqual(shelves["index"]["count"], 0)
 
+    def test_shelf_splits_by_scope_and_does_not_list_nested_twice(self) -> None:
+        """⭐ 一格里的落点按**粒度**分组；`01_剧本/` 不把 `00_总纲/` 的文件再列一遍。
+
+        这两种毛病都不报错：粒度混在一列里，人会以为总纲也是"某一集"；
+        同一份文件列两遍，看起来只像"这项目文件挺多"。所以只能靠机械守卫钉。
+        """
+        self.library.create("剧分")
+        script = self.root / "剧分/00_PROJECT/01_剧本"
+        (script / "EP01-剧本.md").write_text("# EP01", encoding="utf-8")
+        (script / "00_总纲/角色小传.md").write_text("小传", encoding="utf-8")
+        shelf = {item["key"]: item for item in self.library.tree("剧分")["shelves"]}["script"]
+        self.assertEqual([group["title"] for group in shelf["groups"]], ["全剧级", "分集级"])
+        whole, episode = shelf["groups"]
+        self.assertEqual([bucket["rel"] for bucket in whole["dirs"]],
+                         ["00_PROJECT/01_剧本/00_总纲"])
+        self.assertEqual([bucket["rel"] for bucket in episode["dirs"]], ["00_PROJECT/01_剧本"])
+        # 全剧级那份文件只在它自己那一组里出现，且只出现一次。
+        self.assertEqual([f["rel"] for f in whole["dirs"][0]["files"]],
+                         ["00_PROJECT/01_剧本/00_总纲/角色小传.md"])
+        self.assertEqual([f["rel"] for f in episode["dirs"][0]["files"]],
+                         ["00_PROJECT/01_剧本/EP01-剧本.md"])
+        self.assertEqual(episode["count"], 1)
+        # 简报只在"分得开"的格里写粒度明细。
+        self.assertIn("· 全剧级：1 个文件", self.library.brief("剧分")["text"])
+
+    def test_a_landing_without_a_scope_is_reported_not_guessed(self) -> None:
+        """事实源漏标一个落点的粒度 → 如实报出来，**不**随手归进某一组。
+
+        归错组的失效模式是静默的：那一格被摆进"全剧级"，人就会以为里面是一份
+        跨集共用的设定 —— 它其实只是一处没对齐。
+        """
+        thin = self.spec_path.parent / "缺粒度.py"
+        thin.write_text(FAKE_SPEC.replace('    "11_AUDIO": SCOPE_EPISODE,\n', ""), encoding="utf-8")
+        library = ProjectLibrary(self.root, spec_path=thin)
+        self.assertEqual(library.status()["scope_gaps"], ["11_AUDIO"])
+        library.create("剧漏")
+        tree = library.tree("剧漏")
+        self.assertEqual(tree["scope_gaps"], ["11_AUDIO"])
+        self.assertIn("粒度未知", [g["title"] for s in tree["shelves"] for g in s["groups"]])
+        self.assertNotIn("11_AUDIO", [g["title"] for s in tree["shelves"] for g in s["groups"]])
+        self.assertIn("11_AUDIO", library.brief("剧漏")["text"])
+
     def test_tree_reports_the_stage_progress_from_the_spec(self) -> None:
         self.library.create("剧乙")
         summary = self.library.tree("剧乙")["summary"]
@@ -309,7 +366,7 @@ class ProjectsLibraryTest(unittest.TestCase):
         self.assertIn("【项目】剧丙", text)
         self.assertIn("原著：某本原著.txt", text)
         self.assertIn("S0 建纲", text)
-        self.assertIn("剧本：", text)
+        self.assertIn("剧本与总纲：", text)
         self.assertIn("0/2 段有产物", text)
         # 简报是给模型当素材的：只写查得到的事实，不掺评价。
         for word in ("建议", "优秀", "很好"):
@@ -528,7 +585,7 @@ class ProjectsRpcTest(unittest.TestCase):
         self.assertTrue(info["projects"])
         self.assertEqual(info["project_dir"], str(self.root))
         self.assertTrue(info["project_status"]["spec_ok"])
-        self.assertEqual(info["project_status"]["dirs"], 7)
+        self.assertEqual(info["project_status"]["dirs"], 8)
         # 没挂的时候要如实说没有，别报一个假的目录出去。
         self.assertFalse(self.bare.info({}, None)["projects"])
         self.assertIsNone(self.bare.info({}, None)["project_dir"])

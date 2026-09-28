@@ -96,7 +96,7 @@ RESERVED  →  DRAFT  →  LOCKED  →  （DEPRECATED）
    | `02-服化道/模板/VISUAL_BIBLE.md` | `00_PROJECT/02_资产索引/视觉圣经（VISUAL_BIBLE）.md` |
    | `02-服化道/模板/CHANGELOG.yaml` | `00_PROJECT/03_台账/变更记录（CHANGELOG）.yaml` |
    | `02-服化道/模板/ASSET_CARD.yaml` | `02_CHARACTERS/<ID>/ASSET_CARD.yaml`（每个实体一份） |
-   | `02-服化道/模板/INDEX-TEMPLATES.md` | 拆成 `00_PROJECT/02_资产索引/` 下的五张索引 |
+   | `02-服化道/模板/INDEX-TEMPLATES.md` | 拆成 `00_PROJECT/02_资产索引/` 下的**四张资产索引**（角色 / 服装 / 道具 / 场景）—— 第 1–4 章。它第 5 章的 SHOT INDEX 是**分镜产物**，落 `08_STORYBOARDS/`（S4），不进 `02_资产索引/` |
 
 4. 填写 `视觉圣经（VISUAL_BIBLE）` → 过世界观锁定
 5. 填写 `项目状态（PROJECT_STATE）` → 登记 `LOCK_WORLD`

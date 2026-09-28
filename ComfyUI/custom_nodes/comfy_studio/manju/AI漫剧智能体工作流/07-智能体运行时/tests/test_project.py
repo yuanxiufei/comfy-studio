@@ -17,6 +17,12 @@
   ④ **不写死机器路径** —— 源码里不得出现盘符绝对路径（换台机器就静默跳过）。
   ⑤ **同一知识一处维护** —— 节奏常数（台词语速/目标时长/时长容差）只有
      `storyboard.py` 一份，别处不得再存同值副本（改一处、另几处静默失效）。
+  ⑥ **迁移不许覆盖** —— v1 → v2 只把平铺在 `01_剧本/` 的**全剧级**设定收进
+     `00_总纲/`；目标已存在且内容不同时**两边都不动**并报冲突。
+     迁移脚本最坏的失效模式不是报错，是把人写的正本换成一份旧副本。
+  ⑦ **粒度是数据，不是注脚** —— `DIR_SCOPES` 必须与规范 §三 的「粒度」列逐项一致。
+     粒度判错的失效模式是静默的：面板把一集的对白表摆进"全剧共用"那一栏，
+     或者反过来 —— 没人会收到报错。
 
 运行：`python tests/test_project.py`
 """
@@ -144,10 +150,16 @@ class ProjectScaffoldTest(unittest.TestCase):
         got = project.scan_project(res["path"])
         self.assertEqual(got["missing"], [], "刚建完就报缺落点")
         stages = _stages(got)
-        self.assertEqual(stages["S0 建纲"], [], "空模板被当成了 S0 产物（体检变安慰剂）")
-        self.assertEqual(stages["S1 资产设计"], [])
-        self.assertEqual(stages["S6 音频"], [])
-        self.assertEqual(stages["S7 一致性"], [])
+        # 逐个阶段都过一遍，而不是挑两个名字断言 —— 挑名字的写法在阶段表增删时
+        # **静默漏管**（2026-09-28 加 S2 出图 / S3 表情 / 动作 时正是这样）。
+        self.assertEqual(
+            sorted(stages),
+            ["S0 建纲", "S1 资产设计", "S2 出图", "S3 表情 / 动作",
+             "S4 分镜", "S5 视频", "S6 音频", "S7 合规"],
+            "阶段表变了：对照 src/project.py 的 STAGE_SPECS 与两份流程文档",
+        )
+        for label, hits in stages.items():
+            self.assertEqual(hits, [], "%s 把空模板占了位当成了产物（体检变安慰剂）" % label)
 
     def test_check_sees_real_output(self):
         self._new()
@@ -249,6 +261,7 @@ class ProjectScaffoldTest(unittest.TestCase):
         dirs = tuple(project.PROJECT_DIRS)
         self.assertTrue(dirs, "PROJECT_DIRS 是空的 —— 这条守卫会静默通过")
         targets = [(flow_core, "PROJ"), (flow_core, "SCRIPT_DIR"),
+                   (flow_core, "SCRIPT_META_DIR"),
                    (flow_core, "INDEX_DIR"), (flow_core, "LEDGER_DIR"),
                    (flow_core, "DELIVERY_DIR"), (flow_core, "ASSET_DIRS"),
                    (storyboard, "STORYBOARD_DIR"), (storyboard, "SHOTS_DIR")]
@@ -265,6 +278,150 @@ class ProjectScaffoldTest(unittest.TestCase):
         self.assertEqual(Path(project.ROOT).name, "07-智能体运行时")
         self.assertEqual(Path(project.WORKFLOW_ROOT).name, "AI漫剧智能体工作流")
         self.assertTrue(os.path.isfile(project.SPEC_FILE))
+
+    # ── ⑥ v1 → v2 结构迁移 ───────────────────────────────────
+
+    def _v1_layout(self) -> str:
+        """手工摆一个 v1 老项目：**全剧级**数据和分集正文平铺在 `01_剧本/`。
+
+        这是 v1 的真实形态 —— 落点一个不缺，所以"缺落点"那套体检对它毫无反应。
+        """
+        self._new()
+        mk = self._p("00_PROJECT", "01_剧本")
+        Path(mk, "分集大纲与三表.md").write_text("三表正文", encoding="utf-8")
+        Path(mk, "_分集大纲.json").write_text('{"剧名": "测试剧"}', encoding="utf-8")
+        Path(mk, "角色小传.md").write_text("小传正文", encoding="utf-8")
+        Path(mk, "EP01-剧本.md").write_text("# EP01", encoding="utf-8")
+        return mk
+
+    def test_migrate_moves_whole_drama_settings(self):
+        mk = self._v1_layout()
+        res = project.migrate_project(self._p(), log=None)
+        self.assertTrue(res["ok"])
+        self.assertEqual([a[0] for a in res["actions"]], ["moved"] * 3)
+        self.assertFalse(os.path.exists(os.path.join(mk, "分集大纲与三表.md")),
+                         "老位置还留着一份 —— 那是被复制而不是被移动")
+        got = Path(mk, "00_总纲", "分集大纲与三表.md").read_text(encoding="utf-8")
+        self.assertEqual(got, "三表正文", "搬过去之后内容变了")
+        self.assertTrue(os.path.isfile(os.path.join(mk, "00_总纲", "_分集大纲.json")),
+                        "大纲 JSON 没搬 —— 建纲会读不到它，然后重写一份覆盖掉人的改动")
+        self.assertTrue(os.path.isfile(os.path.join(mk, "EP01-剧本.md")),
+                        "分集正文是分集级的，不该被搬走")
+
+    def test_migrate_is_idempotent(self):
+        self._v1_layout()
+        project.migrate_project(self._p(), log=None)
+        res = project.migrate_project(self._p(), log=None)
+        self.assertTrue(res["ok"], "二次跑报失败 —— 幂等没做到")
+        self.assertEqual([a[0] for a in res["actions"]], ["skip"] * 3)
+
+    def test_migrate_never_overwrites(self):
+        """⭐ 目标已存在且**内容不同** → 报冲突，两边一个字节都不动。
+
+        这条守的是迁移最坏的失效模式：脚本替人选一份，把人手写的正本换成旧副本，
+        而且**不报错**。宁可停下来喊人。
+        """
+        mk = self._v1_layout()
+        dst = Path(mk, "00_总纲", "分集大纲与三表.md")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text("人手写的正本", encoding="utf-8")
+        res = project.migrate_project(self._p(), log=None)
+        self.assertFalse(res["ok"], "有冲突却报成功 —— 人会以为已经迁完了")
+        self.assertEqual(res["actions"][0][0], "conflict")
+        self.assertEqual(dst.read_text(encoding="utf-8"), "人手写的正本", "目标被覆盖了")
+        self.assertEqual(Path(mk, "分集大纲与三表.md").read_text(encoding="utf-8"),
+                         "三表正文", "源被删了")
+
+    def test_migrate_duplicate_keeps_the_source(self):
+        """两边内容一样 → 只报 duplicate，**不替人删源**（删哪份是人决定的）。"""
+        mk = self._v1_layout()
+        dst = Path(mk, "00_总纲", "分集大纲与三表.md")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text("三表正文", encoding="utf-8")
+        res = project.migrate_project(self._p(), log=None)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["actions"][0][0], "duplicate")
+        self.assertTrue(os.path.isfile(os.path.join(mk, "分集大纲与三表.md")))
+
+    def test_migrate_dry_run_touches_nothing(self):
+        mk = self._v1_layout()
+        res = project.migrate_project(self._p(), dry=True, log=None)
+        self.assertEqual([a[0] for a in res["actions"]], ["moved"] * 3)
+        self.assertTrue(os.path.isfile(os.path.join(mk, "分集大纲与三表.md")),
+                        "--预演 不该落盘")
+        self.assertFalse(os.path.exists(os.path.join(mk, "00_总纲",
+                                                    "分集大纲与三表.md")))
+
+    def test_check_reports_v1_layout(self):
+        """v1 是新旧交替期的**静默**问题：落点一个不缺，只有体检点得出来。"""
+        self._v1_layout()
+        got = project.scan_project(self._p())
+        self.assertEqual(got["missing"], [], "v1 布局并不缺落点 —— 靠缺落点发现不了它")
+        self.assertIn("00_PROJECT/01_剧本/分集大纲与三表.md", got["legacy"])
+        self.assertIn("project migrate", project.format_report(got),
+                      "体检报了问题却没给修法")
+
+    def test_check_is_quiet_on_v2_layout(self):
+        """新项目（v2）不该被误报成待迁移。"""
+        self._new()
+        got = project.scan_project(self._p())
+        self.assertEqual(got["legacy"], [])
+        self.assertNotIn("project migrate", project.format_report(got))
+
+    def test_migration_targets_live_in_the_new_landing(self):
+        """迁移目标必须落在新落点里，来源就是 v1 那两份 —— 别处不许偷偷加。"""
+        landing = "00_PROJECT/01_剧本/00_总纲"
+        self.assertIn(landing, project.PROJECT_DIRS, "新落点没进清单，迁移目标无处可落")
+        self.assertTrue(project.MIGRATIONS, "迁移表空了 —— 这条守卫会静默通过")
+        for src_rel, dst_rel in project.MIGRATIONS:
+            self.assertEqual(os.path.dirname(dst_rel), landing, dst_rel)
+            self.assertEqual(os.path.dirname(src_rel), "00_PROJECT/01_剧本", src_rel)
+            self.assertNotEqual(src_rel, dst_rel)
+
+    def test_migration_map_matches_spec_doc(self):
+        """§四 的迁移表必须与 `MIGRATIONS` 对得上 —— 否则文档说的和跑的不是一回事。"""
+        body = Path(project.SPEC_FILE).read_text(encoding="utf-8")
+        for src_rel, dst_rel in project.MIGRATIONS:
+            self.assertIn(src_rel, body, "§四 没写源路径：%s" % src_rel)
+            self.assertIn(dst_rel, body, "§四 没写目标路径：%s" % dst_rel)
+
+    # ── ⑦ 粒度（全剧级 / 分集级）───────────────────────────────
+
+    def test_scopes_match_spec_doc(self):
+        """`DIR_SCOPES` 必须与规范 §三 的「粒度」列逐项一致（键集与取值都算）。
+
+        粒度判错的失效模式**不报错**：把一集的对白表摆进"全剧共用"那一栏，
+        或把全剧设定摆进分集栏 —— 两边都还长得像模像样。
+        """
+        doc = project.spec_scopes_from_doc()
+        self.assertTrue(doc, "§三 里一个粒度都没抽到 —— 表的写法变了？")
+        self.assertEqual(project.DIR_SCOPES, doc,
+                         "粒度表与 `08-项目管理/项目目录规范.md` §三 不一致："
+                         "改了文档就要改 src/project.py 的 DIR_SCOPES，反之亦然")
+
+    def test_scopes_cover_every_landing(self):
+        """每个落点都要有粒度 —— 少一个，面板那一格就只能猜。"""
+        missing = [rel for rel in project.PROJECT_DIRS if rel not in project.DIR_SCOPES]
+        self.assertEqual(missing, [], "这些落点没标粒度")
+        strays = [rel for rel in project.DIR_SCOPES if rel not in project.PROJECT_DIRS]
+        self.assertEqual(strays, [], "粒度表里写了清单里没有的落点")
+
+    def test_scope_values_are_known_ones(self):
+        """取值只许是这三种 —— 否则面板那边的分组逻辑会把它漏掉。"""
+        known = {project.SCOPE_WHOLE, project.SCOPE_EPISODE, project.SCOPE_MIXED}
+        self.assertEqual(known, {"全剧级", "分集级", "混合"})
+        for rel, scope in project.DIR_SCOPES.items():
+            self.assertIn(scope, known, "%s 的粒度是 %r" % (rel, scope))
+
+    def test_the_one_place_two_scopes_live_together(self):
+        """⭐ `01_剧本/`（分集级）与它下面的 `00_总纲/`（全剧级）正是 v2 的理由。
+
+        这条盯住"两种粒度并存"这件事本身：它俩要是变成一个粒度，v2 就白分了，
+        而面板那边按粒度分组也会退化成只有一组（看不出坏）。
+        """
+        self.assertEqual(project.DIR_SCOPES["00_PROJECT/01_剧本"], project.SCOPE_EPISODE)
+        self.assertEqual(project.DIR_SCOPES["00_PROJECT/01_剧本/00_总纲"],
+                         project.SCOPE_WHOLE)
 
 
 if __name__ == "__main__":

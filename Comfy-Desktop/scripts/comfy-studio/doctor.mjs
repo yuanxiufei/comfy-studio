@@ -3,7 +3,7 @@
  * 打通体检：只读检查，不改仓库里任何东西（唯一例外是 node_modules/.cache 下的门禁缓存，
  * 加 --no-cache 连它也不写）。
  *
- * 按「自己人代码入库 -> 后端(引擎) -> 前端(桌面壳) -> 接线(安装记录)」四段逐项核对，
+ * 按「自己人代码入库 -> 后端(引擎) -> 前端(桌面壳) -> 接线(安装记录 / 共享池)」逐段核对，
  * 每项给出 通过/失败 与失败时的下一步命令。任何一项失败都以非 0 退出，
  * 方便在 CI 或脚本里当门禁用。
  *
@@ -591,6 +591,113 @@ if (records) {
       sameRoot && fs.existsSync(derivedPython) && fs.existsSync(derivedMain),
       derivedPython,
       `installPath 应为仓库根 ${repoRoot}（宿主只按 <installPath>/ComfyUI/.venv 派生，不读 venvPath）：跑 npm run seed`
+    )
+  }
+}
+
+console.log('\n== 接线：共享池 ==')
+// 这一段为什么必须存在（事实链，都核过源码，不是推测）：
+//   - ComfyUI/main.py 的 apply_custom_paths()（140-148 行）：先读 <ComfyUI>/extra_model_paths.yaml
+//     （有才读），再读启动参数 --extra-model-paths-config 给的每个文件；两条都进
+//     utils/extra_config.py 的 load_extra_path_config()，同一个路径只做 is_default 提升、
+//     不重复追加，所以两份同时生效不会多出重复条目。
+//   - 桌面壳只会注入 %APPDATA%/comfyui-desktop-2/instance-model-paths/<安装id>.yaml，
+//     实测那份**只有模型目录、没有 custom_nodes 键**（它按 settings.json 的 modelsDirs 生成）。
+//     于是「共享插件池」这一半只能靠本仓自己那份 extra_model_paths.yaml，而它被
+//     ComfyUI/.gitignore 忽略（第 10 行）—— 换台机器时唯一会静默丢掉的就是它。丢掉的症状不是
+//     一条能看见的错误，是漫剧那几条视频工作流整片红节点。
+//   - 指向不存在的目录时 ComfyUI 不报错（extra_config.py 只做 os.path.join + normpath），
+//     所以池根还在不在位、插件池非不非空，只能在这里机械核对。
+const sharedYaml = path.join(comfyDir, 'extra_model_paths.yaml')
+
+/** 这条接线的绝对路径清单：对齐 utils/extra_config.py 的算法（base_path 相对节 + 每键的每行值）。 */
+function resolveWiring(sections) {
+  const entries = []
+  for (const [section, conf] of Object.entries(sections)) {
+    if (!conf || typeof conf !== 'object') continue
+    const base = typeof conf.base_path === 'string' ? conf.base_path : null
+    for (const [key, value] of Object.entries(conf)) {
+      if (key === 'base_path' || key === 'is_default') continue
+      if (typeof value !== 'string') continue
+      for (const line of value.split('\n')) {
+        if (line.trim() === '') continue
+        const abs = base
+          ? path.join(base, line)
+          : path.isAbsolute(line)
+            ? line
+            : path.join(path.dirname(sharedYaml), line)
+        entries.push({ section, key, abs: path.normalize(abs) })
+      }
+    }
+  }
+  return entries
+}
+
+if (!fs.existsSync(sharedYaml)) {
+  check(
+    '共享池接线文件在位',
+    false,
+    sharedYaml,
+    '跑 npm run seed 生成（池根按 settings.json 的 modelsDirs 的上一级推导，或用 COMFYUI_SHARED_ROOT 显式指定）'
+  )
+} else {
+  let wiringError = ''
+  let sections = null
+  try {
+    // yaml 是桌面壳自己的依赖（Comfy-Desktop/package.json 的 dependencies 里有），不引新包。
+    // 动态 import：node_modules 没装时，其它项还要能照跑出来。
+    const { parse } = await import('yaml')
+    sections = parse(fs.readFileSync(sharedYaml, 'utf8'))
+    if (!sections || typeof sections !== 'object' || Array.isArray(sections)) {
+      wiringError = '顶层不是「节名 -> 键值」的对象'
+    }
+  } catch (err) {
+    wiringError = String(err?.message ?? err)
+  }
+  check(
+    '共享池接线文件可解析',
+    wiringError === '',
+    wiringError === ''
+      ? `${path.basename(sharedYaml)} · ${Object.keys(sections).length} 节：${Object.keys(sections).join('、')}`
+      : wiringError,
+    '跑 npm run setup:desktop 装上 Comfy-Desktop 的依赖（yaml 解析器在那边）'
+  )
+
+  if (wiringError === '') {
+    const entries = resolveWiring(sections)
+    // 池根（每节的 base_path）必须在位：它不在，这一节挂上去的全是空的
+    const roots = Object.entries(sections)
+      .filter(([, conf]) => conf && typeof conf === 'object' && typeof conf.base_path === 'string')
+      .map(([section, conf]) => ({ section, abs: path.normalize(conf.base_path) }))
+    const badRoots = roots.filter((r) => !fs.existsSync(r.abs))
+    const alive = entries.filter((e) => fs.existsSync(e.abs))
+    check(
+      '接线的池根都在位',
+      badRoots.length === 0,
+      badRoots.length === 0
+        ? `${roots.map((r) => `${r.section} -> ${r.abs}`).join('；')} · ${alive.length}/${entries.length} 条路径在位`
+        : badRoots.map((r) => `${r.section} -> ${r.abs}`).join('；'),
+      '池子挪过位置或盘符变了：改这份文件里的路径，或删掉它再用 COMFYUI_SHARED_ROOT 重新跑 npm run seed'
+    )
+
+    // 子类型目录不在位不算失败：extra_config.py 只把路径挂上去，空目录 ComfyUI 不报错
+    // （本仓那份就写着池里没有的 t2i_adapter/）。缺得多不多，看上面那条的 "N/M 条路径在位"。
+    const poolDirs = [...new Set(entries.filter((e) => e.key === 'custom_nodes').map((e) => e.abs))]
+    const packages = poolDirs.flatMap((dir) =>
+      fs.existsSync(dir)
+        ? fs
+            .readdirSync(dir, { withFileTypes: true })
+            .filter((e) => e.isDirectory())
+            .map((e) => e.name)
+        : []
+    )
+    check(
+      '共享插件池已接上（custom_nodes 非空）',
+      poolDirs.length > 0 && packages.length > 0,
+      poolDirs.length === 0
+        ? '接线上没有 custom_nodes 这一节'
+        : `${poolDirs.join('、')} · ${packages.length} 个插件包`,
+      '桌面壳注入的那份 yaml 不含 custom_nodes，共享插件池只能写在本仓 ComfyUI/extra_model_paths.yaml：跑 npm run seed 生成'
     )
   }
 }

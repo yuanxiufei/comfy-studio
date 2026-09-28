@@ -417,6 +417,9 @@ Gate / 指纹 / 版本 / 落盘，不会出现「批量生成的与单个生成�
 > latent 节点的 `width`/`height`、`KSampler.seed`；其余节点（模型 / LoRA / VAE / 采样器）**照工作流原样**。
 > 因此**换配方 = 换工作流文件，代码一行不动**。配置见 `config.json` 的 `image.comfyui` 一节
 > （`workflow` 填一张**节点式**工作流 JSON 的绝对路径），也可用 `COMFYUI_WORKFLOW` / `COMFYUI_BASE_URL` 覆盖。
+> ⭐ **该选哪套权重组合**：同节的 `_模型组合` 记着本机实测结论（图像基座用 2512 而非 2.1、
+> 量化档用 int8 而非 nvfp4、Lightning 可挂、已派生一张加速档做 A/B），判据是 LoRA 键名覆盖率 ——
+> 算它的脚本是 `custom_nodes/comfy_studio/tools/qwen21-lora-compat.py`（只读 safetensors 头）。
 > **不需要任何 API Key**。注入点一律**靠连线定位**（不靠节点 id —— 你在 ComfyUI 里重画一次，id 就全变了）。
 > seed 留空时由提示词哈希派生：**同词同 seed**，这是《ComfyUI 出图流程》§五 的一致性第 1 条。
 

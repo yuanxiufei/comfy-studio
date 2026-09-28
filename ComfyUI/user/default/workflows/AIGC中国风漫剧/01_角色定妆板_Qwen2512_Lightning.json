@@ -1,0 +1,687 @@
+{
+  "last_node_id": 13,
+  "last_link_id": 12,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "UNETLoader",
+      "pos": [
+        0,
+        0
+      ],
+      "size": [
+        360,
+        82
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "unet_name",
+          "type": "COMBO"
+        },
+        {
+          "name": "weight_dtype",
+          "type": "COMBO"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            1
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "UNETLoader"
+      },
+      "widgets_values": [
+        "qwen_image_2512_bf16.safetensors",
+        "default"
+      ],
+      "title": "Qwen-2512 DiT"
+    },
+    {
+      "id": 2,
+      "type": "CLIPLoader",
+      "pos": [
+        420,
+        0
+      ],
+      "size": [
+        360,
+        106
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip_name",
+          "type": "COMBO"
+        },
+        {
+          "name": "type",
+          "type": "COMBO"
+        },
+        {
+          "name": "device",
+          "type": "COMBO"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "links": [
+            2,
+            3
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPLoader"
+      },
+      "widgets_values": [
+        "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+        "qwen_image",
+        "default"
+      ],
+      "title": "CLIP"
+    },
+    {
+      "id": 3,
+      "type": "VAELoader",
+      "pos": [
+        840,
+        0
+      ],
+      "size": [
+        360,
+        58
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "vae_name",
+          "type": "COMBO"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "links": [
+            4
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAELoader"
+      },
+      "widgets_values": [
+        "qwen_image_vae.safetensors"
+      ],
+      "title": "VAE"
+    },
+    {
+      "id": 4,
+      "type": "LoraLoaderModelOnly",
+      "pos": [
+        0,
+        160
+      ],
+      "size": [
+        360,
+        82
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 1
+        },
+        {
+          "name": "lora_name",
+          "type": "COMBO"
+        },
+        {
+          "name": "strength_model",
+          "type": "FLOAT"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            5
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoraLoaderModelOnly"
+      },
+      "widgets_values": [
+        "Qwen-国漫短剧3D CG质感角色V1_Qwen-国漫短剧3D CG质感角色V1.safetensors",
+        0.8
+      ],
+      "title": "角色 LoRA (0.8)"
+    },
+    {
+      "id": 5,
+      "type": "CLIPTextEncode",
+      "pos": [
+        420,
+        200
+      ],
+      "size": [
+        420,
+        260
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 2
+        },
+        {
+          "name": "text",
+          "type": "STRING"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "links": [
+            6
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPTextEncode"
+      },
+      "widgets_values": [
+        "K-GM, 3D次时代CG风格渲染, PBR材质渲染, 浅景深, 高精度雕刻模型, 戏剧性体积光, 次表面散射皮肤, 烟雾模拟, 电影感氛围, 高精度3D模型, 中国风场景, 4K高清纹理, 电影级布光, Octane渲染器质感, Unreal Engine 5, Chinese Guoman 3D style, East Asian adult face, character reference sheet, 2048x1536, 4:3 horizontal board, four equal columns from left to right. Column 1: front upper-body portrait of [角色名], head and shoulders to waist, face clearly visible. Column 2: headless front full-body orthographic view of [角色名]. Column 3: headless exact 90-degree side full-body orthographic view of [角色名]. Column 4: headless exact back full-body orthographic view of [角色名]. Columns 2-4 have no head, no face, no eyes, no ears, no hair, no crown and no headwear; the neck is cut cleanly at the collar and the background passes through the former head area. Character details: [年龄/身份], [脸型/五官], [发型/发色], [眼睛], [身高体型], [服装], [配饰/道具]. Standard orthographic projection, no 3/4 view, no perspective distortion, same costume, same body proportion, same pose, full body from neck to feet, no clone, no text, no watermark, all labels in simplified Chinese."
+      ],
+      "title": "正向提示词"
+    },
+    {
+      "id": 6,
+      "type": "CLIPTextEncode",
+      "pos": [
+        420,
+        500
+      ],
+      "size": [
+        420,
+        160
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 3
+        },
+        {
+          "name": "text",
+          "type": "STRING"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CONDITIONING",
+          "type": "CONDITIONING",
+          "links": [
+            7
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPTextEncode"
+      },
+      "widgets_values": [
+        "heads in columns 2-4, faces in columns 2-4, hair in columns 2-4, crowns in columns 2-4, 后脑勺 in columns 2-4, 三视图带头, 人物分身, 复制人, 多余人物, 角色增殖, 多人重叠, 3/4侧视, 四分之三侧脸, 透视变形, 动态头发, 动态衣摆, 肢体畸形, 手部畸形, 多余手指, 画面抖动, 闪烁, 模糊, 低清晰度, 水印, 英文文字, 乱码, 错别字, 拼接痕迹, 蒙太奇, 版式混乱"
+      ],
+      "title": "负面提示词"
+    },
+    {
+      "id": 7,
+      "type": "EmptySD3LatentImage",
+      "pos": [
+        840,
+        160
+      ],
+      "size": [
+        280,
+        106
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "width",
+          "type": "INT"
+        },
+        {
+          "name": "height",
+          "type": "INT"
+        },
+        {
+          "name": "batch_size",
+          "type": "INT"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": [
+            8
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "EmptySD3LatentImage"
+      },
+      "widgets_values": [
+        2048,
+        1536,
+        1
+      ],
+      "title": "空潜空间 2048x1536 (4:3)"
+    },
+    {
+      "id": 8,
+      "type": "KSampler",
+      "pos": [
+        840,
+        340
+      ],
+      "size": [
+        380,
+        262
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 11
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 6
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 7
+        },
+        {
+          "name": "latent_image",
+          "type": "LATENT",
+          "link": 8
+        },
+        {
+          "name": "seed",
+          "type": "INT"
+        },
+        {
+          "name": "steps",
+          "type": "INT"
+        },
+        {
+          "name": "cfg",
+          "type": "FLOAT"
+        },
+        {
+          "name": "sampler_name",
+          "type": "COMBO"
+        },
+        {
+          "name": "scheduler",
+          "type": "COMBO"
+        },
+        {
+          "name": "denoise",
+          "type": "FLOAT"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": [
+            9
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "KSampler"
+      },
+      "widgets_values": [
+        42,
+        8,
+        1.0,
+        "euler",
+        "simple",
+        1.0
+      ],
+      "title": "KSampler"
+    },
+    {
+      "id": 9,
+      "type": "VAEDecode",
+      "pos": [
+        1260,
+        340
+      ],
+      "size": [
+        210,
+        46
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "samples",
+          "type": "LATENT",
+          "link": 9
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 4
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            10
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAEDecode"
+      },
+      "widgets_values": [],
+      "title": "VAE Decode"
+    },
+    {
+      "id": 10,
+      "type": "SaveImage",
+      "pos": [
+        1260,
+        440
+      ],
+      "size": [
+        380,
+        120
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 10
+        },
+        {
+          "name": "filename_prefix",
+          "type": "STRING"
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "SaveImage"
+      },
+      "widgets_values": [
+        "AI漫剧/角色定妆板/Subject1_lightning"
+      ],
+      "title": "保存图片"
+    },
+    {
+      "id": 11,
+      "type": "ModelSamplingAuraFlow",
+      "pos": [
+        320,
+        280
+      ],
+      "size": [
+        280,
+        58
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 12
+        },
+        {
+          "name": "shift",
+          "type": "FLOAT",
+          "widget": {
+            "name": "shift"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            11
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ModelSamplingAuraFlow"
+      },
+      "widgets_values": [
+        3.1
+      ]
+    },
+    {
+      "id": 12,
+      "type": "MarkdownNote",
+      "pos": [
+        -580,
+        0
+      ],
+      "size": [
+        540,
+        520
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "配方与选型依据（2512）",
+      "properties": {},
+      "color": "#432",
+      "bgcolor": "#653",
+      "widgets_values": [
+        "# 配方与选型依据（Qwen-Image 2512 · **Lightning 加速档**）\r\n\r\n> ⚠️ 本张是 `01_角色定妆板_Qwen2512.json` 的**加速派生档**，**尚未实跑比对** —— 画风是否因叠加\r\n> Lightning 而衰减，只有把两张都跑一遍才算数。要多出几版看构图时用它换速度；出正式定妆板仍走母版。\r\n\r\n## 与母版的差异（只有这三处，其余逐字节相同）\r\n1. 多一个 `LoraLoaderModelOnly`：`Qwen-Image-Lightning-8steps-V1.1-bf16.safetensors`（strength **1.0**），\r\n   串在画风 LoRA（0.8，未动）之后、`ModelSamplingAuraFlow` 之前。\r\n2. KSampler：步数 **30 → 8**，cfg **4.0 → 1.0**。\r\n3. `SaveImage` 前缀加 `_lightning`。\r\n\r\n\r\n## 采样配方照官方蓝图抄，别改\r\n- `ModelSamplingAuraFlow` **shift=3.1** —— 出处：本仓 `blueprints/Text to Image (Qwen-Image 2512).json`。\r\n  它把 `model_sampling` 换成带 shift 的 flow-matching 实现（`comfy_extras/nodes_model_advanced.py`）。\r\n- KSampler **euler / simple**，与官方一致。此前是 `normal`，已对齐。\r\n- 步数 30 / cfg 4.0 是**有意保留**的差异：官方默认 50 步，而 2512 bf16 有 38GB，\r\n  本机 22.5GB 显存必然反复 offload，50 步代价过高。\r\n\r\n## 为什么用 2512，而不是更新的 Qwen-Image 2.1\r\n本机已有 2.1 的 int8 档（6.76GB，比 2512 省得多），但**不能换**，两条实测理由：\r\n\r\n1. **画风 LoRA 会丢 82% 的模块**。键名覆盖率实测（`ComfyUI/custom_nodes/comfy_studio/tools/qwen21-lora-compat.py`）：\r\n   - `Qwen-国漫短剧3D CG质感角色V1` → 2512 命中 **720/720 = 100%**\r\n   - 同一 LoRA → 2.1 只有 **128/720 = 17.8%**，缺的正是 `attn.add_q/k/v_proj`、`to_add_out`\r\n     这一整套 joint-attention 分支（2.1 的 DiT 只有 265 个张量，是打包存储，细粒度注入不兼容）。\r\n2. **版式出不了**。2.1 的正/负词与 latent 都由 `TextEncodeQwenImage21` 一个节点产出；\r\n   不挂参考图时 latent 只能是 `resolution × resolution` 正方形，出不了本张的 4:3 定妆板。\r\n\r\n→ 2.1 的正确定位是**参考图驱动的编辑**（它的 `images` 输入槽就是干这个的），不是替代本张。\r\n\r\n## 加速 LoRA：本张就是母版里说的「另复制一份」\r\n`Qwen-Image-Lightning-8steps-V1.1-bf16` 对 2512 命中 **720/720 = 100%**（键名与原始\r\nQwen-Image v1.0 同构，故可跨代套用），判据出处同母版：`custom_nodes/comfy_studio/tools/qwen21-lora-compat.py`。\r\n选 **8steps 版**而非 4steps：4steps 蒸馏更激进、画风衰减风险更高，本张只要「速度优先」，先用保守的那份。\r\n\r\n## 本机算力约束（别踩）\r\nRTX A5000 是 **SM 8.6 / 22.5GB**。`supports_nvfp4_compute` 在 SM 8.6 上为假（nvfp4 要 Blackwell），\r\n所以凡 `*nvfp4*` / `*awq*` 权重档一律不要选 —— 选了不会报错，只会悄悄退化成慢路径。\r\nint8（`int8_convrot`）是本机可用的最优量化档。\r\n"
+      ]
+    },
+    {
+      "id": 13,
+      "type": "LoraLoaderModelOnly",
+      "pos": [
+        0,
+        260
+      ],
+      "size": [
+        360,
+        82
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 5
+        },
+        {
+          "name": "lora_name",
+          "type": "COMBO"
+        },
+        {
+          "name": "strength_model",
+          "type": "FLOAT"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            12
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoraLoaderModelOnly"
+      },
+      "widgets_values": [
+        "Qwen-Image-Lightning-8steps-V1.1-bf16.safetensors",
+        1.0
+      ],
+      "title": "Lightning 8step (1.0)"
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      4,
+      0,
+      "MODEL"
+    ],
+    [
+      2,
+      2,
+      0,
+      5,
+      0,
+      "CLIP"
+    ],
+    [
+      3,
+      2,
+      0,
+      6,
+      0,
+      "CLIP"
+    ],
+    [
+      4,
+      3,
+      0,
+      9,
+      1,
+      "VAE"
+    ],
+    [
+      5,
+      4,
+      0,
+      13,
+      0,
+      "MODEL"
+    ],
+    [
+      6,
+      5,
+      0,
+      8,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      7,
+      6,
+      0,
+      8,
+      2,
+      "CONDITIONING"
+    ],
+    [
+      8,
+      7,
+      0,
+      8,
+      3,
+      "LATENT"
+    ],
+    [
+      9,
+      8,
+      0,
+      9,
+      0,
+      "LATENT"
+    ],
+    [
+      10,
+      9,
+      0,
+      10,
+      0,
+      "IMAGE"
+    ],
+    [
+      11,
+      11,
+      0,
+      8,
+      0,
+      "MODEL"
+    ],
+    [
+      12,
+      13,
+      0,
+      11,
+      0,
+      "MODEL"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {},
+  "version": 0.4
+}

@@ -15,7 +15,8 @@
 **原样载入**来用（它只 import os/re/datetime，能独立载入）：落点、种子空表、
 阶段判据、建项目、体检全都是**它的**代码。这里只做三件事：
 
-① 把结果摆成面板要的形状（按"围绕剧本"的顺序分组，见 :data:`PROJECT_SHELVES`）；
+① 把结果摆成面板要的形状（按"围绕剧本"的顺序分**格**＝域，格内再按**粒度**
+   全剧级 / 分集级分组；格见 :data:`PROJECT_SHELVES`，粒度见 ``spec.DIR_SCOPES``）；
 ② 加一道越界守卫与编码判定 —— 越界复用 :func:`comfy_studio.localfiles.is_within`，
    编码复用 :func:`comfy_studio.novels.decode_text`（同一台机器上剧本与原文往往
    出自同一个编辑器，两处各判一套只会出现"原文读得开、剧本读成乱码"）；
@@ -86,10 +87,13 @@ class ProjectsError(RuntimeError):
 #: 「一剧的资料」在面板上按**围绕剧本**的顺序分成几格：剧本在最前，素材归档在后，
 #: 演出相关的（世界观 / 角色 / 场景 / 分镜）在中间。
 #:
+#: 一格 = 一个**域**（skelton）；域里再按**粒度**分两组（全剧级 / 分集级），
+#: 粒度取自 ``spec.DIR_SCOPES`` —— 这里**不写**哪个落点是哪一级，抄一份就是两处维护。
+#:
 #: ⚠️ 这里的字符串**必须**是 ``spec.PROJECT_DIRS`` 里的落点。规范改了落点而这里没跟上，
 #: :func:`shelf_gaps` 会报出来（而不是悄悄少显示一格）；单测对真清单钉住它为空。
 PROJECT_SHELVES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
-    ("script", "剧本", ("00_PROJECT/01_剧本",)),
+    ("script", "剧本与总纲", ("00_PROJECT/01_剧本", "00_PROJECT/01_剧本/00_总纲")),
     ("dialogue", "对白与配音", ("00_PROJECT/06_对白",)),
     ("index", "资产索引与台账", ("00_PROJECT/02_资产索引", "00_PROJECT/03_台账")),
     ("flow", "流程与进度", ("00_PROJECT/05_流程",)),
@@ -127,6 +131,36 @@ def shelf_unknown(dirs: tuple[str, ...] | list[str]) -> tuple[str, ...]:
     known = set(dirs)
     strays = {rel for _key, _title, rels in PROJECT_SHELVES for rel in rels if rel not in known}
     return tuple(sorted(strays))
+
+
+def scope_gaps(spec: Any) -> tuple[str, ...]:
+    """哪些落点**没有粒度**（``spec.DIR_SCOPES`` 里查不到）。
+
+    粒度查不到时面板不会崩，只会把那一格摆进"粒度未知"——**而这正是问题**：
+    "未知"和"全剧级"在界面上都只是一行字，没人会去追它为什么是未知。
+    所以这里报出来（``status`` 与 ``tree`` 都带一份），与 :func:`shelf_gaps` 同一个道理。
+
+    另有一道更早的守卫：``spec`` 里**根本没有** ``DIR_SCOPES`` 时 :func:`load_spec` 直接报错，
+    这里只查"有表但漏了项"。
+    """
+    known_scope: dict[str, str] = dict(getattr(spec, "DIR_SCOPES", {}) or {})
+    return tuple(rel for rel in spec.PROJECT_DIRS if rel not in known_scope)
+
+
+def scope_order(spec: Any) -> tuple[str, ...]:
+    """粒度的显示顺序（全剧级在前）。判据在 ``spec.SCOPE_ORDER``，这里不另立一份。
+
+    取的是 spec 里那几个常量**本身**（``SCOPE_WHOLE`` 等），所以哪怕将来改了叫法，
+    面板跟着变、不需要改这里。
+    """
+    order = tuple(getattr(spec, "SCOPE_ORDER", ()) or ())
+    if order:
+        return order
+    # 只有极老的规范才没有 SCOPE_ORDER —— 显式报错，不静默用一份写死的顺序顶上。
+    raise ProjectsError(
+        "事实源里没有 SCOPE_ORDER：粒度没有显示顺序，面板会把它摆成随机顺序。"
+        f"请在 {SPEC_REL} 里补上（SCOPE_ORDER = (SCOPE_WHOLE, SCOPE_EPISODE, SCOPE_MIXED)）。"
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -176,7 +210,14 @@ def load_spec(path: str | os.PathLike[str]) -> Any:
         raise ProjectsError(f"载入 {target} 失败：{type(err).__name__}: {err}") from err
     missing = [
         attr
-        for attr in ("PROJECT_DIRS", "SEED_FILES", "create_project", "scan_project")
+        for attr in (
+            "PROJECT_DIRS",
+            "SEED_FILES",
+            "create_project",
+            "scan_project",
+            "DIR_SCOPES",
+            "SCOPE_ORDER",
+        )
         if not hasattr(module, attr)
     ]
     if missing:
@@ -219,6 +260,15 @@ def _rel_path(root: Path, path: Path) -> str:
     return os.path.relpath(str(path), str(root)).replace(os.sep, "/")
 
 
+def _scope_title(scope: str) -> str:
+    """粒度组的标题。空串只有一个来源：那个落点不在 ``spec.DIR_SCOPES`` 里。
+
+    这时叫它"粒度未知"，**不**随手归进某一组 —— 归错了，人就以为那份资料
+    真的属于那一层，而它其实只是两边没对齐（:func:`scope_gaps` 会把它报出来）。
+    """
+    return scope or "粒度未知"
+
+
 def _count_files(root: Path) -> int:
     """项目里有多少个真文件（``.gitkeep`` 不算 —— 那是空目录的占位，不是资料）。"""
     total = 0
@@ -228,20 +278,35 @@ def _count_files(root: Path) -> int:
     return total
 
 
-def _list_files(root: Path, *, base: Path | None = None, deep: bool = True) -> list[dict[str, Any]]:
+def _list_files(
+    root: Path,
+    *,
+    base: Path | None = None,
+    deep: bool = True,
+    skip: tuple[Path, ...] = (),
+) -> list[dict[str, Any]]:
     """目录下的文件（按相对路径排），给面板点开用。``deep=False`` 只看这一层。
 
     ``base`` 是相对路径的起点，默认就是 ``root`` 自己。项目里一律传**项目根**：
     面板是拿着这里给的 ``rel`` 回来 :meth:`ProjectLibrary.read` 的，
     那个路径必须是项目内的完整相对路径，不是"相对这一格"。
+
+    ``skip`` 是**不往里走**的子目录（绝对路径）。用法只有一个：``01_剧本/`` 里面套着
+    ``00_总纲/``，两个都是落点 —— 不剪掉的话同一份``角色小传.md``会被列两遍，
+    而"列了两遍"看起来只是文件多了一个，没人会当成 bug。
     """
     if not root.is_dir():
         return []
     origin = base if base is not None else root
+    blocked = {Path(item).resolve() for item in skip}
     out: list[dict[str, Any]] = []
     if deep:
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = sorted(d for d in dirnames if d != "__pycache__")
+            dirnames[:] = sorted(
+                d
+                for d in dirnames
+                if d != "__pycache__" and (Path(dirpath) / d).resolve() not in blocked
+            )
             for name in sorted(filenames):
                 if name == ".gitkeep":
                     continue
@@ -342,6 +407,7 @@ class ProjectLibrary:
             "projects": 0,
             "gaps": [],
             "unknown": [],
+            "scope_gaps": [],
         }
         if self.directory.is_dir():
             out["projects"] = sum(
@@ -360,6 +426,7 @@ class ProjectLibrary:
         out["seeds"] = len(spec.SEED_FILES)
         out["gaps"] = list(shelf_gaps(dirs))
         out["unknown"] = list(shelf_unknown(dirs))
+        out["scope_gaps"] = list(scope_gaps(spec))
         return out
 
     # ---- 名字 → 目录 -----------------------------------------------------
@@ -445,20 +512,39 @@ class ProjectLibrary:
     # ---- 一部剧的落点 ---------------------------------------------------
 
     def tree(self, name: Any) -> dict[str, Any]:
-        """一部剧的落点，按**围绕剧本**的顺序分组（面板右侧那一屏就照它画）。
+        """一部剧的落点，按**围绕剧本**的顺序分格、格内再按**粒度**分两组。
 
-        分组只是"摆法"（:data:`PROJECT_SHELVES`），目录本身仍然逐项对着
-        ``spec.PROJECT_DIRS`` 查 —— 规范里加了落点而面板没加格，
+        两层摆放，两个来源，这里只做摆法、不复制知识：
+
+        * **格**（域）来自 :data:`PROJECT_SHELVES`（剧本 → … → 素材归档 → 项目根）；
+        * **粒度**来自 ``spec.DIR_SCOPES``（全剧级 / 分集级 / 混合），顺序取 ``spec.SCOPE_ORDER``。
+
+        一格里的落点按粒度归成 ``groups``，面板就照它画小标题 —— 于是
+        ``01_剧本/`` 下的``00_总纲/``（全剧级）与分集正文（分集级）不再是混在一列里的
+        一堆文件名，而是"先定的总纲"与"一集一份的正文"两组。
+
+        目录本身仍然逐项对着 ``spec.PROJECT_DIRS`` 查 —— 规范里加了落点而面板没加格，
         ``gaps`` 会如实带出来，不会悄悄少一格。
         """
         spec = self.spec()
         root = self._path(name)
+        scopes: dict[str, str] = dict(getattr(spec, "DIR_SCOPES", {}) or {})
+        order = scope_order(spec)
+        # 嵌套落点：`01_剧本/` 里面套着 `00_总纲/`。父格列文件时要把它剪掉，
+        # 否则同一份文件在父格与子格里各出现一次（多列一遍，不像 bug，像"文件真多"）。
+        nested = {
+            rel: tuple(root / Path(other) for other in spec.PROJECT_DIRS if other.startswith(rel + "/"))
+            for rel in spec.PROJECT_DIRS
+        }
         buckets: dict[str, dict[str, Any]] = {}
         for rel in spec.PROJECT_DIRS:
             full = root / Path(rel)
-            listed = _list_files(full, base=root) if full.is_dir() else []
+            listed = (
+                _list_files(full, base=root, skip=nested[rel]) if full.is_dir() else []
+            )
             buckets[rel] = {
                 "rel": rel,
+                "scope": scopes.get(rel, ""),
                 "exists": full.is_dir(),
                 "count": len(listed),
                 "truncated": len(listed) > MAX_TREE_FILES,
@@ -467,11 +553,26 @@ class ProjectLibrary:
         shelves = []
         for key, title, rels in PROJECT_SHELVES:
             items = [buckets[rel] for rel in rels if rel in buckets]
+            groups = []
+            for scope in tuple(order) + ("",):
+                members = [item for item in items if item["scope"] == scope]
+                if not members:
+                    continue
+                groups.append(
+                    {
+                        "scope": scope,
+                        "title": _scope_title(scope),
+                        "dirs": members,
+                        "exists": any(item["exists"] for item in members),
+                        "count": sum(item["count"] for item in members),
+                    }
+                )
             shelves.append(
                 {
                     "key": key,
                     "title": title,
                     "dirs": items,
+                    "groups": groups,
                     "exists": any(item["exists"] for item in items),
                     "count": sum(item["count"] for item in items),
                 }
@@ -482,6 +583,7 @@ class ProjectLibrary:
                 "key": "root",
                 "title": "项目根",
                 "dirs": [],
+                "groups": [],
                 "exists": True,
                 "count": len(root_files),
                 "files": root_files,
@@ -493,6 +595,8 @@ class ProjectLibrary:
             "dirs": list(spec.PROJECT_DIRS),
             "gaps": list(shelf_gaps(spec.PROJECT_DIRS)),
             "unknown": list(shelf_unknown(spec.PROJECT_DIRS)),
+            "scope_gaps": list(scope_gaps(spec)),
+            "scopes": list(order),
             "shelves": shelves,
             "summary": self._summary(root, spec),
             "novel": self.linked_novel(root),
@@ -672,8 +776,12 @@ class ProjectLibrary:
     def brief(self, name: Any) -> dict[str, Any]:
         """把一部剧的现状写成人话（面板「发到对话」那一下用）。
 
-        只写**面板查得到的**事实：落点齐不齐、每一格有多少文件、阶段到哪、原著登记了没。
+        只写**面板查得到的**事实：落点齐不齐、每一格有多少文件、**每一格里全剧级 /
+        分集级各多少**、阶段到哪、原著登记了没。
         不写评价、不替用户总结 —— 它是丢进输入框给模型当素材的，掺进判断等于替模型先入为主。
+
+        粒度那一层**只在分得开的时候写**（一格里有两种粒度）：一格本来就全是分集级时，
+        再写一行"全剧级 0 个"是噪声，模型读噪声会当成"这里缺东西"。
         """
         data = self.tree(name)
         summary = data["summary"]
@@ -690,6 +798,12 @@ class ProjectLibrary:
         for shelf in data["shelves"]:
             mark = "✅" if shelf["count"] else "☐"
             lines.append(f"  {mark} {shelf['title']}：{shelf['count']} 个文件")
+            groups = list(shelf.get("groups", []))
+            if len(groups) > 1:
+                for group in groups:
+                    lines.append(f"      · {group['title']}：{group['count']} 个文件")
+        if data["scope_gaps"]:
+            lines.append(f"  ⚠️ 这些落点在事实源里没有粒度标记：{'、'.join(data['scope_gaps'])}")
         lines.append("")
         lines.append(
             "阶段："
@@ -727,7 +841,7 @@ PROJECTS_TOOLS: tuple[_Spec, ...] = (
         name="list",
         description=(
             "列出这台机器上已有的漫剧项目（一剧一目录），每部带上：文件数、阶段进度"
-            "（S0 建纲 … S7 一致性）、缺哪些落点、最近改动时间。"
+            "（S0 建纲 … S7 合规）、缺哪些落点、最近改动时间。"
             "用户提到某部剧、问“现在做到哪了”“接着往下做”，先查这里再答，别凭印象说。"
             "这也告诉你项目根在哪：路径就在返回值里，读章节文件用文件工具时按它拼。"
             "建项目 / 改名不在工具里：那是人在面板上按的（名字与集数一定下来就要动十几个目录）。"
@@ -745,10 +859,13 @@ PROJECTS_TOOLS: tuple[_Spec, ...] = (
     _Spec(
         name="brief",
         description=(
-            "读**一部剧**的现状简报：各方资料各有多少文件（剧本 / 对白与配音 / 资产索引与台账 / "
+            "读**一部剧**的现状简报：各方资料各有多少文件（剧本与总纲 / 对白与配音 / 资产索引与台账 / "
             "流程与进度 / 交付与出图 / 素材归档 / 世界观 / 角色服装道具 / 场景表情姿态 / 分镜与镜头 / "
-            "一致性与音频）、六个阶段到哪一步、缺什么落点、原著登记的是哪本书。"
+            "一致性与音频）、一格里有两种粒度时**全剧级 / 分集级各多少**、"
+            "八个生产阶段（S0–S7）到哪一步、缺什么落点、原著登记的是哪本书。"
             "要动一部剧（写剧本、出角色设定、拆分镜）之前先读它，别猜目录里有什么。"
+            "**先把全剧级（总纲 / 资产索引 / 台账）读出来再碰分集产物** —— "
+            "纲领性设定的权威在 `00_PROJECT/01_剧本/00_总纲/`，不在某一集正文里。"
             "名字用 projects__list 给的那个（就是项目目录名）。"
         ),
         input_schema={
@@ -866,6 +983,8 @@ __all__ = [
     "default_project_dir",
     "default_spec_path",
     "load_spec",
+    "scope_gaps",
+    "scope_order",
     "shelf_gaps",
     "shelf_unknown",
 ]

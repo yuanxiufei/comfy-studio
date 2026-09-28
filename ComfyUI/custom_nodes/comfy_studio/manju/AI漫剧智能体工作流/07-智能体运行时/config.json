@@ -3,7 +3,7 @@
 
   "workflow": {
     "root": "",
-    "_root说明": "留空 = 自动定位（本项目在 AI漫剧智能体工作流/07-资产库Agent/，会自动向上找）。跨机器迁移或目录变动时在此填写绝对路径。"
+    "_root说明": "留空 = 自动定位（本项目在 AI漫剧智能体工作流/07-智能体运行时/，会自动向上找）。跨机器迁移或目录变动时在此填写绝对路径。"
   },
 
   "id_style": "project",
@@ -26,7 +26,8 @@
       "seed": null,
       "overrides": {},
       "_说明": "provider 设为 comfyui 时生效。workflow = 一张**节点式**工作流 JSON（在 ComfyUI 里另存的那种）的绝对路径；也可用环境变量 COMFYUI_WORKFLOW / COMFYUI_BASE_URL 覆盖。timeout 要把大模型**首次加载**的时间算进去。",
-      "_本机示例": "ComfyUI/user/default/workflows/AIGC中国风漫剧/ 下有 8 张（定妆板/场景卡/分镜首帧 × Qwen2512 与 ZImage 两版，视频 3 张）。填其中一张的绝对路径即可，例如 01_角色定妆板_ZImage.json（ZImage 比 Qwen2512 省显存）。",
+      "_本机示例": "ComfyUI/user/default/workflows/AIGC中国风漫剧/ 下有 12 张，**每张自带 MarkdownNote 写清配方与选型依据，改配方前先读它**。图像 6 张：定妆板/场景卡各 Qwen2512 与 ZImage 两版，分镜首帧只有 Qwen2512 版；定妆板另有 1 张 **Qwen2512_Lightning 加速档**（8 步 / cfg 1.0，画风未实跑比对，见其 Note）。视频 3 张：04 试片 / 05 正片 = fl2v，06 = r2v。后期 3 张：07 音乐 MiniMax Music3 / 08 补帧 RIFE / 09 放大 GANx4。填其中一张的绝对路径即可。",
+      "_模型组合": "本机（RTX A5000 / SM 8.6 / 22.5GB）经实测的**最优组合**，判据是 LoRA **键名覆盖率**而非体积——由 custom_nodes/comfy_studio/tools/qwen21-lora-compat.py 只读 safetensors 头算出（不加载权重）：\n① 图像基座用 **Qwen-Image 2512 bf16**。国漫画风 LoRA 命中 **720/720 = 100%**；换成更新的 2.1 只剩 **128/720 = 17.8%**（缺 attn.add_q/k/v_proj 与 to_add_out 整套 joint-attention 分支，会静默不生效），且 2.1 不挂参考图时 latent 只能是正方形，出不了 4:3 定妆板 ⇒ **换 2.1 = 丢画风**。\n② **ZImage 是降级档**：Z-国漫画风 LoRA 对它只命中 **102/476 = 42.9%**（context_refiner.* 整套对不上，静默不注入），画风不完整，仅显存吃紧时用。\n③ 加速 LoRA **Qwen-Image-Lightning 对 2512 命中 720/720 = 100%**（键名与原始 Qwen-Image v1.0 同构，故可跨代套用）；对 2.1 同样只有 17.8%。要用就配 cfg≈1.0 + 8 步。已按此派生 `01_角色定妆板_Qwen2512_Lightning.json` 做 A/B（母版不挂、保持已验证配方；派生档挂 8steps 版）。\n④ 量化档一律 **int8_convrot**：`supports_nvfp4_compute` 在 SM 8.6 为假（nvfp4 要 Blackwell），选 `*nvfp4*` / `*awq*` **不会报错，只会悄悄退回慢路径**。视频三张同理；共享池另有 pruned 档（19.53GB，比 int8 整档 31.7GB 省显存），切换用 tools/switch-h3-weights.py。",
       "_注入说明": "本 Provider 只注入四处：KSampler.positive 所指 CLIPTextEncode 的 text、KSampler.negative 所指的 text、latent 节点的 width/height、KSampler.seed。其余节点（模型/LoRA/VAE/采样器）一律照工作流原样 —— 换配方就换工作流文件，代码不动。seed 留 null = 由提示词哈希派生（同词同 seed，可复现，见工作流《ComfyUI 出图流程》§五）。overrides 是逃生口，形如 {\"6\": {\"steps\": 20}}。"
     },
     "_size说明": "16:9 横版 = 1024x576（资产图硬标准，见工作流 TURNAROUND-STANDARD §1.1）"

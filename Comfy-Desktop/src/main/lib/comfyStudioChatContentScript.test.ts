@@ -30,6 +30,9 @@ const NOVEL_SEARCH_ID = 'comfy-desktop-studio-novel-search'
 const NOVEL_TOC_ID = 'comfy-desktop-studio-novel-toc'
 const NOVEL_TOC_BACK_ID = 'comfy-desktop-studio-novel-toc-back'
 const QUOTE_BAR_ID = 'comfy-desktop-studio-quote-bar'
+const VIEWS_ID = 'comfy-desktop-studio-views'
+const VIEWS_TITLE_ID = 'comfy-desktop-studio-views-title'
+const VIEWS_BACK_ID = 'comfy-desktop-studio-views-back'
 const PROJECT_VIEW_ID = 'comfy-desktop-studio-project-view'
 const PROJECT_HINT_ID = 'comfy-desktop-studio-project-hint'
 const PROJECT_FORM_ID = 'comfy-desktop-studio-project-form'
@@ -4479,6 +4482,79 @@ describe('getComfyStudioChatContentScript', () => {
       expect(projectLine('长夜')?.dataset.open).toBe('true')
     })
 
+    it('splits a shelf by granularity, and only when there are two sides to tell apart', async () => {
+      const meta = bucket('00_PROJECT/01_剧本/00_总纲', [
+        fileRow('00_PROJECT/01_剧本/00_总纲/角色小传.md')
+      ])
+      const episodeRel = '00_PROJECT/01_剧本'
+      const episodes = bucket(episodeRel, [fileRow(episodeRel + '/EP01-剧本.md')])
+      installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'projects/tree': projectTree({
+            shelves: [
+              {
+                key: 'script',
+                title: '剧本与总纲',
+                dirs: [episodes, meta],
+                groups: [
+                  { scope: '全剧级', title: '全剧级', dirs: [meta], exists: true, count: 1 },
+                  { scope: '分集级', title: '分集级', dirs: [episodes], exists: true, count: 1 }
+                ],
+                exists: true,
+                count: 2
+              },
+              {
+                key: 'archive',
+                title: '素材归档',
+                dirs: [
+                  bucket('00_PROJECT/07_素材归档', [
+                    fileRow('00_PROJECT/07_素材归档/素材来源登记.md')
+                  ])
+                ],
+                groups: [
+                  {
+                    scope: '全剧级',
+                    title: '全剧级',
+                    dirs: [
+                      bucket('00_PROJECT/07_素材归档', [
+                        fileRow('00_PROJECT/07_素材归档/素材来源登记.md')
+                      ])
+                    ],
+                    exists: true,
+                    count: 1
+                  }
+                ],
+                exists: true,
+                count: 1
+              }
+            ]
+          })
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+      await openLine('长夜')
+
+      // 两种粒度混在一列里，读的人分不出哪份该跟着集数走 —— 一格才分节。
+      const groups = Array.from(
+        shelf('剧本与总纲')?.querySelectorAll<HTMLElement>('.cs-proj-group') ?? []
+      )
+      expect(groups.map((box) => box.dataset.scope)).toEqual(['全剧级', '分集级'])
+      expect(groups[0]?.textContent).toContain('1 个文件')
+      // 分节只是摆法：文件行照旧都在（点得开那一下不能丢）。
+      expect(fileLine('00_PROJECT/01_剧本/00_总纲/角色小传.md')).not.toBeNull()
+      expect(fileLine('00_PROJECT/01_剧本/EP01-剧本.md')).not.toBeNull()
+
+      // 一格本来就只有一边时，不摆小标题：一条"全剧级"标题底下全是全剧级，那是噪声。
+      const flat = Array.from(
+        shelf('素材归档')?.querySelectorAll<HTMLElement>('.cs-proj-group') ?? []
+      )
+      expect(flat).toHaveLength(0)
+    })
+
     it('lists a file it cannot read but keeps it a dead row', async () => {
       installBridge({
         request: host({ 'projects/list': listing([projectRow()]), 'projects/tree': projectTree() })
@@ -5470,6 +5546,73 @@ describe('getComfyStudioChatContentScript', () => {
 
       input.blur()
       press({ key: 'Escape' })
+      expect(view(DRAWER_ID).style.display).toBe('none')
+    })
+
+    it('lays the two browsing pages over the whole window, not inside the drawer slot', async () => {
+      installBridge({ request: stub })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      const layer = document.getElementById(VIEWS_ID) as HTMLElement
+      // 挂在抽屉**里面**：面板那几百条样式全收在抽屉那条选择器底下，挂到 body 上就得再写一遍。
+      // 铺满窗口靠的是 fixed（抽屉自己没有 transform 这类会造"包含块"的东西）。
+      expect(layer.parentElement?.id).toBe(DRAWER_ID)
+      expect(layer.dataset.open, '对话页不铺这一层').toBe('0')
+
+      tabOf('novel').click()
+      await flush()
+      expect(layer.dataset.open).toBe('1')
+      expect(
+        document.getElementById(VIEWS_TITLE_ID)?.textContent,
+        '铺满窗口时抽屉顶上那排标签也被盖住了 —— 得有一处说清这是哪一页'
+      ).toBe('管理小说')
+
+      document.getElementById(VIEWS_BACK_ID)?.click()
+      await flush()
+      expect(layer.dataset.open).toBe('0')
+      expect(view(CHAT_VIEW_ID).style.display).toBe('flex')
+      // 收起来只是收起来：读到哪一页、筛词是什么都还在（切回对话不是"关掉重开"）。
+      expect(view(NOVEL_VIEW_ID).style.display).toBe('none')
+    })
+
+    it('takes one layer at a time on Escape, and lets a replaced instance go', async () => {
+      installBridge({ request: stub })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      // 宿主刷新网页：旧的 DOM 整片没了，脚本又注入了一份新的。上一份实例还挂在 document
+      // 的按键监听上 —— 它要是照着 id 摸到**新的**那面抽屉，同一个 Esc 会被新旧两只手各收
+      // 一层（顺序还不一定），最后收掉什么就成了运气。
+      const replaced = Reflect.get(window, '__comfyStudioChat') as
+        | { drawer?: { isConnected: boolean } }
+        | undefined
+      expect(replaced?.drawer?.isConnected, '先确认它本来是有抽屉的').toBe(true)
+      document.body.innerHTML = ''
+      Reflect.deleteProperty(window, '__comfyStudioChat')
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      expect(replaced?.drawer?.isConnected, '旧实例那面抽屉确实已经不在页面上了').toBe(false)
+
+      tabOf('project').click()
+      await flush()
+      const layer = document.getElementById(VIEWS_ID) as HTMLElement
+      expect(layer.dataset.open).toBe('1')
+
+      // 焦点先离开输入框：在框里按 Esc 是"我还要接着改"，这条规矩对占了窗口那两页一样成立
+      // （项目页那个筛词框自己就吃 Esc —— 清掉筛词，不是把这一页收了）。
+      ;(document.activeElement as HTMLElement | null)?.blur()
+      press({ key: 'Escape' })
+      await flush()
+      // 一次只收一层：按一下把"我正看的那一页"和整个面板一起收走的话，人得从头找回来。
+      expect(layer.dataset.open).toBe('0')
+      expect(view(CHAT_VIEW_ID).style.display).toBe('flex')
+      expect(view(DRAWER_ID).style.display, '不该被上一份实例顺手关掉').not.toBe('none')
+
+      press({ key: 'Escape' })
+      await flush()
       expect(view(DRAWER_ID).style.display).toBe('none')
     })
 

@@ -1,0 +1,226 @@
+{
+  "last_node_id": 10,
+  "last_link_id": 9,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "UNETLoader",
+      "pos": [0, 0],
+      "size": [420, 82],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        { "name": "unet_name", "type": "COMBO" },
+        { "name": "weight_dtype", "type": "COMBO" }
+      ],
+      "outputs": [
+        { "name": "MODEL", "type": "MODEL", "links": [1], "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "UNETLoader" },
+      "widgets_values": ["minimax_music3_dit_fp16.safetensors", "default"],
+      "title": "Music3 DiT (fp16)"
+    },
+    {
+      "id": 2,
+      "type": "CLIPLoader",
+      "pos": [0, 140],
+      "size": [420, 106],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        { "name": "clip_name", "type": "COMBO" },
+        { "name": "type", "type": "COMBO" },
+        { "name": "device", "type": "COMBO" }
+      ],
+      "outputs": [
+        { "name": "CLIP", "type": "CLIP", "links": [2], "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "CLIPLoader" },
+      "widgets_values": ["minimax_music3_text_encoder_pruned_int8_convrot.safetensors", "minimax", "default"],
+      "title": "Music3 文本编码器 (pruned int8_convrot)"
+    },
+    {
+      "id": 3,
+      "type": "VAELoader",
+      "pos": [0, 300],
+      "size": [420, 58],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        { "name": "vae_name", "type": "COMBO" }
+      ],
+      "outputs": [
+        { "name": "VAE", "type": "VAE", "links": [3], "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "VAELoader" },
+      "widgets_values": ["minimax_music3_dav.safetensors"],
+      "title": "Music3 音频 VAE (dav)"
+    },
+    {
+      "id": 4,
+      "type": "MiniMaxMusic3TextEncode",
+      "pos": [500, 0],
+      "size": [520, 340],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        { "name": "clip", "type": "CLIP", "link": 2 },
+        { "name": "caption", "type": "STRING" },
+        { "name": "lyrics", "type": "STRING" },
+        { "name": "seed", "type": "INT" },
+        { "name": "max_duration", "type": "FLOAT" },
+        { "name": "cfg_scale", "type": "FLOAT" },
+        { "name": "top_k", "type": "INT" }
+      ],
+      "outputs": [
+        { "name": "CONDITIONING", "type": "CONDITIONING", "links": [4, 5], "slot_index": 0 },
+        { "name": "seconds", "type": "FLOAT", "links": null }
+      ],
+      "properties": { "Node name for S&R": "MiniMaxMusic3TextEncode" },
+      "widgets_values": [
+        "Chinese guofeng cinematic pop, guzheng and dizi lead, pipa plucks, taiko and orchestral percussion, erhu counter-melody, wide cinematic strings, epic emotional build, modern tight drums, 78 BPM, minor key, female lead vocal, ethereal harmonies, clean studio mix, slight reverb tail",
+        "[Intro]\n(古筝单音, 风声)\n\n[Verse 1]\n一盏孤灯照旧城\n半卷残书记姓名\n刀锋未冷 心先静\n谁在夜里等天明\n\n[Pre-Chorus]\n若这山河要我选\n我选你眼里的光\n\n[Chorus]\n此生不换 逆着风也要向前\n刀山火海 也要护你周全\n此生不换 哪怕天塌地陷\n我与你 并肩成传说一篇\n\n[Verse 2]\n旧事如烟吹又生\n一步一血一诺成\n回首人间千万灯\n唯你是我那一盏\n\n[Chorus]\n此生不换 逆着风也要向前\n刀山火海 也要护你周全\n此生不换 哪怕天塌地陷\n我与你 并肩成传说一篇\n\n[Outro]\n(古筝收尾, 弦乐长音)",
+        42,
+        "fixed",
+        120,
+        1.7,
+        50
+      ],
+      "title": "Music3 文本编码（风格 caption + 歌词 lyrics）"
+    },
+    {
+      "id": 5,
+      "type": "ConditioningZeroOut",
+      "pos": [500, 400],
+      "size": [320, 26],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        { "name": "conditioning", "type": "CONDITIONING", "link": 5 }
+      ],
+      "outputs": [
+        { "name": "CONDITIONING", "type": "CONDITIONING", "links": [6], "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "ConditioningZeroOut" },
+      "widgets_values": [],
+      "title": "负向条件（清空）"
+    },
+    {
+      "id": 6,
+      "type": "EmptyMiniMaxMusic3LatentAudio",
+      "pos": [500, 470],
+      "size": [320, 82],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        { "name": "seconds", "type": "FLOAT" },
+        { "name": "batch_size", "type": "INT" }
+      ],
+      "outputs": [
+        { "name": "LATENT", "type": "LATENT", "links": [7], "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "EmptyMiniMaxMusic3LatentAudio" },
+      "widgets_values": [120, 1],
+      "title": "空音频 latent（时长必须与 max_duration 一致）"
+    },
+    {
+      "id": 7,
+      "type": "KSampler",
+      "pos": [1100, 0],
+      "size": [400, 262],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        { "name": "model", "type": "MODEL", "link": 1 },
+        { "name": "positive", "type": "CONDITIONING", "link": 4 },
+        { "name": "negative", "type": "CONDITIONING", "link": 6 },
+        { "name": "latent_image", "type": "LATENT", "link": 7 },
+        { "name": "seed", "type": "INT" },
+        { "name": "steps", "type": "INT" },
+        { "name": "cfg", "type": "FLOAT" },
+        { "name": "sampler_name", "type": "COMBO" },
+        { "name": "scheduler", "type": "COMBO" },
+        { "name": "denoise", "type": "FLOAT" }
+      ],
+      "outputs": [
+        { "name": "LATENT", "type": "LATENT", "links": [8], "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "KSampler" },
+      "widgets_values": [42, 30, 1.7, "euler", "simple", 1],
+      "title": "KSampler（官方蓝图口径 30 步 / cfg 1.7 / euler simple）"
+    },
+    {
+      "id": 8,
+      "type": "VAEDecodeAudio",
+      "pos": [1100, 340],
+      "size": [400, 46],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        { "name": "samples", "type": "LATENT", "link": 8 },
+        { "name": "vae", "type": "VAE", "link": 3 }
+      ],
+      "outputs": [
+        { "name": "AUDIO", "type": "AUDIO", "links": [9], "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "VAEDecodeAudio" },
+      "widgets_values": [],
+      "title": "音频解码"
+    },
+    {
+      "id": 9,
+      "type": "SaveAudio",
+      "pos": [1100, 440],
+      "size": [400, 136],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        { "name": "audio", "type": "AUDIO", "link": 9 },
+        { "name": "filename_prefix", "type": "STRING" }
+      ],
+      "outputs": [
+        { "name": "audio", "type": "AUDIO", "links": null, "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "SaveAudio" },
+      "widgets_values": ["AI漫剧/音乐/MUSIC_主题曲"],
+      "title": "存盘（FLAC 无损，S6 音频阶段的 .flac 白名单内）"
+    },
+    {
+      "id": 10,
+      "type": "MarkdownNote",
+      "pos": [1650, 0],
+      "size": [560, 700],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": ["# 07 音乐 · MiniMax Music3\n\n## 这份组合为什么是本机最优（实测口径）\n- 三件套都在共享池里且已校验尺寸/哈希：`minimax_music3_dit_fp16`(4.58GB) + `minimax_music3_text_encoder_pruned_int8_convrot`(8.57GB) + `minimax_music3_dav`(0.20GB)，合计约 13.4GB，24GB 显存可全量常驻，不用 offload。\n- CLIPLoader 的 `type` 必须是 `minimax`（`nodes.py` 的 CLIPLoader 选项：minimax = MiniMax H3 Qwen3-VL 或 Music3 Qwen/RVQ）。\n- 采样口径照官方蓝图 `blueprints/Text to Music (MiniMax Music 3).json`：KSampler 30 步 / cfg 1.7 / euler / simple / denoise 1.0，文本编码器 cfg_scale 1.7 / top_k 50。\n\n## 两个时长必须一致\n`MiniMaxMusic3TextEncode.max_duration` 与 `EmptyMiniMaxMusic3LatentAudio.seconds` 都是 120（秒），上限由源码常量决定：`AUDIO_FRAMES_PER_SECOND = 25`、`MAX_AUDIO_FRAMES = 9000` → 最长 360 秒。要改时长就**两处一起改**。\n\n## 歌词写法\n`caption` 只写风格（曲风/乐器/情绪/速度/调式/人声），`lyrics` 写歌词本体，段落标记用 `[Verse]` / `[Chorus]` / `[Outro]`，纯器乐段落用括号写动作（如 `(古筝收尾, 弦乐长音)`）。两个框都开了 dynamic_prompts，支持把提示词写成模板变量。\n\n## 出片慢/显存紧时\n把 `VAEDecodeAudio` 换成 `VAEDecodeAudioTiled`（tile_size 512 / overlap 64）；官方蓝图默认就是不切块，切块只是长音频的省显存逃生口。\n\n## 与视频的关系\n本工作流**不含**人声对白对齐 —— 对白由 S6 的声音设计引擎单独出；这里产的是主题曲/BGM，落盘在 `output/AI漫剧/音乐/`，扩展名 `.flac` 在 S6 的 check_exts 白名单内。\n"]
+    }
+  ],
+  "links": [
+    [1, 1, 0, 7, 0, "MODEL"],
+    [2, 2, 0, 4, 0, "CLIP"],
+    [3, 3, 0, 8, 1, "VAE"],
+    [4, 4, 0, 7, 1, "CONDITIONING"],
+    [5, 4, 0, 5, 0, "CONDITIONING"],
+    [6, 5, 0, 7, 2, "CONDITIONING"],
+    [7, 6, 0, 7, 3, "LATENT"],
+    [8, 7, 0, 8, 0, "LATENT"],
+    [9, 8, 0, 9, 0, "AUDIO"]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {},
+  "version": 0.4
+}

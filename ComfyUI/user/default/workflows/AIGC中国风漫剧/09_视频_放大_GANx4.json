@@ -1,0 +1,174 @@
+{
+  "last_node_id": 8,
+  "last_link_id": 8,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "LoadVideo",
+      "pos": [0, 0],
+      "size": [420, 82],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        { "name": "file", "type": "COMBO" }
+      ],
+      "outputs": [
+        { "name": "VIDEO", "type": "VIDEO", "links": [1], "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "LoadVideo" },
+      "widgets_values": ["AI漫剧_待放大.mp4"],
+      "title": "载入待放大视频（先把 mp4 放进 ComfyUI/input/）"
+    },
+    {
+      "id": 2,
+      "type": "GetVideoComponents",
+      "pos": [0, 140],
+      "size": [420, 126],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        { "name": "video", "type": "VIDEO", "link": 1 }
+      ],
+      "outputs": [
+        { "name": "images", "type": "IMAGE", "links": [3], "slot_index": 0 },
+        { "name": "audio", "type": "AUDIO", "links": [6], "slot_index": 1 },
+        { "name": "fps", "type": "FLOAT", "links": [5], "slot_index": 2 },
+        { "name": "bit_depth", "type": "INT", "links": null, "slot_index": 3 },
+        { "name": "color_space", "type": "COMBO", "links": null, "slot_index": 4 }
+      ],
+      "properties": { "Node name for S&R": "GetVideoComponents" },
+      "widgets_values": [],
+      "title": "拆帧（取 帧/音频/帧率）"
+    },
+    {
+      "id": 3,
+      "type": "UpscaleModelLoader",
+      "pos": [0, 320],
+      "size": [420, 58],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        { "name": "model_name", "type": "COMBO" }
+      ],
+      "outputs": [
+        { "name": "UPSCALE_MODEL", "type": "UPSCALE_MODEL", "links": [2], "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "UpscaleModelLoader" },
+      "widgets_values": ["RealESRGAN_x4plus.pth"],
+      "title": "放大模型（RealESRGAN x4plus；换 4x-UltraSharp.pth 更锐）"
+    },
+    {
+      "id": 4,
+      "type": "ImageUpscaleWithModel",
+      "pos": [500, 0],
+      "size": [420, 46],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        { "name": "upscale_model", "type": "UPSCALE_MODEL", "link": 2 },
+        { "name": "image", "type": "IMAGE", "link": 3 }
+      ],
+      "outputs": [
+        { "name": "IMAGE", "type": "IMAGE", "links": [4], "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "ImageUpscaleWithModel" },
+      "widgets_values": [],
+      "title": "逐帧 4x（内部切块，24GB 显存够用）"
+    },
+    {
+      "id": 5,
+      "type": "ImageScale",
+      "pos": [500, 120],
+      "size": [420, 130],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        { "name": "image", "type": "IMAGE", "link": 4 },
+        { "name": "upscale_method", "type": "COMBO" },
+        { "name": "width", "type": "INT" },
+        { "name": "height", "type": "INT" },
+        { "name": "crop", "type": "COMBO" }
+      ],
+      "outputs": [
+        { "name": "IMAGE", "type": "IMAGE", "links": [7], "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "ImageScale" },
+      "widgets_values": ["lanczos", 1920, 1080, "disabled"],
+      "title": "降采样回 1080p 母版（4x 超采 → 下采样，比直接 2x 更干净）"
+    },
+    {
+      "id": 6,
+      "type": "CreateVideo",
+      "pos": [1000, 0],
+      "size": [420, 150],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        { "name": "images", "type": "IMAGE", "link": 7 },
+        { "name": "fps", "type": "FLOAT", "link": 5 },
+        { "name": "audio", "type": "AUDIO", "link": 6 },
+        { "name": "bit_depth", "type": "INT" }
+      ],
+      "outputs": [
+        { "name": "VIDEO", "type": "VIDEO", "links": [8], "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "CreateVideo" },
+      "widgets_values": [24, 8],
+      "title": "合成视频（帧率、音频原样带走）"
+    },
+    {
+      "id": 7,
+      "type": "SaveVideo",
+      "pos": [1000, 220],
+      "size": [420, 250],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        { "name": "video", "type": "VIDEO", "link": 8 },
+        { "name": "filename_prefix", "type": "STRING" },
+        { "name": "format", "type": "COMBO" },
+        { "name": "codec", "type": "COMBO" }
+      ],
+      "outputs": [
+        { "name": "VIDEO", "type": "VIDEO", "links": null, "slot_index": 0 }
+      ],
+      "properties": { "Node name for S&R": "SaveVideo" },
+      "widgets_values": ["AI漫剧/视频/放大_1080p母版", "auto", "auto"],
+      "title": "存盘（mp4）"
+    },
+    {
+      "id": 8,
+      "type": "MarkdownNote",
+      "pos": [1500, 0],
+      "size": [520, 620],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": ["# 09 视频 · 放大（GAN x4 → 1080p 母版）\n\n## 用途\n04/05 出的是 768p/1080p 生成分辨率，要出成片母版、或想把 06 的多镜片段统一到同一分辨率时跑这一支。\n\n## 组合与出处\n- 拓扑照官方蓝图 `blueprints/Video Upscale(GAN x4).json`：GetVideoComponents → ImageUpscaleWithModel → CreateVideo。\n- 官方写的 `RealESRGAN_x4plus.safetensors` 我们池里只有 `.pth` 版（`upscale_models/RealESRGAN_x4plus.pth`），所以这里改成 `.pth` 真名；节点吃任意 upscale_models 目录下的文件。\n- 另一支 `4x-UltraSharp.pth` 也在池里：线条更锐、适合国漫风；`RealESRGAN_x4plus` 更柔和自然。换模型只改 UpscaleModelLoader 一个下拉。\n\n## 为什么多加了 ImageScale\n官方蓝图直接输出 4x（1344×768 → 5376×3072），体积大且不是交付分辨率。这里加一步 lanczos 回落到 1920×1080：4x 超采样再下采样，边缘比直接 2x 放大干净。要真的出 4K 母版就把 width/height 改成 3840/2160（显存和磁盘都会明显涨）。\n\n## 与补帧的顺序\n先 09 放大、再 08 补帧最省事（补帧在目标分辨率上做，运动更稳）；反过来也行，只是补帧要多算 4 倍的像素。\n\n## 输入从哪来\n同 08：LoadVideo 只列 `ComfyUI/input/`，H3 出片在 `ComfyUI/output/AI漫剧/视频/`，先拷进 input 再选。\n"]
+    }
+  ],
+  "links": [
+    [1, 1, 0, 2, 0, "VIDEO"],
+    [2, 3, 0, 4, 0, "UPSCALE_MODEL"],
+    [3, 2, 0, 4, 1, "IMAGE"],
+    [4, 4, 0, 5, 0, "IMAGE"],
+    [5, 2, 2, 6, 1, "FLOAT"],
+    [6, 2, 1, 6, 2, "AUDIO"],
+    [7, 5, 0, 6, 0, "IMAGE"],
+    [8, 6, 0, 7, 0, "VIDEO"]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {},
+  "version": 0.4
+}

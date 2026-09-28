@@ -20,7 +20,9 @@
  *     （Comfy-Desktop/src/main/lib/firstUseDetection.ts: skipPick），
  *     所以预置这一条后不再弹首次使用向导。
  *
- * 这个脚本只碰「用户数据目录」，对两份上游检出只读（读引擎树里那份自述认身份），零改动。
+ * 这个脚本碰两处：一是用户数据目录（installations.json / settings.json），二是被
+ * ComfyUI/.gitignore 忽略的 ComfyUI/extra_model_paths.yaml（共享池接线，机器本地件，只在它
+ * 不存在时生成）。两份上游检出里被父仓库跟踪的内容一律不动——读引擎树里那份自述只为认身份。
  */
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
@@ -192,6 +194,94 @@ const merged = settings && typeof settings === 'object' && !Array.isArray(settin
 merged.firstUseCompleted = true
 if (typeof merged.telemetryEnabled !== 'boolean') merged.telemetryEnabled = false
 fs.writeFileSync(settingsFile, JSON.stringify(merged, null, 2))
+
+// ---- ComfyUI/extra_model_paths.yaml：把「共享池接线」从手写孤本变成可复现的一步 ----
+// 依据（核过源码）：ComfyUI/main.py 的 apply_custom_paths() 读 <ComfyUI>/extra_model_paths.yaml；
+// 而桌面壳注入的 instance-model-paths/<安装id>.yaml 只有模型目录、没有 custom_nodes 键，
+// 所以共享插件池（漫剧工作流用的 H3 那几包只住在池里）只能靠这份文件。它被 ComfyUI/.gitignore
+// 忽略，于是换台机器时唯一会静默丢掉的正是它——这里按现成的探测手段把它补出来。
+//
+// 池根从哪来（不写死机器路径）：
+//   1) COMFYUI_SHARED_ROOT 显式指定，优先；
+//   2) 桌面壳自己的 settings.json 里 modelsDirs 的上一级——那是它自己记的共享模型目录，
+//      池根就是它的父目录（models 与 custom_nodes 同级）。
+// 两个都拿不到就不生成，并把缺什么说清楚（不静默）。
+const sharedYaml = path.join(comfyDir, 'extra_model_paths.yaml')
+const declaredDirs = merged.modelsDirs
+const modelsDirs =
+  typeof declaredDirs === 'string'
+    ? declaredDirs
+    : Array.isArray(declaredDirs)
+      ? (declaredDirs.find((v) => typeof v === 'string' && v.trim() !== '') ?? '')
+      : ''
+const poolRoot = process.env.COMFYUI_SHARED_ROOT || (modelsDirs ? path.dirname(modelsDirs) : '')
+if (!poolRoot) {
+  console.log(
+    '\n     共享池接线  : 未接（settings.json 里没有 modelsDirs，也没给 COMFYUI_SHARED_ROOT）'
+  )
+  console.log('                   H3 等节点包只住在共享池里，没接上时那些工作流会整片红节点。')
+  console.log(
+    '                   接法：壳里指定一个共享目录，或 COMFYUI_SHARED_ROOT=<池根> npm run seed'
+  )
+} else if (fs.existsSync(sharedYaml)) {
+  // 已有接线（很可能是手写并带注释的那份）：一个字都不改，只核对它引用的池根是不是这次推导出的
+  const wired = fs.readFileSync(sharedYaml, 'utf8').includes(poolRoot)
+  console.log(`\n     共享池接线  : 已在位，未改动  ${sharedYaml}`)
+  if (!wired) {
+    console.log(`     !!          : 它里面没出现这次推导出的池根 ${poolRoot}`)
+    console.log(
+      '                   跑 npm run doctor 看详情；要按当前推导重生成，先删掉它再跑 seed。'
+    )
+  }
+} else {
+  const modelsDir = path.join(poolRoot, 'models')
+  const nodesDir = path.join(poolRoot, 'custom_nodes')
+  const typeDirs = fs.existsSync(modelsDir)
+    ? fs
+        .readdirSync(modelsDir, { withFileTypes: true })
+        .filter((e) => e.isDirectory())
+        .map((e) => e.name)
+        .sort()
+    : []
+  const nodesOk = fs.existsSync(nodesDir)
+  if (typeDirs.length === 0 && !nodesOk) {
+    console.log(
+      `\n     共享池接线  : 未生成 —— 推导出的池根下既没有 models\\ 也没有 custom_nodes\\`
+    )
+    console.log(`                   ${poolRoot}`)
+    console.log(
+      '                   核对 COMFYUI_SHARED_ROOT / settings.json 的 modelsDirs 是不是这个池。'
+    )
+  } else {
+    const lines = [
+      '# 由 npm run seed 生成；本文件被 ComfyUI/.gitignore 忽略（只对本机生效，不进版本库）。',
+      '#',
+      '# 为什么需要它（核过源码，不是推测）：',
+      '#   ComfyUI/main.py 的 apply_custom_paths() 会读 <ComfyUI>/extra_model_paths.yaml（140-148 行），',
+      '#   而桌面壳注入的 instance-model-paths/<安装id>.yaml 只含模型目录、不含 custom_nodes，',
+      '#   所以共享插件池这一半只能写在这里；两份同时生效（同一路径只做 is_default 提升，不重复追加）。',
+      '#',
+      `# 池根来自 ${process.env.COMFYUI_SHARED_ROOT ? '环境变量 COMFYUI_SHARED_ROOT' : 'settings.json 的 modelsDirs 的上一级'}：${poolRoot}`,
+      '# 模型类型清单按池里 models\\ 实际子目录枚举，不另存一份会漂的清单。',
+      '',
+      'shared_models:',
+      `  base_path: '${modelsDir}'`,
+      '  is_default: true',
+      ...typeDirs.map((n) => `  '${n}': '${n}/'`),
+      '',
+      '# 插件池与模型池同级（<池根>\\custom_nodes），不蹭上面的 base_path，单开一节写绝对路径。',
+      'shared_custom_nodes:',
+      `  'custom_nodes': '${nodesDir}'`,
+      ''
+    ]
+    fs.writeFileSync(sharedYaml, lines.join('\n'))
+    console.log(`\n     共享池接线  : 已生成  ${sharedYaml}`)
+    console.log(
+      `                   ${typeDirs.length} 个模型类型 + 插件池 ${nodesDir}` +
+        `${nodesOk ? '' : '（这个目录不存在，核对一下）'}`
+    )
+  }
+}
 
 console.log(`\n[OK] 已注册安装：${record.name}`)
 console.log(`     installPath : ${record.installPath}`)

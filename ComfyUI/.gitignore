@@ -17,7 +17,16 @@ venv*/
 !/web/extensions/logging.js.example
 !/web/extensions/core/
 /tests-ui/data/object_info.json
-/user/
+# 上游默认排掉整个 user/（那是运行期配置：comfy.settings.json 等）。
+# 但本仓的**交付物**之一就是这个 workflow 目录 —— 整套漫剧生产靠它，不跟着仓库走
+# 就等于换台机器静默丢失。所以逐级放行到该目录，其余仍忽略。
+# ⚠️ git 规则：父目录被排除时 `!` 对深层文件无效，必须逐级 un-ignore（下面四行缺一不可）。
+/user/*
+!/user/default/
+/user/default/*
+!/user/default/workflows/
+/user/default/workflows/*
+!/user/default/workflows/AIGC中国风漫剧/
 *.log
 web_custom_versions/
 .DS_Store

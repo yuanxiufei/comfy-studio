@@ -193,7 +193,7 @@ class RuleSource:
 
     # ── 定位工作流根 ──
     def _autodetect(self) -> Path | None:
-        """本项目位于 `AI漫剧智能体工作流/07-资产库Agent/`，故工作流根 = 上上级。"""
+        """本项目位于 `AI漫剧智能体工作流/07-智能体运行时/`，故工作流根 = 上上级。"""
         here = Path(__file__).resolve()
         for p in [here.parent.parent.parent, *here.parents]:
             if (p / "02-服化道" / "引擎" / "NEGATIVE-PROMPT-LIBRARY.md").exists():
