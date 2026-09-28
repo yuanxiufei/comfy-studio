@@ -120,6 +120,8 @@ var NOVEL_VIEW_ID = 'comfy-desktop-studio-novel-view';
 var NOVEL_LIST_ID = 'comfy-desktop-studio-novel-list';
 var NOVEL_HINT_ID = 'comfy-desktop-studio-novel-hint';
 var NOVEL_FORM_ID = 'comfy-desktop-studio-novel-form';
+// 导入弹窗里那份提示行：它盖住了页顶那条，所以同一句话要在卡片里再说一遍（见 importHint）。
+var NOVEL_FORM_HINT_ID = 'comfy-desktop-studio-novel-form-hint';
 var NOVEL_PATH_ID = 'comfy-desktop-studio-novel-path';
 var NOVEL_READER_ID = 'comfy-desktop-studio-novel-reader';
 var NOVEL_PAGER_ID = 'comfy-desktop-studio-novel-pager';
@@ -142,6 +144,8 @@ var PROJECT_FORM_NAME_ID = 'comfy-desktop-studio-project-form-name';
 var PROJECT_FORM_EPISODES_ID = 'comfy-desktop-studio-project-form-episodes';
 var PROJECT_FORM_NOVEL_ID = 'comfy-desktop-studio-project-form-novel';
 var PROJECT_FORM_UPGRADE_ID = 'comfy-desktop-studio-project-form-upgrade';
+// 弹窗里那份提示行：它盖住了页顶那条，所以同一句话要在卡片里再说一遍（见 projectHint）。
+var PROJECT_FORM_HINT_ID = 'comfy-desktop-studio-project-form-hint';
 var PROJECT_LIST_ID = 'comfy-desktop-studio-project-list';
 var PROJECT_MAIN_ID = 'comfy-desktop-studio-project-main';
 var PROJECT_HEAD_ID = 'comfy-desktop-studio-project-head';
@@ -346,9 +350,8 @@ var CHAT_CSS =
   '#' + DRAWER_ID + ' .cs-novel-btn:disabled{color:' + MUTED + ';cursor:not-allowed;}' +
   '#' + DRAWER_ID + ' .cs-novel-hint{padding:0 12px 8px;color:' + MUTED + ';font-size:11px;}' +
   '#' + DRAWER_ID + ' .cs-novel-hint[data-tone="error"]{color:#ff8080;}' +
-  '#' + DRAWER_ID + ' .cs-novel-form{display:none;flex-wrap:wrap;gap:6px;padding:0 12px 8px;}' +
-  '#' + DRAWER_ID + ' .cs-novel-form[data-open="1"]{display:flex;}' +
-  '#' + DRAWER_ID + ' .cs-novel-path{flex:1;min-width:0;box-sizing:border-box;border:1px solid ' + BORDER + ';' +
+  // 导入表单也压成弹窗（见上面 .cs-popup 那段）：路径是长文本，卡片里给它整行。
+  '#' + DRAWER_ID + ' .cs-novel-path{box-sizing:border-box;width:100%;border:1px solid ' + BORDER + ';' +
   'border-radius:4px;background:' + INPUT_BG + ';color:inherit;font:inherit;font-size:12px;padding:4px 6px;}' +
   '#' + DRAWER_ID + ' .cs-novel-list{max-height:38%;overflow-y:auto;padding:0 12px 8px;' +
   'display:flex;flex-direction:column;}' +
@@ -402,41 +405,104 @@ var CHAT_CSS =
   'background:transparent;color:inherit;cursor:pointer;font:inherit;font-size:12px;padding:3px 8px;}' +
   '#' + DRAWER_ID + ' .cs-proj-btn:hover{background:' + INPUT_BG + ';}' +
   '#' + DRAWER_ID + ' .cs-proj-btn:disabled{color:' + MUTED + ';cursor:not-allowed;}' +
+  // 提示行平时是空的（它只说"刚才那件事怎么样了"）：空着还占一行，页顶就永远吊着一条没字的横缝。
   '#' + DRAWER_ID + ' .cs-proj-hint{padding:0 12px 8px;color:' + MUTED + ';font-size:11px;}' +
+  '#' + DRAWER_ID + ' .cs-proj-hint:empty{display:none;}' +
   '#' + DRAWER_ID + ' .cs-proj-hint[data-tone="error"]{color:#ff8080;}' +
-  '#' + DRAWER_ID + ' .cs-proj-form{display:none;flex-wrap:wrap;gap:6px;align-items:center;padding:0 12px 8px;}' +
-  '#' + DRAWER_ID + ' .cs-proj-form[data-open="1"]{display:flex;}' +
-  '#' + DRAWER_ID + ' .cs-proj-input,#' + DRAWER_ID + ' .cs-proj-select{box-sizing:border-box;' +
+  '#' + DRAWER_ID + ' .cs-proj-input,#' + DRAWER_ID + ' .cs-proj-select{box-sizing:border-box;width:100%;' +
   'border:1px solid ' + BORDER + ';border-radius:4px;background:' + INPUT_BG + ';color:inherit;' +
   'font:inherit;font-size:12px;padding:4px 6px;}' +
-  '#' + DRAWER_ID + ' .cs-proj-input{width:110px;}' +
-  '#' + DRAWER_ID + ' .cs-proj-input[name="name"]{width:150px;}' +
-  '#' + DRAWER_ID + ' .cs-proj-check{display:flex;align-items:center;gap:4px;color:' + MUTED + ';font-size:11px;}' +
+  // 抽屉里"压一层"的表单共用这一套（建项目、导入原文都用它）：absolute 落在 fixed 的抽屉里，
+  // inset:0 铺一层暗底，开与关都不动底下的布局 —— 表单不再是页里的一行，不再把下面的格子与
+  // 正文挤下去（"正开着表单"这件事不该漏到整页布局上）。开关只有 togglePopup 一个作者。
+  '#' + DRAWER_ID + ' .cs-popup{position:absolute;inset:0;z-index:5;display:none;' +
+  'align-items:center;justify-content:center;box-sizing:border-box;padding:12px;' +
+  'background:rgba(0,0,0,0.45);}' +
+  '#' + DRAWER_ID + ' .cs-popup[data-open="1"]{display:flex;}' +
+  '#' + DRAWER_ID + ' .cs-popup-card{display:flex;flex-direction:column;gap:8px;width:100%;' +
+  'max-width:320px;max-height:100%;overflow-y:auto;box-sizing:border-box;padding:10px;' +
+  'border:1px solid ' + BORDER + ';border-radius:6px;background:' + SURFACE + ';' +
+  'box-shadow:0 8px 24px rgba(0,0,0,0.45);}' +
+  // 这一下会替换掉目录里同名那本时（见 showOverwrite）：卡片自己也变个脸色。跟「删到第二步」
+  // 那颗红边按钮是同一个道理 —— 长什么样就说明这一下有多重。
+  '#' + DRAWER_ID + ' .cs-popup-card[data-state="confirm"]{border-color:#d9534f;}' +
+  '#' + DRAWER_ID + ' .cs-popup-title{color:' + FG + ';font-size:12px;font-weight:600;}' +
+  // 字段一列排下来：剧名、集数、原著、补齐落点、建挤在同一行里时，这条窄缝下谁都读不清
+  // 自己填的是哪一格。
+  '#' + DRAWER_ID + ' .cs-popup-body{display:flex;flex-direction:column;gap:8px;}' +
+  '#' + DRAWER_ID + ' .cs-popup-field{display:flex;flex-direction:column;gap:3px;}' +
+  '#' + DRAWER_ID + ' .cs-popup-label{color:' + MUTED + ';font-size:11px;}' +
+  '#' + DRAWER_ID + ' .cs-popup-check{display:flex;align-items:center;gap:4px;color:' + MUTED + ';font-size:11px;}' +
+  // 弹窗里那份"刚才那件事怎么样了"：页顶那条被暗底盖住了，没成的话得在卡片里看得见。
+  '#' + DRAWER_ID + ' .cs-popup-hint{color:' + MUTED + ';font-size:11px;line-height:1.4;}' +
+  '#' + DRAWER_ID + ' .cs-popup-hint:empty{display:none;}' +
+  '#' + DRAWER_ID + ' .cs-popup-hint[data-tone="error"]{color:#ff8080;}' +
+  // 换成窄抽屉时按钮折行也别叠在一起（覆盖导入是第三个）。
+  '#' + DRAWER_ID + ' .cs-popup-actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:6px;}' +
+  // 主按钮只有一个：弹窗里"建"/「导入」才是往下走的那步，「取消」是退路。
+  '#' + DRAWER_ID + ' .cs-popup-actions [data-primary="1"]{background:' + INPUT_BG + ';font-weight:600;}' +
   '#' + DRAWER_ID + ' .cs-proj-body{flex:1;min-height:0;display:flex;gap:8px;padding:0 12px 8px;}' +
   // 左栏按比例占但卡在上限里：它是导航，一行就那么点信息；地方要留给右边的格子与正文。
   '#' + DRAWER_ID + ' .cs-proj-list{flex:0 0 auto;width:34%;max-width:200px;min-width:110px;' +
   'overflow-y:auto;display:flex;flex-direction:column;}' +
   '#' + DRAWER_ID + ' .cs-proj-row{flex:0 0 auto;display:block;width:100%;text-align:left;border:none;' +
   'border-bottom:1px solid ' + BORDER + ';background:transparent;color:inherit;cursor:pointer;' +
-  'font:inherit;font-size:12px;padding:6px 4px;}' +
+  'font:inherit;font-size:12px;padding:5px 6px;line-height:1.4;}' +
   '#' + DRAWER_ID + ' .cs-proj-row:hover{background:' + INPUT_BG + ';}' +
-  '#' + DRAWER_ID + ' .cs-proj-row[data-open="true"]{background:' + INPUT_BG + ';font-weight:600;}' +
+  // 在读的那一部：底色的同时左沿立一条竖线（不占布局，靠 inset 阴影画）——
+  // 只用底色的话，跟 hover 长得一模一样，鼠标一移开就不知道自己在哪一部上。
+  '#' + DRAWER_ID + ' .cs-proj-row[data-open="true"]{background:' + INPUT_BG + ';font-weight:600;' +
+  'box-shadow:inset 2px 0 0 ' + MUTED + ';}' +
   // 名字可能很长（剧名后面常常跟着版本、集数），允许折行：省略号会把它变成一个认不出的前缀。
   '#' + DRAWER_ID + ' .cs-proj-name{word-break:break-all;}' +
   '#' + DRAWER_ID + ' .cs-proj-meta{display:block;color:' + MUTED + ';font-size:11px;font-weight:400;}' +
   '#' + DRAWER_ID + ' .cs-proj-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:6px;}' +
-  '#' + DRAWER_ID + ' .cs-proj-head{color:' + MUTED + ';font-size:11px;line-height:1.5;word-break:break-all;}' +
-  '#' + DRAWER_ID + ' .cs-proj-stages{color:' + FG + ';}' +
-  '#' + DRAWER_ID + ' .cs-proj-warn{color:#ff8080;}' +
+  '#' + DRAWER_ID + ' .cs-proj-head{color:' + MUTED + ';font-size:11px;line-height:1.5;' +
+  'display:flex;flex-direction:column;gap:4px;}' +
+  // 剧名一行，路径一行：路径常常比面板还长，跟剧名挤一行会把剧名一起拽断（两行各断各的）。
+  '#' + DRAWER_ID + ' .cs-proj-title{color:' + FG + ';font-size:13px;font-weight:600;' +
+  'word-break:break-all;}' +
+  '#' + DRAWER_ID + ' .cs-proj-path{color:' + MUTED + ';font-size:10px;line-height:1.3;' +
+  'word-break:break-all;}' +
+  // 阶段：一步一枚小签。做过的填底色 + 勾、没做的虚线空框 —— 勾/空不靠颜色也分得出来。
+  '#' + DRAWER_ID + ' .cs-proj-stages{display:flex;flex-wrap:wrap;align-items:center;gap:4px;}' +
+  '#' + DRAWER_ID + ' .cs-proj-stages-label{color:' + MUTED + ';}' +
+  '#' + DRAWER_ID + ' .cs-proj-stage{border:1px dashed ' + BORDER + ';border-radius:3px;' +
+  'padding:0 4px;white-space:nowrap;color:' + MUTED + ';}' +
+  '#' + DRAWER_ID + ' .cs-proj-stage[data-done="1"]{border-style:solid;border-color:' + MUTED + ';' +
+  'background:' + INPUT_BG + ';color:' + FG + ';}' +
+  '#' + DRAWER_ID + ' .cs-proj-stage[data-done="1"]::before{content:"✓ ";}' +
+  '#' + DRAWER_ID + ' .cs-proj-stage[data-done="0"]::before{content:"· ";}' +
+  // 详情里每一行备注都从 projectNote 出来，四种语气四种颜色 —— 以前四种事都穿同一件红衣服：
+  // plain 事实（原著登记）、next 下一步往哪走（那是路标，不是报警）、
+  // action 要人去补的（缺落点）、bug 面板自己的毛病（格子跟规范对不上）。
+  '#' + DRAWER_ID + ' .cs-proj-note{word-break:break-word;}' +
+  '#' + DRAWER_ID + ' .cs-proj-note[data-tone="next"]{color:' + FG + ';}' +
+  '#' + DRAWER_ID + ' .cs-proj-note[data-tone="action"]{color:#ff8080;}' +
+  '#' + DRAWER_ID + ' .cs-proj-note[data-tone="bug"]{color:#e0b400;}' +
+  '#' + DRAWER_ID + ' .cs-proj-meter-note{color:' + MUTED + ';}' +
   '#' + DRAWER_ID + ' .cs-proj-shelves{flex:1;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:4px;}' +
-  '#' + DRAWER_ID + ' .cs-proj-shelf{flex:0 0 auto;border:1px solid ' + BORDER + ';border-radius:4px;}' +
+  '#' + DRAWER_ID + ' .cs-proj-shelf{flex:0 0 auto;border:1px solid ' + BORDER + ';border-radius:4px;' +
+  'overflow:hidden;}' +
   '#' + DRAWER_ID + ' .cs-proj-shelf-head{display:flex;align-items:center;gap:6px;width:100%;' +
   'text-align:left;border:none;background:transparent;color:inherit;cursor:pointer;font:inherit;' +
   'font-size:12px;padding:4px 6px;}' +
   '#' + DRAWER_ID + ' .cs-proj-shelf-head:hover{background:' + INPUT_BG + ';}' +
-  // 空格子只是标题淡一点：它不是错误，是"这一格还空着"这句话本身。
+  // 一格有没有东西用一个 6px 的点说，不用 ✅/☐：勾选框摆在最左边，整列看起来像一排待勾的多选框，
+  // 而这九行是"去哪一格里找资料"，不是一件件要人去勾的事。
+  '#' + DRAWER_ID + ' .cs-proj-shelf-mark{flex:0 0 auto;width:6px;height:6px;border-radius:50%;' +
+  'background:' + MUTED + ';}' +
+  // 空格子：标题淡 + 虚线框 + 空心点。它不是错误，是"这一格还空着"这句话本身。
+  '#' + DRAWER_ID + ' .cs-proj-shelf[data-empty="1"]{border-style:dashed;}' +
   '#' + DRAWER_ID + ' .cs-proj-shelf[data-empty="1"] .cs-proj-shelf-head{color:' + MUTED + ';}' +
-  '#' + DRAWER_ID + ' .cs-proj-shelf-count{margin-left:auto;color:' + MUTED + ';font-size:11px;white-space:nowrap;}' +
+  '#' + DRAWER_ID + ' .cs-proj-shelf[data-empty="1"] .cs-proj-shelf-mark{background:transparent;' +
+  'border:1px solid ' + BORDER + ';}' +
+  // 展开的那一格：边框提亮 + 左沿一条竖线，跟正文里高亮的那一行、左栏在读的那一部一个语言。
+  '#' + DRAWER_ID + ' .cs-proj-shelf[data-open="1"]{border-color:' + MUTED + ';' +
+  'box-shadow:inset 2px 0 0 ' + MUTED + ';}' +
+  '#' + DRAWER_ID + ' .cs-proj-shelf-count{margin-left:auto;color:' + MUTED + ';font-size:10px;' +
+  'white-space:nowrap;border:1px solid ' + BORDER + ';border-radius:8px;padding:0 5px;}' +
+  '#' + DRAWER_ID + ' .cs-proj-shelf[data-empty="1"] .cs-proj-shelf-count{border-color:transparent;}' +
   '#' + DRAWER_ID + ' .cs-proj-files{display:none;flex-direction:column;border-top:1px solid ' + BORDER + ';' +
   'padding:2px 4px 4px;}' +
   '#' + DRAWER_ID + ' .cs-proj-shelf[data-open="1"] .cs-proj-files{display:flex;}' +
@@ -450,8 +516,12 @@ var CHAT_CSS =
   '#' + DRAWER_ID + ' .cs-proj-file-size{margin-left:auto;color:' + MUTED + ';white-space:nowrap;font-weight:400;}' +
   '#' + DRAWER_ID + ' .cs-proj-reader{flex:0 0 auto;height:26%;min-height:70px;overflow:auto;padding:8px;' +
   'border:1px solid ' + BORDER + ';border-radius:4px;font-size:12px;white-space:pre-wrap;word-break:break-word;}' +
-  '#' + DRAWER_ID + ' .cs-proj-pager{display:flex;align-items:center;gap:6px;color:' + MUTED + ';font-size:11px;}' +
-  '#' + DRAWER_ID + ' .cs-proj-pager .cs-proj-pos{margin-left:auto;white-space:nowrap;}' +
+  // 页码那一行允许折行：文件名长起来时（快照名、带集数的稿名）不折就是横向撑破面板。
+  '#' + DRAWER_ID + ' .cs-proj-pager{display:flex;align-items:center;gap:6px;flex-wrap:wrap;' +
+  'color:' + MUTED + ';font-size:11px;}' +
+  '#' + DRAWER_ID + ' .cs-proj-pager .cs-proj-pos{margin-left:auto;word-break:break-all;}' +
+  // 正文是一整块长的，读着读着最容易忘"这是哪一份"：文件名从位置信息里拎出来给前景色。
+  '#' + DRAWER_ID + ' .cs-proj-pos-rel{color:' + FG + ';font-weight:600;}' +
   '#' + DRAWER_ID + ' .cs-proj-empty{flex:0 0 auto;color:' + MUTED + ';font-size:11px;padding:4px;}' +
   // 引用卡：贴在输入框上方那一栏（待发的），以及压在用户气泡里的那几张（已经发出去的）。
   '#' + DRAWER_ID + ' .cs-quote-bar{display:none;flex-direction:column;gap:4px;}' +
@@ -536,10 +606,19 @@ var CHAT_CSS =
   'min-width:42px;}' +
   // 项目页的"页内找字"那一行套用 .cs-find 那套长相（三页一致），但它落在正文区里，
   // 左右不再各让 12px —— 父容器已经让过了，再让一次正文就比上下的块窄一截。
-  '#' + DRAWER_ID + ' .cs-proj-file-find{padding:0 0 6px;}' +
+  // 找字 + 正文 + 页码是**一块**（说的是"这一页在读什么"），跟上面的格子分开：加一条上分界线。
+  '#' + DRAWER_ID + ' .cs-proj-file-find{padding:6px 0 6px;border-top:1px solid ' + BORDER + ';}' +
   // 跨项目总览那一行：只报数（各个数都出自宿主 projects/list 的行），不画图。
-  '#' + DRAWER_ID + ' .cs-proj-overview{padding:0 12px 6px;color:' + MUTED + ';font-size:11px;' +
-  'line-height:1.5;}' +
+  // 一个数一枚小签：连成一句话时它在这条窄缝里要折三行，还读不出哪几个数是哪件事。
+  '#' + DRAWER_ID + ' .cs-proj-overview{padding:0 12px 8px;display:flex;flex-wrap:wrap;' +
+  'align-items:center;gap:4px;font-size:11px;}' +
+  '#' + DRAWER_ID + ' .cs-proj-chip{border:1px solid ' + BORDER + ';border-radius:10px;' +
+  'padding:0 6px;white-space:nowrap;color:' + FG + ';}' +
+  // 0 部照样说出来，但淡下去：它是"没有"，不是"有问题"。
+  '#' + DRAWER_ID + ' .cs-proj-chip[data-tone="zero"]{color:' + MUTED + ';border-color:transparent;' +
+  'background:' + INPUT_BG + ';}' +
+  '#' + DRAWER_ID + ' .cs-proj-chip[data-tone="action"]{color:#ff8080;border-color:#7a3a3a;}' +
+  '#' + DRAWER_ID + ' .cs-proj-chip[data-tone="warn"]{color:#e0b400;border-color:#6b5b00;}' +
   // 正文页内找字：命中处包一层 <mark>（正文是整块重画的，不是增量卡，所以敢动它的 DOM ——
   // 对话那一页的 [data-hit] 只标行不插字，原因在那儿写着）。
   '#' + DRAWER_ID + ' .cs-proj-hit{background:#6b5b00;color:inherit;border-radius:2px;}' +
@@ -572,6 +651,88 @@ function hintLine(id, text, tone) {
   line.textContent = text;
   line.dataset.tone = tone === 'error' ? 'error' : 'info';
   return line;
+}
+
+// ---- 弹窗（在抽屉里压一层）-----------------------------------------------
+//
+// 建项目、导入原文这两张表单都压成弹窗，而不是页里的一行：它们一开就横着推一排控件，把下面
+// 的格子与正文全挤下去 —— "正开着表单"这件事漏到了整页布局上。样子在样式表里一条 .cs-popup
+// 管全部，这里管的是**脾气**：怎么开关、光标落在哪、怎么退出去。两页共用这一份，不然两个
+// 弹窗迟早各长一样（一个能按 Esc 退，另一个不能）。
+
+// 开关只有这一处作者：工具栏那颗按钮、暗底、Esc、以及各页干完活之后的收尾都走它。
+//
+// 打开时顺手把上一次留下的那句话清掉（多半是"先给这部戏起个名字"），光标放进第一格 ——
+// 弹窗一开，人第一件事就是填那一格，别让他再点一下。hintId 是卡片里那份提示行：它也是
+// 页顶那条的镜像（见 projectHint / importHint），这里只管把它擦干净。
+function togglePopup(layerId, hintId, focusId, open) {
+  var layer = document.getElementById(layerId);
+  if (!layer) return false;
+  var next = open === undefined ? layer.dataset.open !== '1' : !!open;
+  layer.dataset.open = next ? '1' : '0';
+  if (!next) return false;
+  hintLine(hintId, '', 'info');
+  var first = focusId ? document.getElementById(focusId) : null;
+  if (first) first.focus();
+  return true;
+}
+
+// 搭一层弹窗：暗底、卡片、卡片里的排版顺序都在这儿定死（标题 → body → 提示 → 按钮），
+// 调用方只管往 body 与 actions 里塞自己的控件。顺序定死是有理由的：提示行得在按钮上面、
+// 在字段下面，各页自己拼迟早会拼出三种样子。
+function buildPopup(layerId, hintId, title) {
+  var layer = document.createElement('div');
+  layer.id = layerId;
+  layer.className = 'cs-popup';
+  layer.dataset.open = '0';
+
+  var card = document.createElement('div');
+  card.className = 'cs-popup-card';
+  card.setAttribute('role', 'dialog');
+  card.setAttribute('aria-label', title);
+  var head = document.createElement('div');
+  head.className = 'cs-popup-title';
+  head.textContent = title;
+  card.appendChild(head);
+
+  var body = document.createElement('div');
+  body.className = 'cs-popup-body';
+  card.appendChild(body);
+
+  var hint = document.createElement('div');
+  hint.id = hintId;
+  hint.className = 'cs-popup-hint';
+  hint.textContent = '';
+  card.appendChild(hint);
+
+  var actions = document.createElement('div');
+  actions.className = 'cs-popup-actions';
+  card.appendChild(actions);
+
+  // 点暗底、按 Esc 都收得掉：弹窗盖住了页顶那排按钮，想退出去时不该只能去够那颗「取消」。
+  // Esc 挂在卡片上，打开时光标就在第一格里，按键从卡片里冒上来。
+  layer.addEventListener('click', function (event) {
+    if (event.target === layer) togglePopup(layerId, hintId, null, false);
+  });
+  card.addEventListener('keydown', function (event) {
+    if (event.key === 'Escape') togglePopup(layerId, hintId, null, false);
+  });
+
+  layer.appendChild(card);
+  return { layer: layer, body: body, actions: actions };
+}
+
+// 一个字段一行、标签在上控件在下，而且用一个 label 包着：点标签上的字就落进那一格。
+// （挤在一行里时，这条窄缝下谁都读不清自己填的是哪一格。）
+function popupField(labelText, control) {
+  var field = document.createElement('label');
+  field.className = 'cs-popup-field';
+  var label = document.createElement('span');
+  label.className = 'cs-popup-label';
+  label.textContent = labelText;
+  field.appendChild(label);
+  field.appendChild(control);
+  return field;
 }
 
 // ---- 抽屉 --------------------------------------------------------------
@@ -1056,12 +1217,30 @@ function setSendEnabled(enabled) {
 
 // "停止"只在有轮次在飞时露出来：没有在跑的活时它没有意义，摆在那儿只会让人以为
 // 有东西卡住了。每次露出来都顺手把 disabled 复位——上一次点击会把它按下去。
-function setStopVisible(visible) {
+//
+// 它有第二种身份（detached）：界面已经被强行复位（见 forceResetTurn）、而宿主那一轮
+// 还占着这个会话时，面板里已经没有"这一轮"可停了，能停的只剩宿主手里那一份。那时它做的
+// 是叫停宿主那一轮，字面也得跟着换 —— 否则用户按下去不知道自己在停什么。
+function setStopVisible(visible, detached) {
   var stop = document.getElementById(STOP_ID);
   if (!stop) return;
   stop.style.display = visible ? 'inline-block' : 'none';
   stop.style.opacity = '1';
   stop.disabled = false;
+  if (!visible) return;
+  stop.textContent = detached ? '叫停宿主那一轮' : '停止';
+  stop.title = detached
+    ? '面板已经放手，但宿主那一轮还占着这个会话：点它就把它叫停（agent/cancel）'
+    : '让这一轮尽快停下：已经跑完的工具结果会留下，会话还能接着说下一句';
+}
+
+// 宿主挡下"同一个会话的第二轮"用的就是这个码（见 lib/comfy_studio/server.py 的
+// agent_chat：INVALID_PARAMS = -32602）。认码也认字：码是契约，字是给读日志的人看的。
+var SESSION_BUSY_CODE = -32602;
+function isSessionBusy(error) {
+  if (!error) return false;
+  if (error.code === SESSION_BUSY_CODE) return true;
+  return typeof error.message === 'string' && error.message.indexOf('已有一轮在跑') >= 0;
 }
 
 function setModelEnabled(enabled) {
@@ -1517,8 +1696,16 @@ function forceResetTurn() {
   if (!STATE.busy) return;
   // 后端那一轮**没有停**（这里没有发 agent/cancel）：只把界面放开，并把这件事说明白 ——
   // 默默放开的话，用户下一句会撞上"会话已有一轮在跑"，那才叫莫名其妙。
+  //
+  // 收尾（finishTurn → settle）会把 busy 清零、把"停止"键摘掉；可宿主那一轮还在跑，摘掉它
+  // 就等于把唯一够得着那一轮的手段一起摘了 —— 文案让用户去点"停止"，而"停止"恰好在这一刻
+  // 消失，用户手上只剩"发一句被拒一次"这一条路。所以这次收尾按 detached 走：键留下来，
+  // 换成"叫停宿主那一轮"（见 setStopVisible / cancelTurn）。
   if (typeof STATE.finishTurn === 'function') STATE.finishTurn();
-  addError('已强行复位界面：宿主那一轮可能还在跑。发下一句之前，先点「停止」或等它收敛。');
+  addError(
+    '已强行复位界面：宿主那一轮可能还在跑，这个会话暂时发不出新话。' +
+      '点「叫停宿主那一轮」把它收掉，或换个会话（它自己跑完也会好）。'
+  );
   setStatus('界面已复位（宿主那一轮可能还在跑）', 'error');
 }
 
@@ -2831,6 +3018,10 @@ function clearLog() {
   STATE.cards = {};
   STATE.planCard = null;
   STATE.paint = (STATE.paint || 0) + 1;
+  // 换到别的段去了：那一段有没有轮次在跑是它自己的事。面板不再举着"叫停"的键 —— 举着的话
+  // 点下去会把这一发 cancel 送给刚换到的这一段（见 cancelTurn 的 session_id）。
+  STATE.detached = false;
+  setStopVisible(false);
   // 找字那点东西全在这段消息里：消息清掉了，标记与计数也就无从谈起（留着会让计数说
   // "3/3 处"而屏幕上一个都没有）。所以连输入框一起清干净，等这一段画出来再重找。
   clearFind();
@@ -3213,8 +3404,16 @@ function sendTurn() {
   STATE.planCard = null;
   addPending();
   startTurnClock();
-  var finish = function () {
-    // 收尾统一摘掉"正在思考"：成功时回答已经插在它前面，失败时错误行也是。
+  // 收尾：摘下"正在思考"、放开发送键。detached 说的不是"这一轮跑完了"，而是"面板放手了，
+  // 宿主那一轮还在跑"：
+  //   - 这一轮的 agent/chat 落地了（成功、失败、或是被宿主拒了）→ false，该摘的都摘；
+  //   - 界面被强行复位（见 forceResetTurn）→ true：宿主那一轮还在，所以"停止"键要按
+  //     "叫停宿主那一轮"的身份留下来；
+  //   - 这一轮被宿主以"会话已有一轮在跑"挡下（-32602）→ true：这一轮压根没起来，卡住的是
+  //     上一轮，能停的同样只有宿主手里那一份。
+  // 原先这三种收成同一个样子（键一律摘掉），于是用户能撞进"发一次被拒一次，而面板上一个
+  // 能按的都没有"的死角。
+  var settle = function (detached) {
     stopTurnClock();
     removePending();
     STATE.finishTurn = null;
@@ -3222,8 +3421,9 @@ function sendTurn() {
     STATE.cards = {};
     STATE.planCard = null;
     STATE.busy = false;
+    STATE.detached = detached === true;
     setSendEnabled(true);
-    setStopVisible(false);
+    setStopVisible(STATE.detached, STATE.detached);
     refreshModelEnabled();
     refreshAgentEnabled();
     refreshSessionEnabled();
@@ -3237,8 +3437,10 @@ function sendTurn() {
     // 清单跟着刷新，用户才看得见"它现在叫什么"。
     loadSessions();
   };
-  // 等太久时那颗"强制复位"按钮要能叫到它（见 forceResetTurn）。
-  STATE.finishTurn = finish;
+  // 等太久时那颗"强制复位"按钮要能叫到它（见 forceResetTurn）：那次收尾按 detached 走。
+  STATE.finishTurn = function () {
+    settle(true);
+  };
 
   // 失败不吞字：这一轮要是没发成，刚才那段话原样还回输入框（出处：ComfyUI 官方前端 agent 面板
   // 的 composables/agent/useAgentDraftSubmission.ts —— 提交失败走 composer.restorePrompt）。
@@ -3252,15 +3454,29 @@ function sendTurn() {
     return true;
   };
 
+  // 宿主挡下"同一个会话的第二轮"时，这一轮压根没起来：收尾要照 detached 走（见 settle）。
+  var rejectedBusy = false;
   bridge.request('agent/chat', { text: composed, session_id: STATE.session }).then(
     function (response) {
       if (!response || response.ok !== true) {
         var error = (response && response.error) || {};
         addError('失败: ' + (error.message || '未知错误'), error.code);
-        setStatus(
-          restoreDraft() ? '这一轮失败了，刚才那段话还回输入框了（改完再发）' : '这一轮失败了',
-          'error'
-        );
+        // 宿主那句"会话已有一轮在跑"不是这一轮的失败，是这一轮压根没起来（卡住的是上一轮）：
+        // 收尾照 detached 处理，把"叫停宿主那一轮"摆出来（见 settle）。
+        rejectedBusy = isSessionBusy(error);
+        var kept = restoreDraft();
+        if (rejectedBusy) {
+          setStatus(
+            (kept ? '这一轮没发出去，话还回输入框了：' : '') +
+              '宿主那一轮还在跑，点「叫停宿主那一轮」或换个会话',
+            'error'
+          );
+        } else {
+          setStatus(
+            kept ? '这一轮失败了，刚才那段话还回输入框了（改完再发）' : '这一轮失败了',
+            'error'
+          );
+        }
         return;
       }
       var result = response.result || {};
@@ -3282,19 +3498,28 @@ function sendTurn() {
         'error'
       );
     }
-  ).then(finish, finish);
+  ).then(
+    function () {
+      settle(rejectedBusy);
+    },
+    function () {
+      settle(rejectedBusy);
+    }
+  );
 }
 
 // 叫停这一轮。真正的收尾（摘下"正在思考"、放开发送键）仍走上面那条 finish，
 // 因为停下之后 agent/chat 会正常回一个 cancelled 结果——这里只负责把请求发出去。
 function cancelTurn() {
-  if (!STATE.busy) return;
+  // detached 时 STATE.busy 已经是 false（界面早复位了），可宿主那一轮还占着这个会话 ——
+  // 这颗键正是为那一刻留的，所以判据得把它算上，否则点它什么都不会发生（原先就是这个死角）。
+  if (!STATE.busy && !STATE.detached) return;
   var stop = document.getElementById(STOP_ID);
   if (stop) {
     stop.disabled = true;
     stop.style.opacity = '0.5';
   }
-  setStatus('正在停下这一轮…');
+  setStatus(STATE.detached ? '正在叫停宿主那一轮…' : '正在停下这一轮…');
 
   var restore = function () {
     if (stop) {
@@ -3313,7 +3538,10 @@ function cancelTurn() {
       }
       if (!response.result || response.result.cancelled !== true) {
         // 幂等：没有在跑的轮次就回 cancelled:false。多半是这一轮刚好自己跑完了，
-        // 正常结果正在回来的路上，什么都不用改。
+        // 正常结果正在回来的路上。界面复位后叫停也会走到这里 —— 宿主说它手上那一份
+        // 已经收场了，那就别再举着"叫停"的键了。
+        STATE.detached = false;
+        setStopVisible(false);
         setStatus('这一轮已经结束了');
         restore();
       }
@@ -3544,14 +3772,9 @@ function buildNovelView() {
     loadNovels();
   }));
   bar.appendChild(novelButton('导入…', '把本机的一份 txt/md 接进原文目录（粘贴它的绝对路径）', function () {
-    var form = document.getElementById(NOVEL_FORM_ID);
-    if (!form) return;
-    var opening = form.dataset.open !== '1';
-    form.dataset.open = opening ? '1' : '0';
-    if (opening) {
-      var path = document.getElementById(NOVEL_PATH_ID);
-      if (path) path.focus();
-    }
+    // 打开就是一个干净的导入弹窗：上一回那个"要不要覆盖"是属于上一回那一次的
+    // （同一份路径再来一次，「导入」还会再问一遍，问的答案不该在上一个问题上接着用）。
+    if (toggleNovelForm()) showOverwrite(false);
   }));
   bar.appendChild(novelButton('去对话', '回到对话那一页', function () {
     switchView('chat');
@@ -3564,11 +3787,10 @@ function buildNovelView() {
   toc.dataset.active = 'true';
   bar.appendChild(toc);
 
-  // 导入表单单独一行：路径是长文本，挤在按钮那行里会窄到看不见自己粘了什么。
-  var form = document.createElement('div');
-  form.id = NOVEL_FORM_ID;
-  form.className = 'cs-novel-form';
-  form.dataset.open = '0';
+  // 导入表单是个弹窗（搭法见 buildPopup）：路径是长文本，挤在按钮那行里会窄到看不见自己
+  // 粘了什么，整行给它。
+  var popup = buildPopup(NOVEL_FORM_ID, NOVEL_FORM_HINT_ID, '导入原文');
+  var form = popup.layer;
 
   var path = document.createElement('input');
   path.id = NOVEL_PATH_ID;
@@ -3589,14 +3811,26 @@ function buildNovelView() {
     showOverwrite(false);
   });
 
+  popup.body.appendChild(popupField('本机原文的绝对路径（txt / md）', path));
+
+  popup.actions.appendChild(
+    novelButton('取消', '关掉这个弹窗（不接进来）', function () {
+      toggleNovelForm(false);
+    })
+  );
   var go = novelButton('导入', '把这份接进原文目录（同名会先问你）', function () {
     importNovel(false);
   });
+  // 「导入」是这一页往下走的那一步，弹窗里就它是实心的。
+  go.dataset.primary = '1';
+  popup.actions.appendChild(go);
+  // 「覆盖导入」不是另一条路，是同一个问题的另一个答案：露出来之前先看卡片上那句话。
   var overwrite = novelButton('覆盖导入', '同名时换成你这份，原来那本会被替换掉', function () {
     importNovel(true);
   });
   overwrite.dataset.tone = 'danger';
   overwrite.style.display = 'none';
+  popup.actions.appendChild(overwrite);
 
   var hint = document.createElement('div');
   hint.id = NOVEL_HINT_ID;
@@ -3629,16 +3863,15 @@ function buildNovelView() {
   body.appendChild(buildNovelSide());
   body.appendChild(main);
 
-  form.appendChild(path);
-  form.appendChild(go);
-  form.appendChild(overwrite);
   view.appendChild(bar);
-  view.appendChild(form);
   view.appendChild(hint);
   // 批量那一栏就摆在篇目列表上面（它管的就是下面这一列）：常驻，没勾选时只说明怎么用。
   view.appendChild(buildNovelBatch());
   view.appendChild(list);
   view.appendChild(body);
+  // 弹窗摆在最后：它是绝对定位、不吃布局（放哪儿都不推别人），摆最后只是为了让它在这一页
+  // 所有内容上面。
+  view.appendChild(form);
   return view;
 }
 
@@ -3710,9 +3943,30 @@ function novelHint(text, tone) {
   return hintLine(NOVEL_HINT_ID, text, tone);
 }
 
+// 导入这条路上的提示：导入弹窗盖住了页顶那条，所以同一句话要在卡片里也写一份（跟项目页的
+// projectHint 是同一个道理：**一个调用写两处**，文案与语气还是只在这里定）。
+// 只有导入用这一份 —— 这一页页顶那条还说别的事（正读着哪一章、列表里几篇），那些跟这张
+// 卡片没有关系，不该跟着抄进弹窗里。
+function importHint(text, tone) {
+  hintLine(NOVEL_FORM_HINT_ID, text, tone);
+  return novelHint(text, tone);
+}
+
+// 导入弹窗的开关：工具栏那颗「导入…」与导完的收尾都走它（脾气交给 togglePopup）。
+function toggleNovelForm(open) {
+  return togglePopup(NOVEL_FORM_ID, NOVEL_FORM_HINT_ID, NOVEL_PATH_ID, open);
+}
+
+// 「覆盖导入」不常驻：同名不是出错，是"要你确认一下"，确认了才把它露出来 —— 而且只对着刚
+// 问过的那条路径（改了路径就收回，见 NOVEL_PATH_ID 的 input 监听）。
+// 它露出来的同时卡片也变个脸色：这一下会替换掉目录里同名那本，长什么样就说明这一下有多重。
 function showOverwrite(visible) {
-  var button = document.querySelector('#' + NOVEL_FORM_ID + ' .cs-novel-btn[data-tone="danger"]');
+  var form = document.getElementById(NOVEL_FORM_ID);
+  if (!form) return;
+  var button = form.querySelector('.cs-novel-btn[data-tone="danger"]');
   if (button) button.style.display = visible ? '' : 'none';
+  var card = form.querySelector('.cs-popup-card');
+  if (card) card.dataset.state = visible ? 'confirm' : '';
 }
 
 // 大小和日期都按人看得懂的样子写：面板上"3145728 字节"和"3.0 MB"是同一件事，
@@ -4528,12 +4782,12 @@ function importNovel(overwrite) {
   if (!path) return null;
   var source = (path.value || '').trim();
   if (source === '') {
-    novelHint('先粘一份本机 txt/md 的绝对路径。', 'error');
+    importHint('先粘一份本机 txt/md 的绝对路径。', 'error');
     path.focus();
     return null;
   }
   setNovelFormEnabled(false);
-  novelHint('正在把 ' + source + (overwrite ? ' 覆盖进来…' : ' 接进原文目录…'), 'info');
+  importHint('正在把 ' + source + (overwrite ? ' 覆盖进来…' : ' 接进原文目录…'), 'info');
   return Promise.resolve(
     bridge.request('novels/import', { path: source, overwrite: overwrite === true })
   ).then(
@@ -4543,7 +4797,7 @@ function importNovel(overwrite) {
         var error = (response && response.error) || {};
         // 路径不对、不是 txt/md、拷不动 —— 都是"这一次没成"，不是"结果里有话要说"。
         showOverwrite(false);
-        novelHint('没导进来: ' + (error.message || '未知错误'), 'error');
+        importHint('没导进来: ' + (error.message || '未知错误'), 'error');
         return null;
       }
       var result = response.result || {};
@@ -4552,11 +4806,14 @@ function importNovel(overwrite) {
         // 这时候才把「覆盖导入」露出来 —— 而且只对着刚问过的那条路径，改了路径就收回
         // （见 NOVEL_PATH_ID 的 input 监听）。
         showOverwrite(true);
-        novelHint(result.message || '原文目录里已经有这一本了：要换成你这份就点「覆盖导入」', 'info');
+        importHint(result.message || '原文目录里已经有这一本了：要换成你这份就点「覆盖导入」', 'info');
         return result;
       }
       showOverwrite(false);
       path.value = '';
+      // 这一趟做完了就把弹窗收掉：结果（接进来哪一份、目录在哪）写在页顶那条提示与列表里，
+      // 弹窗继续举着只会挡住刚更新出来的那一列。
+      toggleNovelForm(false);
       var note =
         (result.overwritten === true ? '换成了 ' : '接进来了 ') +
         result.name +
@@ -4570,7 +4827,7 @@ function importNovel(overwrite) {
     function (err) {
       setNovelFormEnabled(true);
       showOverwrite(false);
-      novelHint('没导进来: ' + message(err), 'error');
+      importHint('没导进来: ' + message(err), 'error');
       return null;
     }
   );
@@ -4627,8 +4884,10 @@ function novelToChat(row) {
 // 三页之间就靠这类动作互相接上：小说页出的是"哪一篇"，项目页出的是"这部戏的格子"。
 function novelToProject(row) {
   switchView('project');
-  var form = document.getElementById(PROJECT_FORM_ID);
-  if (form) form.dataset.open = '1';
+  // 走弹窗那一套开关打开（内含：清掉上一次那句话、把光标放进剧名）。
+  // 这里**不**顺手 fillNovelOptions：下面那趟是有序的 —— 先填下拉、再选中这一篇；
+  // 两趟并在一起时，后回来的那趟会把已经选中的冲掉。
+  toggleProjectForm(true);
   var name = document.getElementById(PROJECT_FORM_NAME_ID);
   // 剧名默认去掉扩展名（"斗破苍穹.txt" → "斗破苍穹"）：剧名就是目录名，
   // 带着 .txt 建出来的目录一眼就是机器随手起的。
@@ -4666,8 +4925,17 @@ function novelToProject(row) {
 // 以及正读的那份读到第几页。票是为了"慢回话别盖掉新界面"。
 
 // 这一页的提示行：文案是这一页的事，语气交给 hintLine（三页同一套）。
+// 建项目弹窗盖住了页顶这条，所以同一句话要在卡片里也写一份（弹窗自己那条 hint）——
+// 这是**一个调用写两处**，不是一个来源变两个：文案与语气还是只在这里定。
 function projectHint(text, tone) {
+  hintLine(PROJECT_FORM_HINT_ID, text, tone);
   return hintLine(PROJECT_HINT_ID, text, tone);
+}
+
+// 建项目弹窗的开关：脾气交给 togglePopup（那一份是两页共用的），这里只说清是哪一个弹窗、
+// 打开时光标该落在剧名那一格。
+function toggleProjectForm(open) {
+  return togglePopup(PROJECT_FORM_ID, PROJECT_FORM_HINT_ID, PROJECT_FORM_NAME_ID, open);
 }
 
 function projectButton(label, title, onClick) {
@@ -4702,15 +4970,9 @@ function buildProjectView() {
   );
   bar.appendChild(
     projectButton('新建项目…', '给一部新戏建目录：填名字与集数，还能从原文库里挑一本原著', function () {
-      var form = document.getElementById(PROJECT_FORM_ID);
-      if (!form) return;
-      var open = form.dataset.open === '1';
-      form.dataset.open = open ? '0' : '1';
-      if (open) return;
       // 表单里的原著下拉要现填：原文库是别的程序也会动的东西（导入、删除都在小说那页）。
-      fillNovelOptions();
-      var name = document.getElementById(PROJECT_FORM_NAME_ID);
-      if (name) name.focus();
+      // 只在"确实打开了"这一趟填 —— 收起来的时候没必要再问一遍原文库。
+      if (toggleProjectForm()) fillNovelOptions();
     })
   );
   bar.appendChild(
@@ -4721,16 +4983,18 @@ function buildProjectView() {
 
   // 建项目表单：剧名、集数、原著（可从原文库里挑）。原著是**可选**的 ——
   // 有的是原创，有的还没把原文接进来；没选就只是不登记来源，不影响建目录。
-  var form = document.createElement('div');
-  form.id = PROJECT_FORM_ID;
-  form.className = 'cs-proj-form';
+  // 它是个弹窗（搭法见 buildPopup），这几个字段一个占一行。
+  var popup = buildPopup(PROJECT_FORM_ID, PROJECT_FORM_HINT_ID, '新建项目 / 补落点');
+  var form = popup.layer;
+
   var nameInput = document.createElement('input');
   nameInput.id = PROJECT_FORM_NAME_ID;
   nameInput.className = 'cs-proj-input';
-  nameInput.name = 'name';
   nameInput.type = 'text';
-  nameInput.placeholder = '剧名（就是目录名）';
+  nameInput.placeholder = '例如 长夜';
   nameInput.title = '这一部戏的目录名：manju/projects/<剧名>/';
+  popup.body.appendChild(popupField('剧名（就是目录名）', nameInput));
+
   var episodes = document.createElement('input');
   episodes.id = PROJECT_FORM_EPISODES_ID;
   episodes.className = 'cs-proj-input';
@@ -4739,32 +5003,41 @@ function buildProjectView() {
   episodes.max = '9999';
   episodes.value = '12';
   episodes.title = '分多少集：写进模板占位符（以后改集数不用重建目录）';
+  popup.body.appendChild(popupField('集数', episodes));
+
   var novel = document.createElement('select');
   novel.id = PROJECT_FORM_NOVEL_ID;
   novel.className = 'cs-proj-select';
   novel.title = '这一部改的是哪本原著：登记进 00_PROJECT/07_素材归档/素材来源登记.md（可选）';
+  popup.body.appendChild(popupField('原著（可选）', novel));
+
   var upgrade = document.createElement('input');
   upgrade.id = PROJECT_FORM_UPGRADE_ID;
   upgrade.type = 'checkbox';
   var upgradeWrap = document.createElement('label');
-  upgradeWrap.className = 'cs-proj-check';
+  upgradeWrap.className = 'cs-popup-check';
   upgradeWrap.title = '目录已经有了时：补上缺少的那些格子（已经写进去的东西一律不动）';
   upgradeWrap.appendChild(upgrade);
   upgradeWrap.appendChild(document.createTextNode('已存在就补齐落点'));
-  form.appendChild(nameInput);
-  form.appendChild(episodes);
-  form.appendChild(novel);
-  form.appendChild(upgradeWrap);
-  form.appendChild(
-    projectButton('建', '按这份表单建目录 / 补落点（只补不覆盖）', function () {
-      createProjectFromForm();
+  popup.body.appendChild(upgradeWrap);
+
+  popup.actions.appendChild(
+    projectButton('取消', '关掉这个弹窗（不建目录）', function () {
+      toggleProjectForm(false);
     })
   );
+  var submit = projectButton('建', '按这份表单建目录 / 补落点（只补不覆盖）', function () {
+    createProjectFromForm();
+  });
+  submit.dataset.primary = '1';
+  popup.actions.appendChild(submit);
 
   var hint = document.createElement('div');
   hint.id = PROJECT_HINT_ID;
   hint.className = 'cs-proj-hint';
-  hint.textContent = '左边点一部剧，右边就是它的资料落到哪几格了。';
+  // 平时空着（CSS 里 :empty 连位子都不占）：这一行说的是"刚才那件事怎么样了"——建项目、
+  // 读文件、列不出项目。这块面板怎么用那两句，放在右边的空态里说，不必在页顶再占一行。
+  hint.textContent = '';
 
   var body = document.createElement('div');
   body.className = 'cs-proj-body';
@@ -4778,7 +5051,7 @@ function buildProjectView() {
   var head = document.createElement('div');
   head.id = PROJECT_HEAD_ID;
   head.className = 'cs-proj-head';
-  head.textContent = '还没有选中哪一部剧。';
+  head.textContent = '左边点一部剧，右边就是它的资料落到哪几格了。';
   var shelves = document.createElement('div');
   shelves.id = PROJECT_SHELVES_ID;
   shelves.className = 'cs-proj-shelves';
@@ -4797,11 +5070,15 @@ function buildProjectView() {
   body.appendChild(list);
   body.appendChild(main);
   view.appendChild(bar);
-  view.appendChild(buildProjectFind());
-  view.appendChild(form);
   view.appendChild(hint);
+  // 筛项目那一行与总览紧挨着：它们说的是同一件事（这一屏列出来了几部、什么光景）。
+  // 中间夹一个建项目表单的话，读完计数还得往上翻回去找。
+  view.appendChild(buildProjectFind());
   view.appendChild(buildProjectOverview());
   view.appendChild(body);
+  // 弹窗摆在最后：它是绝对定位、不吃布局（放哪儿都不推别人），摆最后只是为了让它在这一页
+  // 所有内容上面。
+  view.appendChild(form);
   return view;
 }
 
@@ -4933,6 +5210,17 @@ function paintProjectFindCount(result) {
 // stages_total / missing_count，见 projects.py 的 _summary）—— 不新造任何判据：哪一步算落齐
 // 仍然是宿主按落点里有没有产物判的。所以措辞只说"阶段全落齐"，不说"这部戏做完了"（详情页里
 // 也是同一句提醒）。列表被截断时只算得到列出来的那几部，这一点写在句子里。
+// 总览里的一枚小签。数还是那几个数（都出自宿主 projects/list 的行，见 paintProjectOverview），
+// 只是不再连成一长句 —— tone 只管语气：'' 普通、"zero" 这个数是 0（淡下去：它是"没有"，
+// 不是"有问题"）、"action" 有要人去补的、"warn" 这一屏只算到了一部分。
+function projectChip(text, tone) {
+  var chip = document.createElement('span');
+  chip.className = 'cs-proj-chip';
+  chip.textContent = text;
+  if (tone) chip.dataset.tone = tone;
+  return chip;
+}
+
 function buildProjectOverview() {
   var line = document.createElement('div');
   line.id = PROJECT_OVERVIEW_ID;
@@ -4964,13 +5252,22 @@ function paintProjectOverview(result) {
     else if (total > 0 && done >= total) settled += 1;
     else running += 1;
   });
-  var text =
-    (result.query ? '筛出的 ' : '列出来的 ') + rows.length + ' 部：还没动工 ' + untouched +
-    ' 部、进行中 ' + running + ' 部、阶段全落齐 ' + settled + ' 部';
-  if (sumTotal > 0) text += '；阶段合计 ' + sumDone + '/' + sumTotal;
-  if (missing > 0) text += '；缺落点共 ' + missing + ' 格';
-  if (result.truncated === true) text += '（还有 ' + (result.matched - result.returned) + ' 部没算进来）';
-  line.textContent = text;
+  line.textContent = '';
+  // 每一枚签的文案跟原来那一句里的片段逐字一致：数一个都没变，只是不再连成一整句。
+  // 两枚签之间留一个空格，复制出去还是断得开的。
+  var add = function (chip) {
+    if (line.childNodes.length > 0) line.appendChild(document.createTextNode(' '));
+    line.appendChild(chip);
+  };
+  add(projectChip((result.query ? '筛出的 ' : '列出来的 ') + rows.length + ' 部'));
+  add(projectChip('还没动工 ' + untouched + ' 部', untouched === 0 ? 'zero' : ''));
+  add(projectChip('进行中 ' + running + ' 部', running === 0 ? 'zero' : ''));
+  add(projectChip('阶段全落齐 ' + settled + ' 部', settled === 0 ? 'zero' : ''));
+  if (sumTotal > 0) add(projectChip('阶段合计 ' + sumDone + '/' + sumTotal));
+  if (missing > 0) add(projectChip('缺落点共 ' + missing + ' 格', 'action'));
+  if (result.truncated === true) {
+    add(projectChip('还有 ' + (result.matched - result.returned) + ' 部没算进来', 'warn'));
+  }
 }
 
 function paintProjects(result) {
@@ -5117,10 +5414,14 @@ function projectDetailError(text) {
   if (pager) pager.textContent = '';
 }
 
-function projectWarn(text) {
+// 详情里的一行备注。文案由各处自己写（只有它知道那件事的来龙去脉），语气在这一处定 ——
+// 以前四种事都穿同一件红衣服：下一步往哪走是**路标**，不是报警，用红字说它，人一进来就以为
+// 出事了。tone：plain 事实登记 / next 下一步 / action 要人去补的 / bug 面板自己的毛病。
+function projectNote(text, tone) {
   var line = document.createElement('div');
   if (!text) return line;
-  line.className = 'cs-proj-warn';
+  line.className = 'cs-proj-note';
+  line.dataset.tone = tone || 'plain';
   line.textContent = text;
   return line;
 }
@@ -5150,6 +5451,16 @@ function projectBar(done, total, label) {
   return bar;
 }
 
+// 阶段里的一步，一枚小签。文案照宿主念（label 与文件数都出自 projects/tree 的 summary.stages，
+// 见 projects.py 的 _summary）；做没做只看 done 这一位 —— 面板不自己判断哪一步算完成了。
+function projectStage(stage) {
+  var chip = document.createElement('span');
+  chip.className = 'cs-proj-stage';
+  chip.dataset.done = stage.done === true ? '1' : '0';
+  chip.textContent = stage.label + '（' + stage.files + '）';
+  return chip;
+}
+
 // 画一部剧：顶上三行事实（阶段 / 原著 / 缺什么），下面一格一格摆资料。
 // 「缺落点」与「面板格子跟规范对不上」是两码事，所以分两条写：
 // 前者让人去补目录，后者是**面板自己的 bug**（要改 PROJECT_SHELVES），不能混在一起说。
@@ -5159,20 +5470,28 @@ function paintProjectDetail(tree) {
   var stages = summary.stages || [];
   if (head) {
     head.textContent = '';
+    // 剧名一行、路径一行：路径常常比面板还长，跟剧名挤一行会把剧名一起拽断。
     var title = document.createElement('div');
-    title.textContent = tree.name + ' · ' + tree.path;
+    title.className = 'cs-proj-title';
+    title.textContent = tree.name;
     head.appendChild(title);
+    var pathLine = document.createElement('div');
+    pathLine.className = 'cs-proj-path';
+    pathLine.textContent = tree.path;
+    head.appendChild(pathLine);
     var stageLine = document.createElement('div');
     stageLine.className = 'cs-proj-stages';
-    stageLine.textContent =
-      '阶段：' +
-      (stages.length > 0
-        ? stages
-            .map(function (stage) {
-              return (stage.done === true ? '✅ ' : '☐ ') + stage.label + '（' + stage.files + '）';
-            })
-            .join('  ')
-        : '宿主没给阶段判据');
+    var stageLabel = document.createElement('span');
+    stageLabel.className = 'cs-proj-stages-label';
+    stageLabel.textContent = '阶段：';
+    stageLine.appendChild(stageLabel);
+    if (stages.length > 0) {
+      stages.forEach(function (stage) {
+        stageLine.appendChild(projectStage(stage));
+      });
+    } else {
+      stageLine.appendChild(document.createTextNode('宿主没给阶段判据'));
+    }
     head.appendChild(stageLine);
     // 还剩几步、下一步是哪一步：条还是宿主那两个数画的（见 projectBar），名字也照宿主的念
     // （stages[].label / stages_done / stages_total 都出自 projects/tree 的 summary）——
@@ -5180,6 +5499,11 @@ function paintProjectDetail(tree) {
     var done = Number(summary.stages_done) || 0;
     var total = Number(summary.stages_total) || stages.length;
     if (total > 0) {
+      // 数字照旧写在条旁边：条形只当"余量"看，别让人只能对着一条虚线猜还剩多少（见 projectBar）。
+      var meterNote = document.createElement('div');
+      meterNote.className = 'cs-proj-meter-note';
+      meterNote.textContent = done + '/' + total + ' 段有产物';
+      head.appendChild(meterNote);
       head.appendChild(projectBar(done, total, done + '/' + total + ' 段有产物'));
       var nextStage = null;
       for (var stageIndex = 0; stageIndex < stages.length; stageIndex += 1) {
@@ -5189,13 +5513,15 @@ function paintProjectDetail(tree) {
         }
       }
       head.appendChild(
-        projectWarn(
+        projectNote(
           nextStage
             ? '下一步：' + nextStage.label + '（这一步现在 ' + nextStage.files + ' 个产物）—— 资料放进去之后回来看这条就会往前走'
-            : '这几步都落上产物了（这是宿主按落点判的，不等于整部戏做完了）'
+            : '这几步都落上产物了（这是宿主按落点判的，不等于整部戏做完了）',
+          'next'
         )
       );
     }
+    // 原著登记这一行：登记过的话右边接一颗"去读原文"（见 novel 分支）。
     var novel = document.createElement('div');
     novel.className = 'cs-proj-novel';
     if (!tree.novel) {
@@ -5215,22 +5541,29 @@ function paintProjectDetail(tree) {
       );
     }
     head.appendChild(novel);
+    // 缺落点是要人去补目录（action）；下面两条是**面板自己的 bug**（bug）——
+    // 一个要去补目录、一个要改面板，两件事不共用一种颜色。
     head.appendChild(
-      projectWarn(
+      projectNote(
         (summary.missing || []).length > 0
           ? '缺 ' + summary.missing_count + ' 个落点：' + summary.missing.join('、') + '（勾上「已存在就补齐落点」再建一次）'
-          : ''
+          : '',
+        'action'
       )
     );
     head.appendChild(
-      projectWarn(
+      projectNote(
         (tree.gaps || []).length > 0
           ? '规范里有落点没被面板归到任何一格：' + tree.gaps.join('、') + '（面板该补格子了）'
-          : ''
+          : '',
+        'bug'
       )
     );
     head.appendChild(
-      projectWarn((tree.unknown || []).length > 0 ? '面板写了规范里没有的落点：' + tree.unknown.join('、') : '')
+      projectNote(
+        (tree.unknown || []).length > 0 ? '面板写了规范里没有的落点：' + tree.unknown.join('、') : '',
+        'bug'
+      )
     );
   }
   var shelves = document.getElementById(PROJECT_SHELVES_ID);
@@ -5254,8 +5587,12 @@ function shelfBlock(shelf) {
     shelf.dirs && shelf.dirs.length > 0
       ? '这一格对应：' + shelf.dirs.map(function (dir) { return dir.rel; }).join('、')
       : '项目根下的文件（总纲、README 这类不在格子里的）';
+  // 有东西/空着用一个 6px 的点说（样式在 CSS，这里只占位），不用 ✅/☐：
+  // 勾选框摆在这一列最左边，九行连起来像一排待勾的多选框，而这九行是
+  // "去哪一格里找资料"，不是一件件要人去勾的事。
   var mark = document.createElement('span');
-  mark.textContent = shelf.count > 0 ? '✅' : '☐';
+  mark.className = 'cs-proj-shelf-mark';
+  mark.setAttribute('aria-hidden', 'true');
   var title = document.createElement('span');
   title.textContent = shelf.title;
   var count = document.createElement('span');
@@ -5565,22 +5902,29 @@ function paintProjectPage(page) {
   pager.appendChild(next);
   var info = document.createElement('span');
   info.className = 'cs-proj-pos';
-  info.textContent =
-    page.rel +
-    ' · ' +
-    page.encoding +
-    ' · ' +
-    (chars === 0 ? '空' : offset + 1 + '~' + (offset + chars)) +
-    ' / ' +
-    page.total_chars +
-    ' 字';
+  // 文件名单独拎成一个 span（提亮加粗，见 CSS）：正文是一整块长的，读着读着最容易忘
+  // "这是哪一份"。只是分开上色，textContent 还是原来那一句。
+  var rel = document.createElement('span');
+  rel.className = 'cs-proj-pos-rel';
+  rel.textContent = page.rel;
+  info.appendChild(rel);
+  info.appendChild(
+    document.createTextNode(
+      ' · ' +
+        page.encoding +
+        ' · ' +
+        (chars === 0 ? '空' : offset + 1 + '~' + (offset + chars)) +
+        ' / ' +
+        page.total_chars +
+        ' 字'
+    )
+  );
   pager.appendChild(info);
 }
 
 // 建项目 / 补落点。落盘的活整个是宿主的（那边的 create_project 只补不覆盖），
 // 这一层只把它回的话说成人话 —— 包括"原著登记了没、为什么没登记"。
 function createProjectFromForm() {
-  var form = document.getElementById(PROJECT_FORM_ID);
   var nameEl = document.getElementById(PROJECT_FORM_NAME_ID);
   var episodesEl = document.getElementById(PROJECT_FORM_EPISODES_ID);
   var novelEl = document.getElementById(PROJECT_FORM_NOVEL_ID);
@@ -5620,7 +5964,8 @@ function createProjectFromForm() {
         (result.files || []).length +
         ' 份）' +
         novelNote(result.novel);
-      if (form) form.dataset.open = '0';
+      // 建成了就把弹窗收掉（开关只有 toggleProjectForm 一个作者）。
+      toggleProjectForm(false);
       // 筛词要先清掉（只清状态与输入框，不发请求）：留着的话这一趟重列带着旧筛词，
       // 刚建好的那部戏名字多半对不上筛词，用户建完却"看不见自己"。
       clearProjectFindQuietly();
@@ -6257,6 +6602,9 @@ export function getComfyStudioChatContentScript(): string {
     // 之后摆出来的"强制复位"按钮（见 paintTurnClock / offerForceReset）。
     `pendingLabel: null, turnStartedAt: 0, turnTimer: null, turnNote: '', forceReset: null, ` +
     `finishTurn: null, softWarned: false, ` +
+    // 界面已经放手、宿主那一轮却还占着这个会话（强行复位之后就是这个局面，见 forceResetTurn）。
+    // 它决定"停止"键以哪种身份露面（见 setStopVisible），也决定那颗键还能不能按。
+    `detached: false, ` +
     // 抽屉里的三页（'chat' / 'novel' / 'project'）与小说那一页的当前状态：列表那一趟的票、
     // 正开着的是哪一篇（含它自己那趟读的票）、删除按到第二步的是哪一行。
     `view: 'chat', novels: null, novelOpen: null, novelDeleteArmed: null, novelListToken: 0, ` +

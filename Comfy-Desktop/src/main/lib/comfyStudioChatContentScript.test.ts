@@ -149,7 +149,7 @@ describe('getComfyStudioChatContentScript', () => {
         Promise.resolve(
           typeof overrides.request === 'function'
             ? (overrides.request as RequestStub)(method, params)
-            : overrides.request ?? { ok: true, result: { text: '答案在此' } }
+            : (overrides.request ?? { ok: true, result: { text: '答案在此' } })
         )
       ),
       onEvent: vi.fn((callback: (payload: unknown) => void) => {
@@ -323,7 +323,10 @@ describe('getComfyStudioChatContentScript', () => {
 
     expect(rows('pending'), 'the pending row goes away when the turn settles').toHaveLength(0)
     // final 事件本身不画：同一段文本由请求结果带回，画两遍就重复了
-    expect(rows('assistant').map((r) => r.textContent)).toEqual(['先查一下可用的 skill', '答案在此'])
+    expect(rows('assistant').map((r) => r.textContent)).toEqual([
+      '先查一下可用的 skill',
+      '答案在此'
+    ])
     expect(rows('assistant')[0]?.getAttribute('data-variant')).toBe('intermediate')
     expect(rows('assistant')[1]?.getAttribute('data-variant')).toBe('final')
   })
@@ -343,7 +346,14 @@ describe('getComfyStudioChatContentScript', () => {
     // 宿主在一次模型调用失败后会报 retry（见 lib/comfy_studio/agent/loop.py 的 report_retry）。
     // 那是"还活着、只是还没成"的唯一信号，原先面板不认这个类型 —— 于是它和卡死长得一模一样。
     emit({
-      params: { session_id: 'default', type: 'retry', attempt: 2, total: 5, delay: 4, reason: '500' }
+      params: {
+        session_id: 'default',
+        type: 'retry',
+        attempt: 2,
+        total: 5,
+        delay: 4,
+        reason: '500'
+      }
     })
     await flush()
 
@@ -392,12 +402,87 @@ describe('getComfyStudioChatContentScript', () => {
     expect(said('error').join(''), 'it must say the host may still be running').toContain(
       '宿主那一轮可能还在跑'
     )
+
+    // 复位只放开面板：宿主那一轮还占着这个会话。原先收尾把"停止"键一起摘掉了（busy 清零 +
+    // display:none），于是同一句文案让用户去点一个已经消失的键，用户只剩"发一句被拒一次"
+    // 这条路 —— 键得留下来，而且要说清它现在停的是谁（见 setStopVisible / cancelTurn）。
+    const stopButton = document.getElementById(STOP_ID) as HTMLButtonElement
+    expect(stopButton.style.display, 'the host turn is still out there').not.toBe('none')
+    expect(stopButton.textContent).toBe('叫停宿主那一轮')
+  })
+
+  it('really cancels the host turn from that key after a force reset', async () => {
+    const request = vi.fn((method: string) => {
+      if (method === 'agent/models') return catalog(['a:3b'], 'a:3b')
+      if (method === 'agent/cancel') {
+        return { ok: true, result: { session_id: 'default', cancelled: true } }
+      }
+      return new Promise(() => {}) // 这一轮一直挂着：面板与宿主各有一份"还在跑"
+    })
+    installBridge({ request })
+    setupDom()
+    new Function(script)()
+    await openPanel()
+
+    await send('问一句')
+    await vi.advanceTimersByTimeAsync(301_000)
+    const escape = document.querySelector(`#${LOG_ID} .cs-force-reset`) as HTMLButtonElement
+    escape.click()
+    await flush()
+    await flush()
+
+    const stop = document.getElementById(STOP_ID) as HTMLButtonElement
+    stop.click()
+    await flush()
+
+    // 面板这边 busy 已经是 false 了，可发的还是得发：那一轮在宿主手里，只有它能收。
+    expect(request).toHaveBeenCalledWith('agent/cancel', { session_id: 'default' })
+    expect(document.getElementById(STATUS_ID)?.textContent).toContain('正在叫停宿主那一轮')
+  })
+
+  it('offers to cancel the host turn when the host rejects a second turn', async () => {
+    // 复位之后用户多半会先试一句（"继续"），宿主回 -32602。那时面板要是只报一行"失败"，
+    // 用户就只能再发一次 —— 得把能停那一轮的东西摆出来。
+    const request = vi.fn((method: string) => {
+      if (method === 'agent/models') return catalog(['a:3b'], 'a:3b')
+      if (method === 'agent/chat') {
+        return {
+          ok: false,
+          error: {
+            code: -32602,
+            message: '会话 s1 已有一轮在跑；等它结束、agent/cancel 掉它，或换个 session_id'
+          }
+        }
+      }
+      return { ok: true, result: {} }
+    })
+    installBridge({ request })
+    setupDom()
+    new Function(script)()
+    await openPanel()
+
+    await send('接着说')
+
+    const stop = document.getElementById(STOP_ID) as HTMLButtonElement
+    expect(stop.style.display, 'the host still holds this session').not.toBe('none')
+    expect(stop.textContent).toBe('叫停宿主那一轮')
+    expect(said('error').join('')).toContain('已有一轮在跑')
+    expect(document.getElementById(STATUS_ID)?.textContent).toContain('还在跑')
+    // 话也没吞：还回输入框了，换个会话就能发。
+    expect((document.getElementById(INPUT_ID) as HTMLTextAreaElement).value).toBe('接着说')
+
+    stop.click()
+    await flush()
+
+    expect(request).toHaveBeenCalledWith('agent/cancel', { session_id: 'default' })
   })
 
   describe('coming back to an older conversation', () => {
     /** 只有 `agent/history` 走自己的桩：开抽屉时面板还会问模型目录，那些保持默认。 */
-    const archive = (result: unknown): RequestStub => (method) =>
-      method === 'agent/history' ? result : { ok: true, result: { text: '答案在此' } }
+    const archive =
+      (result: unknown): RequestStub =>
+      (method) =>
+        method === 'agent/history' ? result : { ok: true, result: { text: '答案在此' } }
 
     const archived = (result: Record<string, unknown>): unknown => ({
       ok: true,
@@ -435,7 +520,10 @@ describe('getComfyStudioChatContentScript', () => {
       const log = document.getElementById(LOG_ID)
       expect(log?.firstElementChild?.textContent).toBe('上次的对话（存在这台机器上）')
       expect(said('user')).toEqual(['帮我把这张图放大两倍'])
-      expect(rows('assistant').map((r) => r.textContent)).toEqual(['先查一下可用的 skill', '已经好了'])
+      expect(rows('assistant').map((r) => r.textContent)).toEqual([
+        '先查一下可用的 skill',
+        '已经好了'
+      ])
       expect(rows('assistant')[0]?.getAttribute('data-variant')).toBe('intermediate')
       expect(rows('assistant')[1]?.getAttribute('data-variant')).toBe('final')
       // 工具卡是同一套画法：结果按 id 配回调用那张，不另起一行
@@ -446,7 +534,9 @@ describe('getComfyStudioChatContentScript', () => {
 
     it('says how many older messages the archive could not keep', async () => {
       installBridge({
-        request: archive(archived({ dropped: 12, entries: [{ type: 'user', text: '很久以前问的' }] }))
+        request: archive(
+          archived({ dropped: 12, entries: [{ type: 'user', text: '很久以前问的' }] })
+        )
       })
       setupDom()
       new Function(script)()
@@ -460,7 +550,10 @@ describe('getComfyStudioChatContentScript', () => {
 
     it('an archive that cannot be read is one line, not a silent blank', async () => {
       installBridge({
-        request: archive({ ok: false, error: { code: -32603, message: '对话存档读不了（x.json）：坏了' } })
+        request: archive({
+          ok: false,
+          error: { code: -32603, message: '对话存档读不了（x.json）：坏了' }
+        })
       })
       setupDom()
       new Function(script)()
@@ -518,17 +611,16 @@ describe('getComfyStudioChatContentScript', () => {
       ...over
     })
 
-    const host = (
-      sessions: unknown,
-      over: { history?: unknown } = {}
-    ): RequestStub => (method: string) => {
-      if (method === 'agent/sessions') return { ok: true, result: { sessions, live: 1, max_sessions: 8 } }
-      if (method === 'agent/history') return over.history ?? { ok: true, result: { entries: [] } }
-      return { ok: true, result: { text: '答案在此' } }
-    }
+    const host =
+      (sessions: unknown, over: { history?: unknown } = {}): RequestStub =>
+      (method: string) => {
+        if (method === 'agent/sessions')
+          return { ok: true, result: { sessions, live: 1, max_sessions: 8 } }
+        if (method === 'agent/history') return over.history ?? { ok: true, result: { entries: [] } }
+        return { ok: true, result: { text: '答案在此' } }
+      }
 
-    const picker = (): HTMLSelectElement =>
-      document.getElementById(SESSION_ID) as HTMLSelectElement
+    const picker = (): HTMLSelectElement => document.getElementById(SESSION_ID) as HTMLSelectElement
     const state = (): { session?: string } =>
       Reflect.get(window, '__comfyStudioChat') as { session?: string }
 
@@ -879,7 +971,9 @@ describe('getComfyStudioChatContentScript', () => {
       // 宁可多点一下，也别在一次点击里丢掉一段可能没有存档的对话。
       const bridge = installBridge({
         request: (method: string): unknown =>
-          method === 'agent/sessions' ? { ok: true, result: { sessions: [row()] } } : { ok: true, result: { text: '答案在此' } }
+          method === 'agent/sessions'
+            ? { ok: true, result: { sessions: [row()] } }
+            : { ok: true, result: { text: '答案在此' } }
       })
       setupDom()
       new Function(script)()
@@ -920,7 +1014,10 @@ describe('getComfyStudioChatContentScript', () => {
       const bridge = installBridge({
         request: (method: string): unknown => {
           if (method === 'agent/reset') {
-            return { ok: true, result: { session_id: 'default', reset: true, history_cleared: true } }
+            return {
+              ok: true,
+              result: { session_id: 'default', reset: true, history_cleared: true }
+            }
           }
           return { ok: true, result: { text: '答案在此' } }
         }
@@ -960,7 +1057,10 @@ describe('getComfyStudioChatContentScript', () => {
       installBridge({
         request: (method: string): unknown => {
           if (method === 'agent/reset') {
-            return { ok: true, result: { session_id: 'default', reset: false, history_cleared: false } }
+            return {
+              ok: true,
+              result: { session_id: 'default', reset: false, history_cleared: false }
+            }
           }
           return { ok: true, result: { text: '答案在此' } }
         }
@@ -982,7 +1082,10 @@ describe('getComfyStudioChatContentScript', () => {
       installBridge({
         request: (method: string): unknown => {
           if (method === 'agent/reset') {
-            return { ok: true, result: { session_id: 'default', reset: true, history_cleared: false } }
+            return {
+              ok: true,
+              result: { session_id: 'default', reset: true, history_cleared: false }
+            }
           }
           return { ok: true, result: { text: '答案在此' } }
         }
@@ -1054,12 +1157,14 @@ describe('getComfyStudioChatContentScript', () => {
 
   describe('where it keeps things on this machine', () => {
     /** 开抽屉时面板会问几件事（模型目录、上次的对话、host/info）；只有 host/info 走自己的桩。 */
-    const hostInfo = (result: Record<string, unknown> | null): RequestStub => (method) =>
-      method === 'host/info'
-        ? result === null
-          ? { ok: false, error: { message: '宿主没起来' } }
-          : { ok: true, result }
-        : { ok: true, result: { text: '答案在此' } }
+    const hostInfo =
+      (result: Record<string, unknown> | null): RequestStub =>
+      (method) =>
+        method === 'host/info'
+          ? result === null
+            ? { ok: false, error: { message: '宿主没起来' } }
+            : { ok: true, result }
+          : { ok: true, result: { text: '答案在此' } }
 
     const line = (): HTMLElement | null => document.getElementById(STORAGE_ID)
 
@@ -1235,7 +1340,9 @@ describe('getComfyStudioChatContentScript', () => {
     expect(card.getAttribute('data-state'), 'a call with no result yet is running').toBe('running')
     expect(card.querySelector('.cs-tool-server')?.textContent).toBe('comfy-studio')
     expect(card.querySelector('.cs-tool-name')?.textContent).toBe('comfy_list_skills')
-    expect(card.querySelector('.cs-block')?.textContent, 'arguments are shown').toContain('"limit": 5')
+    expect(card.querySelector('.cs-block')?.textContent, 'arguments are shown').toContain(
+      '"limit": 5'
+    )
 
     emit({
       params: {
@@ -1263,16 +1370,38 @@ describe('getComfyStudioChatContentScript', () => {
     input.value = '跑个 skill'
     document.getElementById(SEND_ID)?.click() // 不 await：这一轮在飞行中
 
-    emit({ params: { session_id: 'default', type: 'tool_call', id: 'call_1', name: 'srv__run', arguments: {} } })
+    emit({
+      params: {
+        session_id: 'default',
+        type: 'tool_call',
+        id: 'call_1',
+        name: 'srv__run',
+        arguments: {}
+      }
+    })
     // 宿主把 isError 的结果标成 "ERROR: ..." 文本喂回来（mcp/result.py 的 tool_text）
     emit({
-      params: { session_id: 'default', type: 'tool_result', id: 'call_1', name: 'srv__run', text: 'ERROR: 显存不够' }
+      params: {
+        session_id: 'default',
+        type: 'tool_result',
+        id: 'call_1',
+        name: 'srv__run',
+        text: 'ERROR: 显存不够'
+      }
     })
 
     expect(rows('tool')[0]?.getAttribute('data-state')).toBe('error')
     expect(rows('tool')[0]?.querySelector('.cs-tool-state')?.textContent).toBe('失败')
 
-    emit({ params: { session_id: 'default', type: 'tool_result', id: 'call_9', name: 'srv__run', text: '结果' } })
+    emit({
+      params: {
+        session_id: 'default',
+        type: 'tool_result',
+        id: 'call_9',
+        name: 'srv__run',
+        text: '结果'
+      }
+    })
 
     const cards = rows('tool')
     expect(cards, 'a result without its call must not be dropped').toHaveLength(2)
@@ -1291,8 +1420,24 @@ describe('getComfyStudioChatContentScript', () => {
     document.getElementById(SEND_ID)?.click() // 不 await：这一轮在飞行中
 
     const long = 'x'.repeat(700)
-    emit({ params: { session_id: 'default', type: 'tool_call', id: 'call_1', name: 'srv__run', arguments: {} } })
-    emit({ params: { session_id: 'default', type: 'tool_result', id: 'call_1', name: 'srv__run', text: long } })
+    emit({
+      params: {
+        session_id: 'default',
+        type: 'tool_call',
+        id: 'call_1',
+        name: 'srv__run',
+        arguments: {}
+      }
+    })
+    emit({
+      params: {
+        session_id: 'default',
+        type: 'tool_result',
+        id: 'call_1',
+        name: 'srv__run',
+        text: long
+      }
+    })
 
     const card = rows('tool')[0]
     if (!card) throw new Error('Expected the tool card')
@@ -1407,7 +1552,10 @@ describe('getComfyStudioChatContentScript', () => {
     expect(request).toHaveBeenCalledWith('agent/cancel', { session_id: 'default' })
 
     // 停下之后宿主仍把 agent/chat 正常答完：结果带 cancelled:true
-    settleChat({ ok: true, result: { session_id: 'default', text: '', cancelled: true, reason: '用户取消' } })
+    settleChat({
+      ok: true,
+      result: { session_id: 'default', text: '', cancelled: true, reason: '用户取消' }
+    })
     await flush()
 
     expect(rows('stopped').map((r) => r.textContent)).toEqual(['已停止'])
@@ -1597,9 +1745,10 @@ describe('getComfyStudioChatContentScript', () => {
     await openPanel()
 
     const picker = document.getElementById(MODEL_ID) as HTMLSelectElement
-    expect(Array.from(picker.options).map((o) => o.value), 'the broken source is not dropped').toEqual(
-      ['default::a:3b']
-    )
+    expect(
+      Array.from(picker.options).map((o) => o.value),
+      'the broken source is not dropped'
+    ).toEqual(['default::a:3b'])
     // 坏掉的那家照样画在分组里（点不了），标题上写清是它、为什么 —— 悄悄抹掉的话，
     // 用户只会以为自己刚配的那一家没生效，然后反复改它。
     const broken = Array.from(picker.querySelectorAll('optgroup')).find(
@@ -1695,7 +1844,9 @@ describe('getComfyStudioChatContentScript', () => {
 
   it('locks the picker while a turn is in flight', async () => {
     const request = vi.fn((method: string) =>
-      method === 'agent/models' ? catalog(['a:3b'], 'a:3b') : { ok: true, result: { text: '答案在此' } }
+      method === 'agent/models'
+        ? catalog(['a:3b'], 'a:3b')
+        : { ok: true, result: { text: '答案在此' } }
     )
     installBridge({ request })
     setupDom()
@@ -1748,7 +1899,13 @@ describe('getComfyStudioChatContentScript', () => {
   it('switches the agent through the host and names the new persona', async () => {
     const request = vi.fn((method: string) => {
       if (method === 'agent/agents')
-        return agentsCatalog([{ id: 'general', name: '通用' }, { id: 'artist', name: '画师' }], 'general')
+        return agentsCatalog(
+          [
+            { id: 'general', name: '通用' },
+            { id: 'artist', name: '画师' }
+          ],
+          'general'
+        )
       if (method === 'agent/agent')
         return { ok: true, result: { agent: 'artist', changed: true, name: '画师', error: null } }
       return { ok: true, result: { text: '答案在此' } }
@@ -1774,7 +1931,13 @@ describe('getComfyStudioChatContentScript', () => {
   it('rolls the agent picker back when the host rejects the switch', async () => {
     const request = vi.fn((method: string) => {
       if (method === 'agent/agents')
-        return agentsCatalog([{ id: 'general', name: '通用' }, { id: 'ghost', name: '幽灵' }], 'general')
+        return agentsCatalog(
+          [
+            { id: 'general', name: '通用' },
+            { id: 'ghost', name: '幽灵' }
+          ],
+          'general'
+        )
       if (method === 'agent/agent')
         return { ok: false, error: { code: -32602, message: '没有这个智能体' } }
       return { ok: true, result: { text: '答案在此' } }
@@ -2368,7 +2531,9 @@ describe('getComfyStudioChatContentScript', () => {
       Array.from(document.querySelectorAll<HTMLElement>(`#${LOG_ID} [data-hit]`))
     const saidRow = (index = 0): Element | undefined => rows('user')[index]
     const actionButton = (text: string, row: Element | undefined = saidRow()): HTMLButtonElement =>
-      Array.from(row?.querySelectorAll('button') ?? []).find((b) => b.textContent === text) as HTMLButtonElement
+      Array.from(row?.querySelectorAll('button') ?? []).find(
+        (b) => b.textContent === text
+      ) as HTMLButtonElement
     /** 敲进找字框里（面板听的是 input 事件，不是 change）。 */
     const typeFind = (query: string): void => {
       const box = findBox()
@@ -2387,7 +2552,9 @@ describe('getComfyStudioChatContentScript', () => {
       await send('帮我起个标题')
 
       expect(
-        Array.from(saidRow()?.querySelectorAll('.cs-user-actions button') ?? []).map((b) => b.textContent)
+        Array.from(saidRow()?.querySelectorAll('.cs-user-actions button') ?? []).map(
+          (b) => b.textContent
+        )
       ).toEqual(['复制', '改一下'])
       // 模型说的话没有"改一下"这回事：宿主没有"改掉某一条历史"的口子（agent/chat 只接一段话）。
       expect(rows('assistant')[0]?.querySelector('.cs-user-actions')).toBeNull()
@@ -2404,7 +2571,9 @@ describe('getComfyStudioChatContentScript', () => {
       await flush()
 
       expect((document.getElementById(INPUT_ID) as HTMLTextAreaElement).value).toBe('帮我起个标题')
-      expect(document.getElementById(STATUS_ID)?.textContent, '得说清这不是改历史').toContain('另起一轮')
+      expect(document.getElementById(STATUS_ID)?.textContent, '得说清这不是改历史').toContain(
+        '另起一轮'
+      )
       expect(said('user'), '原来那一轮还留在这段对话里').toEqual(['帮我起个标题'])
       expect(
         bridge.request.mock.calls.filter((call: unknown[]) => call[0] === 'agent/chat'),
@@ -2606,12 +2775,14 @@ describe('getComfyStudioChatContentScript', () => {
     })
 
     /** 只有 novels/* 那几件事走自己的桩；开抽屉时要问的那些保持默认。 */
-    const host = (handlers: Record<string, unknown>): RequestStub => (method, params) =>
-      method in handlers
-        ? typeof handlers[method] === 'function'
-          ? (handlers[method] as RequestStub)(method, params)
-          : handlers[method]
-        : { ok: true, result: { text: '答案在此' } }
+    const host =
+      (handlers: Record<string, unknown>): RequestStub =>
+      (method, params) =>
+        method in handlers
+          ? typeof handlers[method] === 'function'
+            ? (handlers[method] as RequestStub)(method, params)
+            : handlers[method]
+          : { ok: true, result: { text: '答案在此' } }
 
     const view = (id: string): HTMLElement => document.getElementById(id) as HTMLElement
     const hintLine = (): HTMLElement => view(NOVEL_HINT_ID)
@@ -2642,7 +2813,9 @@ describe('getComfyStudioChatContentScript', () => {
 
     const sideList = (): HTMLElement => view(NOVEL_SIDE_LIST_ID)
     const sideRows = (): HTMLElement[] =>
-      Array.from(document.querySelectorAll<HTMLElement>(`#${NOVEL_SIDE_LIST_ID} .cs-novel-side-row`))
+      Array.from(
+        document.querySelectorAll<HTMLElement>(`#${NOVEL_SIDE_LIST_ID} .cs-novel-side-row`)
+      )
     /** 第几行。列表里没有那么多行时直接炸出来 —— 断言里少了一行不该静默地变成 undefined。 */
     const sideRow = (index: number): HTMLElement => {
       const row = sideRows()[index]
@@ -2691,10 +2864,12 @@ describe('getComfyStudioChatContentScript', () => {
     })
 
     /** 把 novels/read 接成"照参数回一段"：正文那种整页读法也走它。 */
-    const readsOnDemand = (text?: string): RequestStub => (_method: string, params: unknown) => {
-      const asked = (params ?? {}) as { offset?: number; chars?: number }
-      return sliceAt(asked.offset ?? 0, asked.chars ?? 0, text)
-    }
+    const readsOnDemand =
+      (text?: string): RequestStub =>
+      (_method: string, params: unknown) => {
+        const asked = (params ?? {}) as { offset?: number; chars?: number }
+        return sliceAt(asked.offset ?? 0, asked.chars ?? 0, text)
+      }
 
     /** 宿主 novels/read 的一页：把 offset 写进正文，好在断言里认出跳到了哪儿。 */
     const readAt = (offset: number): unknown => ({
@@ -2822,7 +2997,9 @@ describe('getComfyStudioChatContentScript', () => {
       expect(button(NOVEL_PAGER_ID, '上一页')?.disabled, '第一页没有上一页').toBe(true)
       expect(view(NOVEL_PAGER_ID).textContent).toContain('第 0–4000 字 / 共 9000 字')
       expect(hintLine().textContent, 'UTF-8 是默认档，不用挂在脸上').not.toContain('utf-8')
-      expect(novelLine('长夜.txt')?.getAttribute('data-open'), '在读的那一行要看得出来').toBe('true')
+      expect(novelLine('长夜.txt')?.getAttribute('data-open'), '在读的那一行要看得出来').toBe(
+        'true'
+      )
 
       button(NOVEL_PAGER_ID, '下一页')?.click()
       await flush()
@@ -2906,7 +3083,8 @@ describe('getComfyStudioChatContentScript', () => {
                     reason: 'exists',
                     name: '长夜.txt',
                     bytes: 2048,
-                    message: '原文目录里已经有 长夜.txt 了（2048 字节）：要换成你这份就带 overwrite 再来一次'
+                    message:
+                      '原文目录里已经有 长夜.txt 了（2048 字节）：要换成你这份就带 overwrite 再来一次'
                   }
                 }
         })
@@ -2935,6 +3113,49 @@ describe('getComfyStudioChatContentScript', () => {
       pathInput().value = 'D:/books/另一本.txt'
       pathInput().dispatchEvent(new Event('input'))
       expect(button(NOVEL_FORM_ID, '覆盖导入')?.style.display).toBe('none')
+    })
+
+    it('closes the import popup by the backdrop, Esc and 取消, and on a successful import', async () => {
+      installBridge({
+        request: host({
+          'novels/list': listing([]),
+          'novels/import': {
+            ok: true,
+            result: { imported: true, name: '长夜.txt', bytes: 2048, created_dir: false }
+          }
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openNovels()
+
+      const popup = (): HTMLElement => view(NOVEL_FORM_ID)
+      expect(popup().dataset.open, '平时是收着的（它就压在页面上面，不该常驻）').toBe('0')
+
+      button(NOVEL_VIEW_ID, '导入…')?.click()
+      expect(popup().dataset.open).toBe('1')
+
+      // 暗底就是弹窗那一层自己：点它（事件落在它身上）＝退出，不该只能去够那颗「取消」。
+      popup().dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      expect(popup().dataset.open).toBe('0')
+
+      button(NOVEL_VIEW_ID, '导入…')?.click()
+      // Esc 从光标所在的那一格冒上来（打开时光标就在路径上，见 toggleNovelForm）。
+      pathInput().dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+      expect(popup().dataset.open).toBe('0')
+
+      button(NOVEL_VIEW_ID, '导入…')?.click()
+      button(NOVEL_FORM_ID, '取消')?.click()
+      expect(popup().dataset.open, '取消只管关，不接进来').toBe('0')
+
+      // 接进来了就把弹窗收掉：结果在页顶那条与列表里，卡片继续举着只会挡住刚更新出来的那一列。
+      button(NOVEL_VIEW_ID, '导入…')?.click()
+      pathInput().value = 'D:/books/长夜.txt'
+      button(NOVEL_FORM_ID, '导入')?.click()
+      await flush()
+      expect(popup().dataset.open).toBe('0')
+      expect(hintLine().textContent).toContain('接进来了 长夜.txt')
     })
 
     it('replaces it once the user says so, and says which one changed', async () => {
@@ -2992,10 +3213,9 @@ describe('getComfyStudioChatContentScript', () => {
       )
       expect(pathInput().value, '导完就清空，免得手一抖再点一次').toBe('')
       expect(novelCalls(bridge, 'novels/list'), '导进来一本，列表要重新列一遍').toHaveLength(2)
-      expect(
-        view(NOVEL_READER_ID).textContent,
-        '正文被换掉了，旧的字不能还挂在屏幕上'
-      ).toBe('选中上面一篇，正文显示在这里。')
+      expect(view(NOVEL_READER_ID).textContent, '正文被换掉了，旧的字不能还挂在屏幕上').toBe(
+        '选中上面一篇，正文显示在这里。'
+      )
       expect(novelLine('长夜.txt')?.getAttribute('data-open')).toBeNull()
     })
 
@@ -3022,9 +3242,10 @@ describe('getComfyStudioChatContentScript', () => {
 
       expect(bridge.request).toHaveBeenCalledWith('novels/delete', { name: '长夜.txt' })
       expect(hintLine().textContent).toContain('删掉了 长夜.txt')
-      expect(novelCalls(bridge, 'novels/list'), '删完要重新列，别让人对着已经不存在的名字点').toHaveLength(
-        2
-      )
+      expect(
+        novelCalls(bridge, 'novels/list'),
+        '删完要重新列，别让人对着已经不存在的名字点'
+      ).toHaveLength(2)
     })
 
     it('hands a novel to the conversation without sending it for the user', async () => {
@@ -3130,7 +3351,9 @@ describe('getComfyStudioChatContentScript', () => {
       })
       expect(sideRows()).toHaveLength(1)
       expect(sideRow(0).textContent, '片段是宿主给的，面板不自己裁正文').toBe('…他想起那一夜…')
-      expect(view(NOVEL_SIDE_ID).querySelector('.cs-novel-side-title')?.textContent).toContain('1 处')
+      expect(view(NOVEL_SIDE_ID).querySelector('.cs-novel-side-title')?.textContent).toContain(
+        '1 处'
+      )
       expect(
         document.getElementById(NOVEL_TOC_BACK_ID)?.style.display,
         '搜索结果这一屏才有「返回目录」'
@@ -3321,11 +3544,16 @@ describe('getComfyStudioChatContentScript', () => {
 
       // 要多少字由面板说，回多少字由宿主说：面板一个数都不自己算（位置、字数都认宿主的）。
       const asked = novelCalls(bridge, 'novels/read')
-      expect(asked[asked.length - 1]).toEqual(['novels/read', { name: '长夜.txt', offset: 0, chars: 800 }])
+      expect(asked[asked.length - 1]).toEqual([
+        'novels/read',
+        { name: '长夜.txt', offset: 0, chars: 800 }
+      ])
       expect(view(CHAT_VIEW_ID).style.display, '卡片在对话页那一边，切过去才看得见').toBe('flex')
       expect(view(NOVEL_VIEW_ID).style.display).toBe('none')
       const card = view(QUOTE_BAR_ID).querySelector('.cs-quote')
-      expect(card?.querySelector('.cs-quote-title')?.textContent).toBe('引用 长夜.txt · 第 0 字起 800 字')
+      expect(card?.querySelector('.cs-quote-title')?.textContent).toBe(
+        '引用 长夜.txt · 第 0 字起 800 字'
+      )
       expect(card?.querySelector('.cs-quote-drop'), '还没发出去，能去掉').not.toBeNull()
       expect(document.getElementById(STATUS_ID)?.textContent).toContain('可以去掉')
 
@@ -3373,9 +3601,14 @@ describe('getComfyStudioChatContentScript', () => {
 
       // 页起点 0 + 节点内偏移 4，一共 5 个字 —— 这就是"选中的那段在原文里的位置"。
       const asked = novelCalls(bridge, 'novels/read')
-      expect(asked[asked.length - 1]).toEqual(['novels/read', { name: '长夜.txt', offset: 4, chars: 5 }])
+      expect(asked[asked.length - 1]).toEqual([
+        'novels/read',
+        { name: '长夜.txt', offset: 4, chars: 5 }
+      ])
       const card = view(QUOTE_BAR_ID).querySelector('.cs-quote')
-      expect(card?.querySelector('.cs-quote-title')?.textContent).toBe('引用 长夜.txt · 第 4 字起 5 字')
+      expect(card?.querySelector('.cs-quote-title')?.textContent).toBe(
+        '引用 长夜.txt · 第 4 字起 5 字'
+      )
       expect(document.getElementById(STATUS_ID)?.textContent).toContain('引用了选中的 5 字')
     })
 
@@ -3657,7 +3890,9 @@ describe('getComfyStudioChatContentScript', () => {
 
         // 字数与那条占比用的是同一对数（chapter.chars / meta.total_chars）：面板不另外量正文。
         expect(sideRow(0).querySelector('.cs-novel-side-meta')?.textContent).toBe('5000 字 · 56%')
-        expect(sideRow(0).querySelector<HTMLElement>('.cs-novel-side-bar-fill')?.style.width).toBe('55.56%')
+        expect(sideRow(0).querySelector<HTMLElement>('.cs-novel-side-bar-fill')?.style.width).toBe(
+          '55.56%'
+        )
         expect(sideRow(1).querySelector('.cs-novel-side-meta')?.textContent).toBe('4000 字 · 44%')
 
         sideRow(1).click()
@@ -3684,12 +3919,13 @@ describe('getComfyStudioChatContentScript', () => {
           (document.getElementById(PROJECT_FORM_NAME_ID) as HTMLInputElement).value,
           '剧名就是目录名，别带着 .txt'
         ).toBe('长夜')
-        expect((document.getElementById(PROJECT_FORM_NOVEL_ID) as HTMLSelectElement).value).toBe('长夜.txt')
+        expect((document.getElementById(PROJECT_FORM_NOVEL_ID) as HTMLSelectElement).value).toBe(
+          '长夜.txt'
+        )
         expect(view(PROJECT_HINT_ID).textContent).toContain('拿「长夜.txt」当原著')
         expect(novelCalls(bridge, 'projects/create'), '建不建、建几集是人自己定').toHaveLength(0)
       })
     })
-
   })
 
   describe('一键跑 skill', () => {
@@ -3747,12 +3983,14 @@ describe('getComfyStudioChatContentScript', () => {
     })
 
     /** 只有 skills/* 那两件事走自己的桩；开抽屉要问的那些保持默认。 */
-    const host = (handlers: Record<string, unknown>): RequestStub => (method, params) =>
-      method in handlers
-        ? typeof handlers[method] === 'function'
-          ? (handlers[method] as RequestStub)(method, params)
-          : handlers[method]
-        : { ok: true, result: { text: '答案在此' } }
+    const host =
+      (handlers: Record<string, unknown>): RequestStub =>
+      (method, params) =>
+        method in handlers
+          ? typeof handlers[method] === 'function'
+            ? (handlers[method] as RequestStub)(method, params)
+            : handlers[method]
+          : { ok: true, result: { text: '答案在此' } }
 
     const skillSelect = (): HTMLSelectElement =>
       document.getElementById(SKILL_ID) as HTMLSelectElement
@@ -3809,7 +4047,13 @@ describe('getComfyStudioChatContentScript', () => {
           'skills/list': catalog([
             skillRow({
               params: [
-                { name: 'ckpt_name', type: 'string', required: true, default: null, hasDefault: false },
+                {
+                  name: 'ckpt_name',
+                  type: 'string',
+                  required: true,
+                  default: null,
+                  hasDefault: false
+                },
                 {
                   name: 'prompt',
                   type: 'string',
@@ -4081,12 +4325,14 @@ describe('getComfyStudioChatContentScript', () => {
     })
 
     /** 只有 projects/* 那几件事走自己的桩；开抽屉时要问的那些保持默认。 */
-    const host = (handlers: Record<string, unknown>): RequestStub => (method, params) =>
-      method in handlers
-        ? typeof handlers[method] === 'function'
-          ? (handlers[method] as RequestStub)(method, params)
-          : handlers[method]
-        : { ok: true, result: { text: '答案在此' } }
+    const host =
+      (handlers: Record<string, unknown>): RequestStub =>
+      (method, params) =>
+        method in handlers
+          ? typeof handlers[method] === 'function'
+            ? (handlers[method] as RequestStub)(method, params)
+            : handlers[method]
+          : { ok: true, result: { text: '答案在此' } }
 
     const view = (id: string): HTMLElement => document.getElementById(id) as HTMLElement
     const hintLine = (): HTMLElement => view(PROJECT_HINT_ID)
@@ -4102,15 +4348,18 @@ describe('getComfyStudioChatContentScript', () => {
       document.querySelector<HTMLElement>(`#${PROJECT_LIST_ID} .cs-proj-row[data-name="${name}"]`)
     /** 一格：格头是「勾/空 标题 计数」三个 span，按第二个（就是标题本身）认。 */
     const shelf = (title: string): HTMLElement | null =>
-      Array.from(document.querySelectorAll<HTMLElement>(`#${PROJECT_SHELVES_ID} .cs-proj-shelf`)).find(
-        (box) => box.querySelectorAll('.cs-proj-shelf-head span')[1]?.textContent === title
-      ) ?? null
-    const fileLine = (rel: string): HTMLButtonElement | null =>
-      document.querySelector<HTMLButtonElement>(`#${PROJECT_SHELVES_ID} .cs-proj-file[data-rel="${rel}"]`)
-    const pagerButton = (text: string): HTMLButtonElement | null =>
       Array.from(
-        document.querySelectorAll<HTMLButtonElement>(`#${PROJECT_PAGER_ID} button`)
-      ).find((b) => b.textContent === text) ?? null
+        document.querySelectorAll<HTMLElement>(`#${PROJECT_SHELVES_ID} .cs-proj-shelf`)
+      ).find((box) => box.querySelectorAll('.cs-proj-shelf-head span')[1]?.textContent === title) ??
+      null
+    const fileLine = (rel: string): HTMLButtonElement | null =>
+      document.querySelector<HTMLButtonElement>(
+        `#${PROJECT_SHELVES_ID} .cs-proj-file[data-rel="${rel}"]`
+      )
+    const pagerButton = (text: string): HTMLButtonElement | null =>
+      Array.from(document.querySelectorAll<HTMLButtonElement>(`#${PROJECT_PAGER_ID} button`)).find(
+        (b) => b.textContent === text
+      ) ?? null
     const nameInput = (): HTMLInputElement =>
       document.getElementById(PROJECT_FORM_NAME_ID) as HTMLInputElement
     const episodesInput = (): HTMLInputElement =>
@@ -4169,7 +4418,10 @@ describe('getComfyStudioChatContentScript', () => {
 
       expect(view(CHAT_VIEW_ID).style.display).toBe('flex')
       expect(view(PROJECT_VIEW_ID).style.display).toBe('none')
-      expect(projectCalls(bridge, 'projects/list'), '没打开这一页就别去翻人家的项目根').toHaveLength(0)
+      expect(
+        projectCalls(bridge, 'projects/list'),
+        '没打开这一页就别去翻人家的项目根'
+      ).toHaveLength(0)
 
       await openProjects()
 
@@ -4197,7 +4449,10 @@ describe('getComfyStudioChatContentScript', () => {
     it('lists the projects, then opens one into one shelf per drop point', async () => {
       const bridge = installBridge({
         request: host({
-          'projects/list': listing([projectRow(), projectRow({ name: '乙剧', stages_done: 0, stages_total: 2 })]),
+          'projects/list': listing([
+            projectRow(),
+            projectRow({ name: '乙剧', stages_done: 0, stages_total: 2 })
+          ]),
           'projects/tree': projectTree()
         })
       })
@@ -4318,7 +4573,10 @@ describe('getComfyStudioChatContentScript', () => {
           'projects/list': listing([projectRow(), projectRow({ name: '乙剧' })]),
           'projects/tree': (_method: string, params: unknown) => {
             const name = (params as { name: string }).name
-            if (name === '长夜') return new Promise((resolve) => { late = resolve })
+            if (name === '长夜')
+              return new Promise((resolve) => {
+                late = resolve
+              })
             // 乙剧没登记原著：这里留空，好让"长夜"这个名字只可能来自那一趟迟到的回话。
             return projectTree({ name: '乙剧', path: projectPath('乙剧'), novel: '' })
           }
@@ -4344,16 +4602,22 @@ describe('getComfyStudioChatContentScript', () => {
 
     it('draws how many stages already have output on each project line', async () => {
       installBridge({
-        request: host({ 'projects/list': listing([projectRow({ stages_done: 2, stages_total: 4 })]) })
+        request: host({
+          'projects/list': listing([projectRow({ stages_done: 2, stages_total: 4 })])
+        })
       })
       setupDom()
       new Function(script)()
       await openPanel()
       await openProjects()
 
-      expect(projectLine('长夜')?.querySelector<HTMLElement>('.cs-proj-meter-fill')?.style.width).toBe('50.00%')
+      expect(
+        projectLine('长夜')?.querySelector<HTMLElement>('.cs-proj-meter-fill')?.style.width
+      ).toBe('50.00%')
       // 条上写的是宿主的两个数（projects/tree 的 summary），不是面板自己算的"完成度"。
-      expect(projectLine('长夜')?.querySelector('.cs-proj-meter')?.getAttribute('title')).toBe('2/4 段有产物')
+      expect(projectLine('长夜')?.querySelector('.cs-proj-meter')?.getAttribute('title')).toBe(
+        '2/4 段有产物'
+      )
     })
 
     it('says how far this project is and which step is next', async () => {
@@ -4367,9 +4631,10 @@ describe('getComfyStudioChatContentScript', () => {
       await openLine('长夜')
 
       const head = view(PROJECT_HEAD_ID)
-      expect(head.querySelector<HTMLElement>('.cs-proj-meter-fill')?.style.width, '剧本有产物、分镜没有').toBe(
-        '50.00%'
-      )
+      expect(
+        head.querySelector<HTMLElement>('.cs-proj-meter-fill')?.style.width,
+        '剧本有产物、分镜没有'
+      ).toBe('50.00%')
       expect(head.querySelector('.cs-proj-meter')?.getAttribute('title')).toBe('1/2 段有产物')
       // 下一步是哪一步照宿主给的阶段顺序念（stages[].label），面板不自己排工序。
       expect(head.textContent).toContain('下一步：分镜')
@@ -4382,7 +4647,15 @@ describe('getComfyStudioChatContentScript', () => {
           'projects/tree': projectTree(),
           'novels/chapters': {
             ok: true,
-            result: { name: '长夜.txt', count: 0, returned: 0, total_chars: 9000, limit: 5000, message: '', chapters: [] }
+            result: {
+              name: '长夜.txt',
+              count: 0,
+              returned: 0,
+              total_chars: 9000,
+              limit: 5000,
+              message: '',
+              chapters: []
+            }
           },
           'novels/read': (_method: string, params: unknown) => ({
             ok: true,
@@ -4425,7 +4698,15 @@ describe('getComfyStudioChatContentScript', () => {
           'novels/list': { ok: true, result: { novels: [] } },
           'novels/chapters': {
             ok: true,
-            result: { name: '长夜.txt', count: 0, returned: 0, total_chars: 9000, limit: 5000, message: '', chapters: [] }
+            result: {
+              name: '长夜.txt',
+              count: 0,
+              returned: 0,
+              total_chars: 9000,
+              limit: 5000,
+              message: '',
+              chapters: []
+            }
           },
           'novels/read': { ok: false, error: { message: '书库里没有长夜.txt' } },
           'projects/list': listing([projectRow()]),
@@ -4461,7 +4742,10 @@ describe('getComfyStudioChatContentScript', () => {
 
     it('refuses a nameless project and a nonsense episode count without asking the host', async () => {
       const bridge = installBridge({
-        request: host({ 'projects/list': listing([]), 'novels/list': { ok: true, result: { novels: [] } } })
+        request: host({
+          'projects/list': listing([]),
+          'novels/list': { ok: true, result: { novels: [] } }
+        })
       })
       setupDom()
       new Function(script)()
@@ -4482,7 +4766,45 @@ describe('getComfyStudioChatContentScript', () => {
       await flush()
       expect(hintLine().textContent).toContain('集数要是 1 以上的整数')
 
-      expect(projectCalls(bridge, 'projects/create'), '本地就问得出的错，别拿去打扰宿主').toHaveLength(0)
+      expect(
+        projectCalls(bridge, 'projects/create'),
+        '本地就问得出的错，别拿去打扰宿主'
+      ).toHaveLength(0)
+    })
+
+    it('closes the new-project popup by the backdrop, Esc and 取消', async () => {
+      installBridge({
+        request: host({
+          'projects/list': listing([]),
+          'novels/list': { ok: true, result: { novels: [] } }
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+
+      const popup = (): HTMLElement => view(PROJECT_FORM_ID)
+      expect(popup().dataset.open, '平时是收着的（它就压在页面上面，不该常驻）').toBe('0')
+
+      button('新建项目…')?.click()
+      await flush()
+      expect(popup().dataset.open).toBe('1')
+
+      // 暗底就是弹窗那一层自己：点它（事件落在它身上）＝退出，不该只能去够那颗「取消」。
+      popup().dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      expect(popup().dataset.open).toBe('0')
+
+      button('新建项目…')?.click()
+      await flush()
+      // Esc 从卡片里冒上来：打开时光标就在剧名那一格（见 toggleProjectForm）。
+      nameInput().dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+      expect(popup().dataset.open).toBe('0')
+
+      button('新建项目…')?.click()
+      await flush()
+      button('取消')?.click()
+      expect(popup().dataset.open, '取消只管关，不建目录').toBe('0')
     })
 
     it('creates a project with the linked novel and opens it right away', async () => {
@@ -4504,7 +4826,15 @@ describe('getComfyStudioChatContentScript', () => {
               files: ['01_剧本/总纲.md'],
               skipped: [],
               pending: [],
-              novel: { name: '长夜', novel: '长夜.txt', file: '', linked: true, already: false, current: '', reason: 'filled' }
+              novel: {
+                name: '长夜',
+                novel: '长夜.txt',
+                file: '',
+                linked: true,
+                already: false,
+                current: '',
+                reason: 'filled'
+              }
             }
           },
           'projects/tree': projectTree()
@@ -4593,7 +4923,11 @@ describe('getComfyStudioChatContentScript', () => {
           'projects/tree': projectTree(),
           'projects/brief': {
             ok: true,
-            result: { name: '长夜', path: projectPath('长夜'), text: '【项目】长夜\n阶段：✅ 剧本  ☐ 分镜' }
+            result: {
+              name: '长夜',
+              path: projectPath('长夜'),
+              text: '【项目】长夜\n阶段：✅ 剧本  ☐ 分镜'
+            }
           }
         })
       })
@@ -4608,7 +4942,9 @@ describe('getComfyStudioChatContentScript', () => {
 
       expect(bridge.request).toHaveBeenCalledWith('projects/brief', { name: '长夜' })
       expect(view(CHAT_VIEW_ID).style.display, '拿去对话就切回对话').toBe('flex')
-      expect((document.getElementById(INPUT_ID) as HTMLTextAreaElement).value).toContain('【项目】长夜')
+      expect((document.getElementById(INPUT_ID) as HTMLTextAreaElement).value).toContain(
+        '【项目】长夜'
+      )
       // 拿哪一部开工、怎么开工是用户的事：面板只把材料放进框里，不替他按发送。
       expect(projectCalls(bridge, 'agent/chat')).toHaveLength(0)
       expect(document.getElementById(STATUS_ID)?.textContent).toContain('长夜')
@@ -4627,8 +4963,13 @@ describe('getComfyStudioChatContentScript', () => {
       await openProjects()
       await openLine('长夜')
 
-      expect(document.getElementById(PROJECT_HEAD_ID)?.textContent).toContain('找不到项目规范的事实源')
-      expect(document.querySelectorAll(`#${PROJECT_SHELVES_ID} .cs-proj-shelf`), '读不出来就别摆格子').toHaveLength(0)
+      expect(document.getElementById(PROJECT_HEAD_ID)?.textContent).toContain(
+        '找不到项目规范的事实源'
+      )
+      expect(
+        document.querySelectorAll(`#${PROJECT_SHELVES_ID} .cs-proj-shelf`),
+        '读不出来就别摆格子'
+      ).toHaveLength(0)
       expect(hintLine().getAttribute('data-tone')).toBe('error')
     })
 
@@ -4638,7 +4979,10 @@ describe('getComfyStudioChatContentScript', () => {
       new Function(script)()
       await openPanel()
       await openProjects()
-      expect(document.querySelectorAll(`#${PROJECT_LIST_ID} .cs-proj-row`), '不带筛词时两部都在').toHaveLength(2)
+      expect(
+        document.querySelectorAll(`#${PROJECT_LIST_ID} .cs-proj-row`),
+        '不带筛词时两部都在'
+      ).toHaveLength(2)
 
       await typeProjectFind('乙')
 
@@ -4684,7 +5028,9 @@ describe('getComfyStudioChatContentScript', () => {
 
       await typeProjectFind('丙')
 
-      expect(document.getElementById(PROJECT_LIST_ID)?.textContent).toContain('没有名字含「丙」的项目')
+      expect(document.getElementById(PROJECT_LIST_ID)?.textContent).toContain(
+        '没有名字含「丙」的项目'
+      )
       expect(document.getElementById(PROJECT_FIND_COUNT_ID)?.textContent).toBe('匹配 0 部')
       // 筛不着 ≠ 目录里还没东西：这两句话不能混着说。
       expect(document.getElementById(PROJECT_LIST_ID)?.textContent).not.toContain('还没建过项目')
@@ -4721,7 +5067,9 @@ describe('getComfyStudioChatContentScript', () => {
       await typeProjectFind('乙')
       expect(document.getElementById(PROJECT_FIND_COUNT_ID)?.textContent).toBe('匹配 1 部')
 
-      projectFindBox().dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', cancelable: true }))
+      projectFindBox().dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Escape', cancelable: true })
+      )
       await flush()
 
       expect(lastListParams(bridge)).toEqual({})
@@ -4807,7 +5155,12 @@ describe('getComfyStudioChatContentScript', () => {
     it('says the overview only counted the ones it was shown', async () => {
       installBridge({
         request: host({
-          'projects/list': listing([projectRow()], { matched: 8, returned: 1, truncated: true, limit: 1 })
+          'projects/list': listing([projectRow()], {
+            matched: 8,
+            returned: 1,
+            truncated: true,
+            limit: 1
+          })
         })
       })
       setupDom()
@@ -4835,7 +5188,11 @@ describe('getComfyStudioChatContentScript', () => {
         request: host({
           'projects/list': listing([projectRow()]),
           'projects/tree': projectTree(),
-          'projects/read': page(0, { text: '长夜漫漫，长夜里的灯。', total_chars: 11, truncated: false })
+          'projects/read': page(0, {
+            text: '长夜漫漫，长夜里的灯。',
+            total_chars: 11,
+            truncated: false
+          })
         })
       })
       setupDom()
@@ -4887,7 +5244,11 @@ describe('getComfyStudioChatContentScript', () => {
         request: host({
           'projects/list': listing([projectRow()]),
           'projects/tree': projectTree(),
-          'projects/read': page(0, { text: 'Draft one, draft two.', total_chars: 20, truncated: false })
+          'projects/read': page(0, {
+            text: 'Draft one, draft two.',
+            total_chars: 20,
+            truncated: false
+          })
         })
       })
       setupDom()
@@ -4913,7 +5274,11 @@ describe('getComfyStudioChatContentScript', () => {
         request: host({
           'projects/list': listing([projectRow()]),
           'projects/tree': projectTree(),
-          'projects/read': page(0, { text: '长夜漫漫，长夜里的灯。', total_chars: 11, truncated: false })
+          'projects/read': page(0, {
+            text: '长夜漫漫，长夜里的灯。',
+            total_chars: 11,
+            truncated: false
+          })
         })
       })
       setupDom()
@@ -4939,7 +5304,11 @@ describe('getComfyStudioChatContentScript', () => {
         request: host({
           'projects/list': listing([projectRow()]),
           'projects/tree': projectTree(),
-          'projects/read': page(0, { text: '长夜漫漫，长夜里的灯。', total_chars: 11, truncated: false })
+          'projects/read': page(0, {
+            text: '长夜漫漫，长夜里的灯。',
+            total_chars: 11,
+            truncated: false
+          })
         })
       })
       setupDom()
@@ -5010,7 +5379,11 @@ describe('getComfyStudioChatContentScript', () => {
           'projects/list': listing([projectRow(), projectRow({ name: '乙剧' })]),
           'projects/tree': (_method: string, params: unknown) =>
             projectTree({ name: (params as { name: string }).name }),
-          'projects/read': page(0, { text: '长夜漫漫，长夜里的灯。', total_chars: 11, truncated: false })
+          'projects/read': page(0, {
+            text: '长夜漫漫，长夜里的灯。',
+            total_chars: 11,
+            truncated: false
+          })
         })
       })
       setupDom()
@@ -5039,7 +5412,9 @@ describe('getComfyStudioChatContentScript', () => {
   describe('键盘', () => {
     const view = (id: string): HTMLElement => document.getElementById(id) as HTMLElement
     const tabOf = (name: string): HTMLButtonElement =>
-      document.querySelector<HTMLButtonElement>(`#${TABS_ID} .cs-tab[data-view="${name}"]`) as HTMLButtonElement
+      document.querySelector<HTMLButtonElement>(
+        `#${TABS_ID} .cs-tab[data-view="${name}"]`
+      ) as HTMLButtonElement
     /** 往 document 上按一个键（面板的快捷键就挂在 document 上），返回那个事件好查有没有被拦下。 */
     const press = (init: KeyboardEventInit): KeyboardEvent => {
       const event = new KeyboardEvent('keydown', { ...init, bubbles: true, cancelable: true })
@@ -5047,7 +5422,9 @@ describe('getComfyStudioChatContentScript', () => {
       return event
     }
     const stub: RequestStub = (method) =>
-      method === 'novels/list' ? { ok: true, result: { novels: [] } } : { ok: true, result: { text: '答案在此' } }
+      method === 'novels/list'
+        ? { ok: true, result: { novels: [] } }
+        : { ok: true, result: { text: '答案在此' } }
 
     it('focuses this page search box on Ctrl/Cmd+F', async () => {
       installBridge({ request: stub })
@@ -5056,12 +5433,16 @@ describe('getComfyStudioChatContentScript', () => {
       await openPanel()
 
       press({ key: 'f', ctrlKey: true })
-      expect(document.activeElement, '对话页就是消息区上头那个检索框').toBe(document.getElementById(FIND_ID))
+      expect(document.activeElement, '对话页就是消息区上头那个检索框').toBe(
+        document.getElementById(FIND_ID)
+      )
 
       tabOf('project').click()
       await flush()
       press({ key: 'f', metaKey: true }) // mac 上是 Cmd+F
-      expect(document.activeElement, '项目页是筛项目那个框').toBe(document.getElementById(PROJECT_FIND_ID))
+      expect(document.activeElement, '项目页是筛项目那个框').toBe(
+        document.getElementById(PROJECT_FIND_ID)
+      )
     })
 
     it('leaves the browser find alone while the drawer is shut', async () => {
@@ -5100,7 +5481,9 @@ describe('getComfyStudioChatContentScript', () => {
 
       const chatTab = tabOf('chat')
       chatTab.focus()
-      chatTab.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true }))
+      chatTab.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true })
+      )
       await flush()
 
       const novelTab = tabOf('novel')
@@ -5111,7 +5494,9 @@ describe('getComfyStudioChatContentScript', () => {
       expect(chatTab.tabIndex, '只有当前这一页能被 Tab 到').toBe(-1)
       expect(novelTab.tabIndex).toBe(0)
 
-      novelTab.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true, cancelable: true }))
+      novelTab.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'End', bubbles: true, cancelable: true })
+      )
       await flush()
       expect(view(PROJECT_VIEW_ID).style.display).toBe('flex')
       expect(document.activeElement).toBe(tabOf('project'))
