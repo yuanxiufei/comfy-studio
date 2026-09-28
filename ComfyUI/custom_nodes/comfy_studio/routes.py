@@ -25,6 +25,7 @@ from .engine import EngineError, get_engine
 from .mcp.server import skills_dir
 from .mcp.tools import build_tools, skill_entry, web_config, web_enabled
 from .skills import Skill, SkillRegistry, user_skills_dir
+from .skills.render import RenderError, prepare_render, render_listing, workflows_dir
 from .web import SEARCH_BACKEND_BING, WEB_PROMPT_RULES, WebFetcher
 
 PREFIX = "/comfy-studio"
@@ -227,6 +228,44 @@ def register_routes() -> None:
         except EngineError as err:
             return _error(500, str(err))
         return web.json_response(result.to_json(engine.base_url))
+
+    @router.get(f"{PREFIX}/renders")
+    async def list_renders(_request: web.Request) -> web.Response:
+        """这台机器上配好的渲染目标（与 MCP 的 comfy_list_renders 同一份装配，只换传输）。"""
+        return web.json_response(render_listing(workflows_dir()))
+
+    @router.post(f"{PREFIX}/renders/{{target_id}}/run")
+    async def run_render(request: web.Request) -> web.Response:
+        """跑一个渲染目标：与 MCP 的 comfy_render 同一套组装（含参考图与外部组）。"""
+        target_id = request.match_info["target_id"]
+        try:
+            body = await _read_json(request)
+            params = body.get("params") or {}
+            if not isinstance(params, dict):
+                raise ValueError("params 必须是对象")
+            images = body.get("images") or ()
+            if isinstance(images, str) or not isinstance(images, (list, tuple)):
+                raise ValueError('images 必须是数组（哪怕只有一项也要写成 ["…"]）')
+            duration_sec = body.get("duration_sec")
+            if duration_sec is not None and (
+                isinstance(duration_sec, bool) or not isinstance(duration_sec, (int, float))
+            ):
+                raise ValueError("duration_sec 必须是数字")
+            # 形状在这里挡；正数/上限那些规则住在 skills.render 里（组装期唯一说了算的地方）。
+            plan = await prepare_render(engine, target_id, images=images, duration_sec=duration_sec)
+        except (ValueError, RenderError) as err:
+            return _bad_request(err)
+        except EngineError as err:
+            return _error(500, str(err))
+
+        try:
+            result = await engine.run_skill(plan.skill, params)
+        except EngineError as err:
+            return _error(500, str(err))
+        payload: dict[str, Any] = {**result.to_json(engine.base_url), "target": plan.target.id}
+        if plan.notes:  # 组装期的让步（时长折算、接了外部组）照实交给面板
+            payload["notes"] = list(plan.notes)
+        return web.json_response(payload)
 
     @router.get(f"{PREFIX}/agent/config")
     async def agent_config(_request: web.Request) -> web.Response:

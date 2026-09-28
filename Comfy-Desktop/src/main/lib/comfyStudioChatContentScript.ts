@@ -107,6 +107,15 @@ var MODEL_SOURCE_DEFAULT = 'default';
 var AGENT_ID = 'comfy-desktop-studio-chat-agent';
 var SKILL_ID = 'comfy-desktop-studio-chat-skill';
 var SKILL_RUN_ID = 'comfy-desktop-studio-chat-skill-run';
+// 渲染目标那一行（引擎侧那 12 张生产工作流，见宿主 lib/comfy_studio/renders/catalog.py）：
+// 下拉 + 参数区 + 跑一遍。参数区里摆的是**必填且没默认值的那些**，参考图输入框按需插在里面
+// （只有引擎报 referenceImages 的目标才摆，见 fillRenderArgs）。
+var RENDER_ID = 'comfy-desktop-studio-chat-render';
+var RENDER_RUN_ID = 'comfy-desktop-studio-chat-render-run';
+var RENDER_ARGS_ID = 'comfy-desktop-studio-chat-render-args';
+// 每个必填参数一个输入框，id 是前缀 + 参数名：取回来时按同一套名字找（见 renderArgValues）。
+var RENDER_ARG_PREFIX = 'comfy-desktop-studio-chat-render-arg-';
+var RENDER_IMAGES_ID = 'comfy-desktop-studio-chat-render-images';
 var SESSION_ID = 'comfy-desktop-studio-chat-session';
 var SESSION_NEW_ID = 'comfy-desktop-studio-chat-session-new';
 var SESSION_CLOSE_ID = 'comfy-desktop-studio-chat-session-close';
@@ -614,7 +623,10 @@ var CHAT_CSS =
   '#' + DRAWER_ID + ' .cs-skill-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;' +
   'white-space:nowrap;}' +
   '#' + DRAWER_ID + ' .cs-skill-state{color:' + MUTED + ';font-size:11px;white-space:nowrap;}' +
-  '#' + DRAWER_ID + ' [data-kind="skill"][data-state="error"] .cs-skill-state{color:#ff8080;}' +
+  '#' + DRAWER_ID + ' [data-kind="skill"][data-state="error"] .cs-skill-state,' +
+  // 渲染那张卡复用同一批 class（同一件事的两层，见「一键跑渲染目标」那一节），所以失败配色也得
+  // 一起管到它：不然渲染失败时那一行还是灰的，一眼看不出它没跑成。
+  '#' + DRAWER_ID + ' [data-kind="render"][data-state="error"] .cs-skill-state{color:#ff8080;}' +
   '#' + DRAWER_ID + ' .cs-skill-body{display:flex;flex-direction:column;gap:6px;margin-top:6px;}' +
   '#' + DRAWER_ID + ' .cs-skill-image{max-width:100%;border:1px solid ' + BORDER + ';' +
   'border-radius:4px;display:block;}' +
@@ -1175,6 +1187,11 @@ function buildDrawer() {
   skills.appendChild(skill);
   skills.appendChild(skillRun);
 
+  // 渲染那一行：与技能同一个形状（选一个、按一下），区别在**必填参数要当场填** ——
+  // 渲染目标的必填参数是内容本身（提示词 / 歌词 / 要放大的片子名），引擎没给默认值，面板也不
+  // 替它编（理由见下面「一键跑渲染目标」那一节）。下拉样式走与技能同一个来源，不各写一份。
+  var renders = buildRenderRow(model.style.cssText);
+
   var status = document.createElement('div');
   status.id = STATUS_ID;
   status.textContent = '正在查询宿主状态…';
@@ -1263,6 +1280,7 @@ function buildDrawer() {
   chatView.appendChild(agents);
   chatView.appendChild(sessions);
   chatView.appendChild(skills);
+  chatView.appendChild(renders);
   chatView.appendChild(status);
   chatView.appendChild(storage);
   // 找字那一行钉在消息区上面（它管的就是下面这一块）：平时不占地方 —— 它一直躺着，
@@ -2818,6 +2836,501 @@ function runSkill(id) {
   ).then(settle, settle);
 }
 
+// ---- 一键跑渲染目标 ------------------------------------------------------
+//
+// 渲染目标是引擎侧那 12 张**生产工作流**（角色定妆板、分镜首帧、视频试片、主题曲、放大…，
+// 见引擎 skills/render.py 的 RENDER_TARGETS）。它与 skill 是同一件事的两层：skill 是"参数化
+// 工作流"，渲染目标是"这台机器上配好的、带用途的那几张"。
+//
+// 与技能那一行有一处**必须不同**：技能的一键靠"每个必填参数都有默认值"，而渲染目标的必填参数
+// （prompt / caption / lyrics / file）就是**内容本身**，引擎没给默认值可编 —— 面板替它编一句
+// 提示词，跑出来不会报错，只会是另一张图，那种错没人查得出来。所以这一行让用户当场填必填参数：
+// 只有必填且没默认值的才建输入框，可选参数（宽高 / seed / steps / frame_rate）一律用图上原值。
+//
+// 参考图（引擎报 referenceImages=true 的那几只，即视频目标）要的是**本机文件路径**，不是工作流
+// 参数，所以单独一个输入框、多张用分号隔开；留空就是不用图（t2v）。
+
+function renderOf(id) {
+  var list = STATE.renders || [];
+  for (var i = 0; i < list.length; i++) {
+    if (String((list[i] || {}).id || '') === String(id)) return list[i];
+  }
+  return null;
+}
+
+function renderParam(entry, name) {
+  var params = (entry && entry.params) || [];
+  for (var i = 0; i < params.length; i++) {
+    if (String((params[i] || {}).name || '') === String(name)) return params[i];
+  }
+  return null;
+}
+
+// 必填又没默认值的参数名：面板为它们各建一个输入框。判据与技能那边同一套字段（引擎与宿主共用
+// 一份参数形状，见引擎 skills/params.py 的 param_entry），不另立一套。
+function renderRequired(entry) {
+  var params = (entry && entry.params) || [];
+  var names = [];
+  for (var i = 0; i < params.length; i++) {
+    var param = params[i] || {};
+    var name = String(param.name || '');
+    if (name === '' || param.required !== true || param.hasDefault === true) continue;
+    names.push(name);
+  }
+  return names;
+}
+
+// 下拉里那条 tooltip：这是干嘛的、工作流在不在、要填什么。文件名与参数表都是引擎给的（宿主原样
+// 转回来），这里只念不猜。
+function renderHint(entry) {
+  var parts = [];
+  if (entry.description) parts.push(String(entry.description));
+  var tags = entry.tags || [];
+  if (tags.length) parts.push('标签: ' + tags.join('、'));
+  // 文件缺了要说在最前面：列出来不等于跑得起来（引擎照实报 fileExists，见宿主 renders/catalog.py）。
+  parts.push(
+    entry.fileExists === false
+      ? '工作流文件没找到: ' + String(entry.file || '')
+      : '工作流: ' + String(entry.file || '')
+  );
+  var names = renderRequired(entry);
+  parts.push(names.length ? '要填: ' + names.join('、') : '必填参数都有默认值');
+  if (entry.referenceImages === true) parts.push('可以给参考图（本机图片路径，不给就是不用图）');
+  return parts.join('；');
+}
+
+function setRenderHint(text) {
+  var select = document.getElementById(RENDER_ID);
+  if (!select) return;
+  if (text) {
+    select.title = String(text);
+    return;
+  }
+  // 目录这一句是引擎如实报出来的（见宿主 renders/catalog.py 的 note 与 workflows_dir）：目标表是
+  // 代码里定死的，所以"目录整个不在"时下拉里照样有 12 条 —— 那就得让人看得见图该去哪儿找。
+  var parts = ['选一个渲染目标，填好必填参数再按「跑一遍」'];
+  if (STATE.rendersDir) parts.push('工作流目录: ' + STATE.rendersDir);
+  if (STATE.rendersNote) parts.push(String(STATE.rendersNote));
+  select.title = parts.join('；');
+}
+
+// 与技能那一份同一个口径：判"有目标"看 STATE.renders，不看 option 条数（空目录时下拉里那条是
+// 占位文案）；跑着的时候下拉灭掉、按钮留着按得动（按一下会听到"上一个还在跑"，见 runRender）。
+function refreshRenderEnabled() {
+  var select = document.getElementById(RENDER_ID);
+  var run = document.getElementById(RENDER_RUN_ID);
+  var ready = (STATE.renders || []).length > 0 && !!select;
+  var running = STATE.renderRunning !== '';
+  if (select) {
+    select.disabled = !ready || running;
+    select.style.opacity = !ready || running ? '0.5' : '1';
+  }
+  if (run) {
+    run.disabled = !ready;
+    run.style.opacity = ready ? '1' : '0.5';
+  }
+}
+
+// 渲染那一行：外壳自己一列（一行下拉 + 一块参数区），下拉样式与技能共用一份（由调用方传进来，
+// 不各写一份内联样式）。
+function buildRenderRow(selectCss) {
+  var outer = document.createElement('div');
+  outer.style.cssText = 'display:flex;flex-direction:column;padding:0 0 8px;';
+
+  var row = document.createElement('div');
+  row.style.cssText = 'display:flex;align-items:center;gap:6px;padding:0 12px;';
+
+  var label = document.createElement('label');
+  label.textContent = '渲染';
+  label.setAttribute('for', RENDER_ID);
+  label.style.cssText = 'color:' + MUTED + ';font-size:11px;white-space:nowrap;';
+
+  var select = document.createElement('select');
+  select.id = RENDER_ID;
+  select.disabled = true;
+  select.title = '正在读引擎的渲染目标…';
+  select.style.cssText = selectCss;
+  select.addEventListener('change', function () {
+    // 换目标要连着换参数表：必填的参数名每个目标都不一样（提示词 / 歌词 / 片子名），
+    // 留着上一条的输入框只会让人填错位置。
+    STATE.render = select.value;
+    fillRenderArgs(renderOf(select.value));
+  });
+
+  var run = document.createElement('button');
+  run.id = RENDER_RUN_ID;
+  run.type = 'button';
+  run.textContent = '跑一遍';
+  run.disabled = true;
+  run.title = '按上面填的参数跑这个渲染目标，产物画在这一页里';
+  run.style.cssText =
+    'border:1px solid ' + BORDER + ';border-radius:4px;background:transparent;color:' + MUTED + ';' +
+    'cursor:pointer;font-size:11px;padding:2px 6px;white-space:nowrap;';
+  run.addEventListener('click', function () {
+    runRender(select.value);
+  });
+
+  row.appendChild(label);
+  row.appendChild(select);
+  row.appendChild(run);
+
+  var args = document.createElement('div');
+  args.id = RENDER_ARGS_ID;
+  args.style.cssText = 'display:none;flex-direction:column;gap:6px;padding:6px 12px 0;';
+
+  outer.appendChild(row);
+  outer.appendChild(args);
+  return outer;
+}
+
+function renderInputCss() {
+  return (
+    'flex:1;min-width:0;box-sizing:border-box;padding:4px 6px;border-radius:4px;font-size:11px;' +
+    'border:1px solid ' + BORDER + ';background:' + INPUT_BG + ';color:' + FG + ';font:inherit;'
+  );
+}
+
+// 一个必填参数的输入框。类型一律 text：必填的这几个本来就是文本（提示词 / 歌词 / 要放大的片子名），
+// 而数字那些都在可选参数里、根本不摆出来。值原样发出去 ——"这串字算不算数"由引擎的组装期判，
+// 面板不在这里另立一套校验（见引擎 skills/render.py）。
+function renderArgRow(param, name) {
+  var row = document.createElement('div');
+  row.style.cssText = 'display:flex;align-items:center;gap:6px;';
+
+  var label = document.createElement('label');
+  label.textContent = name;
+  label.setAttribute('for', RENDER_ARG_PREFIX + name);
+  label.style.cssText = 'color:' + MUTED + ';font-size:11px;white-space:nowrap;min-width:60px;';
+
+  var input = document.createElement('input');
+  input.id = RENDER_ARG_PREFIX + name;
+  input.type = 'text';
+  input.placeholder = String((param && param.description) || '必填');
+  input.title = String((param && param.description) || '');
+  input.style.cssText = renderInputCss();
+
+  row.appendChild(label);
+  row.appendChild(input);
+  return row;
+}
+
+// 参考图那一行：视频目标要的首帧 / 尾帧或参考图。路径是**这台机器上的**文件，引擎会先搬进它自己的
+// input/（见引擎 skills/render.py 的 INPUT_IMAGE_SUBDIR），所以这里只收路径、不传内容。
+function renderImagesRow() {
+  var row = document.createElement('div');
+  row.style.cssText = 'display:flex;align-items:center;gap:6px;';
+
+  var label = document.createElement('label');
+  label.textContent = '参考图';
+  label.setAttribute('for', RENDER_IMAGES_ID);
+  label.style.cssText = 'color:' + MUTED + ';font-size:11px;white-space:nowrap;min-width:60px;';
+
+  var input = document.createElement('input');
+  input.id = RENDER_IMAGES_ID;
+  input.type = 'text';
+  input.placeholder = '本机图片路径，多张用 ; 隔开（首帧、尾帧 / 参考图1、参考图2…）；留空=不用图';
+  input.title = '这台机器上的图片文件，引擎按顺序搬进自己的 input/：图片1、图片2…';
+  input.style.cssText = renderInputCss();
+
+  row.appendChild(label);
+  row.appendChild(input);
+  return row;
+}
+
+// 参数区按选中的目标重建：**只建必填且没默认值的那些**。一个输入框都没有时整块收起来 ——
+// 留一片空白只会让人以为漏了东西。切目标会丢上一轮填的字，这是故意的：每个目标的必填项不同，
+// 留着上一份就是让人把"上一张图的提示词"填进这首歌里。
+function fillRenderArgs(entry) {
+  var box = document.getElementById(RENDER_ARGS_ID);
+  if (!box) return;
+  box.textContent = '';
+  var names = renderRequired(entry);
+  for (var i = 0; i < names.length; i++) {
+    box.appendChild(renderArgRow(renderParam(entry, names[i]), names[i]));
+  }
+  if (entry && entry.referenceImages === true) box.appendChild(renderImagesRow());
+  box.style.display = box.childNodes.length > 0 ? 'flex' : 'none';
+}
+
+// 面板要发出去的那份参数：**只发必填的那些**（其余用图上原值，等于没填）。空的必填项原地点名，
+// 不替它编、也不静默塞一个空串进去。
+function renderArgValues(entry) {
+  var names = renderRequired(entry);
+  var values = {};
+  var missing = [];
+  for (var i = 0; i < names.length; i++) {
+    var input = document.getElementById(RENDER_ARG_PREFIX + names[i]);
+    var value = input ? String(input.value || '').trim() : '';
+    if (value === '') missing.push(names[i]);
+    else values[names[i]] = value;
+  }
+  return { values: values, missing: missing };
+}
+
+// 参考图那一串：分号 / 换行分隔的本机路径。空项直接丢掉（敲了两个分号不等于两张图），全空就是
+// "不用参考图"。
+function renderImages() {
+  var input = document.getElementById(RENDER_IMAGES_ID);
+  if (!input) return [];
+  var raw = String(input.value || '').split(/[;\\n]/);
+  var out = [];
+  for (var i = 0; i < raw.length; i++) {
+    var path = raw[i].trim();
+    if (path !== '') out.push(path);
+  }
+  return out;
+}
+
+function fillRenders(payload) {
+  var select = document.getElementById(RENDER_ID);
+  if (!select) return;
+  var data = payload || {};
+  var list = data.targets || [];
+  var wanted = STATE.render;
+  select.textContent = '';
+  for (var i = 0; i < list.length; i++) {
+    var entry = list[i] || {};
+    var option = document.createElement('option');
+    option.value = String(entry.id || '');
+    // 缺文件的那几条在下拉里就标出来：点下去才发现跑不起来，比提前说一句坏得多。
+    option.textContent =
+      String(entry.title || entry.id || '') +
+      (entry.fileExists === false ? '（工作流文件没找到）' : '');
+    option.title = renderHint(entry);
+    select.appendChild(option);
+  }
+  if (select.options.length === 0) {
+    // 空着不解释，用户只会以为面板坏了：目标表在引擎侧（MCP），引擎没起来就是空的。
+    var none = document.createElement('option');
+    none.value = '';
+    none.textContent = '（引擎没报出渲染目标）';
+    none.disabled = true;
+    select.appendChild(none);
+  } else if (wanted && renderOf(wanted)) {
+    // 上一次选的那个还在清单里就接着选中（与技能那份同一个理由：别替用户改选择）。
+    select.value = String(wanted);
+  }
+  STATE.renders = list;
+  STATE.render = select.value || '';
+  STATE.rendersDir = String(data.workflows_dir || '');
+  STATE.rendersNote = data.note ? String(data.note) : '';
+  refreshRenderEnabled();
+  fillRenderArgs(renderOf(STATE.render));
+}
+
+function loadRenders() {
+  return Promise.resolve(bridge.request('renders/list')).then(
+    function (response) {
+      if (!response || response.ok !== true) {
+        var error = (response && response.error) || {};
+        fillRenders({ targets: [] });
+        setRenderHint('读渲染目标失败: ' + (error.message || '未知错误'));
+        return null;
+      }
+      fillRenders(response.result || {});
+      setRenderHint('');
+      return response.result;
+    },
+    function (err) {
+      fillRenders({ targets: [] });
+      setRenderHint('读渲染目标失败: ' + message(err));
+      return null;
+    }
+  );
+}
+
+// 跑渲染的那张卡：与技能卡同一个形状（同一批 class 与 CSS），这样"正在跑"和"跑完了"是同一张卡的
+// 前后两态，而不是两行。
+function renderCard(entry) {
+  var card = makeRow('render');
+  card.setAttribute('data-render', String(entry.id || ''));
+  card.setAttribute('data-state', 'running');
+  var head = document.createElement('div');
+  head.className = 'cs-skill-head';
+  var title = document.createElement('span');
+  title.className = 'cs-skill-title';
+  title.textContent = '渲染 ' + String(entry.title || entry.id || '') + '（' + String(entry.id || '') + '）';
+  head.appendChild(title);
+  var state = document.createElement('span');
+  state.className = 'cs-skill-state';
+  state.textContent = '运行中…';
+  head.appendChild(state);
+  var body = document.createElement('div');
+  body.className = 'cs-skill-body';
+  card.appendChild(head);
+  card.appendChild(body);
+  card.csState = state;
+  card.csBody = body;
+  return card;
+}
+
+// 产物**不都是图**：视频目标出 mp4、主题曲出 flac，拿 <img> 去装它们只会得到"这张图加载不出来"。
+// 按后缀挑标签：图走 paintSkillImage（那边已经处理好"没地址"与"加载不出来"两种坏情况），视频用
+// <video>，其余（音频等）只把地址与文件名写上 —— 面板不假装自己什么都能放。
+var RENDER_IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp'];
+var RENDER_VIDEO_EXTS = ['mp4', 'webm', 'mov', 'mkv'];
+
+// 一个产物的后缀（小写，不含点）。名字是引擎给的（它落在 output/ 里的文件名），面板不自己造。
+function mediaExt(media) {
+  var filename = String((media && media.filename) || '');
+  var dot = filename.lastIndexOf('.');
+  return dot < 0 ? '' : filename.slice(dot + 1).toLowerCase();
+}
+
+// 换掉一个加载不出来的产物：留个空框看着像"还在路上"，换成一行字并写上地址，用户能自己去查是引擎
+// 没起来还是那个文件已经被清掉。
+function paintMediaFailure(node, note, url) {
+  var line = document.createElement('div');
+  line.className = 'cs-skill-image-note';
+  line.textContent = note + ': ' + url;
+  if (node && node.parentNode) node.parentNode.replaceChild(line, node);
+}
+
+function paintRenderMedia(body, media) {
+  var item = media || {};
+  var url = String(item.url || '');
+  var filename = String(item.filename || '');
+  var ext = mediaExt(item);
+  if (RENDER_IMAGE_EXTS.indexOf(ext) >= 0 || (ext === '' && url !== '')) {
+    // 后缀认不出但给了地址（引擎那边形状变过）：按图试一次，比什么都不画强。
+    paintSkillImage(body, item);
+    return;
+  }
+  if (url === '') {
+    var skipped = document.createElement('div');
+    skipped.className = 'cs-skill-image-note';
+    skipped.textContent = '引擎报了一个产物但没有地址: ' + (filename || '（也没文件名）');
+    body.appendChild(skipped);
+    return;
+  }
+  if (RENDER_VIDEO_EXTS.indexOf(ext) >= 0) {
+    var video = document.createElement('video');
+    video.className = 'cs-skill-image';
+    video.src = url;
+    video.controls = true;
+    video.preload = 'metadata';
+    video.setAttribute('data-media', 'video');
+    video.addEventListener('error', function (event) {
+      paintMediaFailure(event.target, '这段视频加载不出来', url);
+    });
+    body.appendChild(video);
+  } else {
+    // 音频之类：画不了就不硬画（浏览器对 flac 的支持看机器），把地址与文件名给足。
+    var line = document.createElement('div');
+    line.className = 'cs-skill-caption';
+    line.textContent = '产物（这一页放不了）: ' + url;
+    body.appendChild(line);
+  }
+  if (filename !== '') {
+    var caption = document.createElement('div');
+    caption.className = 'cs-skill-caption';
+    caption.textContent = filename;
+    body.appendChild(caption);
+  }
+}
+
+// 一次渲染跑完之后画它。跟技能那边一样把三种结果分开说：引擎**执行**失败（显存不够、工作流里那个
+// 模型没装）、跑成了但没有产物、跑成了有产物。渲染比 skill 多两样要如实带出来：notes（组装期的
+// 让步 —— 时长按帧数折了、接的是外部组）与 saved（指定了输出目录时落盘的文件）。
+function paintRenderRun(card, id, run) {
+  var result = run || {};
+  if (result.isError === true) {
+    card.setAttribute('data-state', 'error');
+    card.csState.textContent = '失败';
+    card.csBody.appendChild(makeBlock('引擎说', String(result.text || '（没有说明）'), RESULT_FOLD));
+    setStatus('渲染 ' + id + ' 失败（原因在那张卡里）', 'error');
+    return;
+  }
+  var data = result.data || {};
+  // 组装期让步了就得说：没这句话，用户看到的时长 / 接法与工作流图上写的不一样，会以为哪里算错了。
+  var notes = data.notes || [];
+  if (notes.length > 0) {
+    card.csBody.appendChild(makeBlock('这次组装改了什么', notes.join('\\n'), RESULT_FOLD));
+  }
+  var media = data.images || [];
+  var saved = data.saved || [];
+  card.setAttribute('data-state', 'done');
+  if (media.length > 0) {
+    for (var i = 0; i < media.length; i++) paintRenderMedia(card.csBody, media[i] || {});
+    card.csState.textContent = '完成 · ' + media.length + ' 个产物';
+    setStatus('渲染 ' + id + ' 跑完了：' + media.length + ' 个产物（在这一页里）');
+  } else {
+    // 走得通但没有产物：把引擎的原文照放，别让人以为跑空了。
+    card.csState.textContent = '完成（没有产物）';
+    card.csBody.appendChild(makeBlock('结果', String(result.text || '（引擎没有返回内容）'), RESULT_FOLD));
+    setStatus('渲染 ' + id + ' 跑完了，但引擎没报出产物（结果在那张卡里）');
+  }
+  if (saved.length > 0) {
+    card.csBody.appendChild(makeBlock('另存到', saved.join('\\n'), RESULT_FOLD));
+  }
+}
+
+function runRender(id) {
+  var targetId = String(id || '');
+  if (STATE.renderRunning !== '') {
+    // 一次只跑一个（与技能同一个理由）：渲染要占满显存好些分钟，叠着跑两边都慢。
+    setStatus('上一个渲染（' + STATE.renderRunning + '）还在跑，等它完再按', 'error');
+    return null;
+  }
+  var entry = renderOf(targetId);
+  if (!entry) {
+    setStatus('先在上面选一个渲染目标', 'error');
+    return null;
+  }
+  if (entry.fileExists === false) {
+    // 文件缺了这一趟必跑不起来（引擎那边也会报），但先把话说在前面：别让人等到模型加载完才看到。
+    setStatus(
+      '渲染 ' + targetId + ' 的工作流文件不在（' + String(entry.file || '') + '）：先把它放回引擎的工作流目录',
+      'error'
+    );
+    return null;
+  }
+  var args = renderArgValues(entry);
+  if (args.missing.length > 0) {
+    // 面板不替它编内容（编出来的不报错，只是另一张图）：说清要填哪个，让人自己填。
+    setStatus('渲染 ' + targetId + ' 要填 ' + args.missing.join('、') + '（填完再按「跑一遍」）', 'error');
+    return null;
+  }
+  // 卡先摆上再发请求：渲染要跑几分钟到几十分钟，界面上得有东西说明"在跑哪个"。
+  switchView('chat');
+  var card = renderCard(entry);
+  appendNode(card);
+  STATE.renderRunning = targetId;
+  refreshRenderEnabled();
+  setStatus('正在渲染 ' + targetId + '…');
+
+  var settle = function () {
+    STATE.renderRunning = '';
+    refreshRenderEnabled();
+  };
+  var failed = function (reason) {
+    card.setAttribute('data-state', 'error');
+    card.csState.textContent = '失败';
+    card.csBody.appendChild(makeBlock('宿主说', String(reason), RESULT_FOLD));
+    setStatus('渲染 ' + targetId + ' 没跑起来（原因在那张卡里）', 'error');
+    return null;
+  };
+  var payload = { target_id: targetId, params: args.values };
+  var images = renderImages();
+  // 没给参考图就**不带这一项**：带一个空数组过去，读的人会以为"打算给图但没给"。
+  if (images.length > 0) payload.images = images;
+  return Promise.resolve(bridge.request('renders/run', payload)).then(
+    function (response) {
+      if (!response || response.ok !== true) {
+        // 走到这里的是**协议层**的问题（引擎没这把工具、目录里没这个 id、参数形状不对）：
+        // 原因整段放进卡里。
+        var error = (response && response.error) || {};
+        return failed(error.message || '未知错误');
+      }
+      paintRenderRun(card, targetId, response.result);
+      return response.result;
+    },
+    function (err) {
+      return failed(message(err));
+    }
+  ).then(settle, settle);
+}
+
 function loadAgents() {
   return Promise.resolve(bridge.request('agent/agents')).then(
     function (response) {
@@ -3525,6 +4038,8 @@ function sendTurn() {
     loadAgents();
     // 技能目录同理：agent 自己就是用它跑工作流的，这一轮里可能刚新增过一套。
     loadSkills();
+    // 渲染目标也一起重读：这一轮里 agent 可能刚往工作流目录里放过文件（那样"文件没找到"就该消失）。
+    loadRenders();
     // 这一轮过后这段对话的样子也变了（第一句话成了它的标题、条数加了）：
     // 清单跟着刷新，用户才看得见"它现在叫什么"。
     loadSessions();
@@ -3688,8 +4203,9 @@ function openDrawer() {
   loadModels();
   loadAgents();
   // skill 目录也在引擎侧：面板每次打开都现读一遍，引擎重启过、或刚往 skills 目录里加了
-  // 一套，这里就该跟上（跟智能体清单一个道理）。
+  // 一套，这里就该跟上（跟智能体清单一个道理）。渲染目标同理（它连工作流文件在不在都是现读的）。
   loadSkills();
+  loadRenders();
   loadHistory();
   loadSessions();
   loadStorage();
@@ -7418,6 +7934,9 @@ export function getComfyStudioChatContentScript(): string {
     // 引擎报回来的 skill 目录，以及"现在正跑着哪一个"（同一时刻只跑一个：引擎那边跑一次
     // 要占住显存，叠着跑只会两边都慢）。
     `skills: null, skill: '', skillRunning: '', ` +
+    // 引擎报回来的渲染目标（那 12 张生产工作流 + 工作流目录在哪），以及"现在正跑着哪一个"。
+    // 与 skill 那一份同一个道理：一次只跑一个（渲染一次要占满显存好些分钟）。
+    `renders: null, render: '', renderRunning: '', rendersDir: '', rendersNote: '', ` +
     // 抽屉宽度（像素，0 = 占满整屏）与"窗口变窄要收回来"的监听装没装。
     `width: 0, widthWatcher: false, shortcuts: false, ` +
     // 这一份实例建的那面抽屉（见 buildDrawer）。宿主刷新网页后旧实例还在监听按键，

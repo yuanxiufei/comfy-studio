@@ -123,6 +123,7 @@ from .projects import (
     ProjectsError,
     default_project_dir,
 )
+from .renders import RenderCatalog, RendersError
 from .review import ReviewChannel, ReviewClient
 from .rpc import INTERNAL_ERROR, INVALID_PARAMS, RpcContext, RpcError, StdioRpcServer
 from .settings import (
@@ -257,6 +258,7 @@ class StudioHost:
         novels: NovelLibrary | None = None,
         settings: SettingsStore | None = None,
         projects: ProjectLibrary | None = None,
+        renders: RenderCatalog | None = None,
         turn_timeout: float | None = DEFAULT_TURN_TIMEOUT,
     ) -> None:
         self.hub = hub
@@ -292,6 +294,10 @@ class StudioHost:
         #: ``--comfyui-dir`` 推出默认落点（与原文同一个父目录下的 ``projects/``）。
         #: None 时 ``projects/*`` 会明确说"宿主没挂项目目录"，而不是回一个空项目表。
         self.projects = projects
+        #: 渲染目标目录（这台机器上那 12 张生产工作流的入口）：由启动方挂上来，因为它要用
+        #: 同一个 hub 去读引擎。None 时 ``renders/*`` 会明确说"宿主没挂渲染目录"，而不是回一张空表
+        #: 让人以为"这台机器没配任何目标"。
+        self.renders = renders
         #: 面板里切过的模型；None = 用当前那条源自己的默认模型（进程内有效，不落盘）。
         self.default_model: str | None = None
         #: 面板里切过的模型**源**；None = 环境变量那条。它与 :attr:`default_model` 一起决定
@@ -319,6 +325,8 @@ class StudioHost:
         self.server.on("mcp/tools", self.mcp_tools)
         self.server.on("skills/list", self.skills_list)
         self.server.on("skills/run", self.skills_run)
+        self.server.on("renders/list", self.renders_list)
+        self.server.on("renders/run", self.renders_run)
         self.server.on("agent/config", self.agent_config)
         self.server.on("agent/settings", self.agent_settings)
         self.server.on("agent/models", self.agent_models)
@@ -464,6 +472,68 @@ class StudioHost:
         except SkillsError as err:
             raise RpcError(INVALID_PARAMS, str(err)) from err
         return run.to_json()
+
+    async def renders_list(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
+        """这台机器上配好的渲染目标（引擎那 12 张生产工作流的入口）。
+
+        ``workflows_dir`` 与 ``note`` 一路照实带出去：**"没配"与"配在哪"要能分开看**，
+        面板照着它显示，而不是让人对着一张空表猜。
+        """
+        _object(params, "renders/list")
+        catalog = self._renders()
+        try:
+            targets = await catalog.refresh()
+        except RendersError as err:
+            raise RpcError(INTERNAL_ERROR, f"读渲染目标失败: {err}") from err
+        return {
+            "workflows_dir": catalog.workflows_dir,
+            "note": catalog.note,
+            "targets": [t.to_json() for t in targets],
+        }
+
+    async def renders_run(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
+        """跑一个渲染目标：与 MCP 的 ``comfy_render`` 同一套组装（含参考图与外部组）。
+
+        这里只挡**形状**（参数是不是对象、images 是不是字符串数组）："必填给了没、时长要正数"
+        那些规则住在引擎的组装期，不在这里再写一份。
+        """
+        args = _object(params, "renders/run")
+        target_id = _text(args, "target_id")
+        run_params = args.get("params") or {}
+        if not isinstance(run_params, dict):
+            raise RpcError(INVALID_PARAMS, "params 必须是对象")
+        images = args.get("images") or ()
+        if isinstance(images, str) or not isinstance(images, (list, tuple)):
+            raise RpcError(INVALID_PARAMS, 'images 必须是数组（哪怕只有一项也要写成 ["…"]）')
+        if any(not isinstance(path, str) or not path.strip() for path in images):
+            raise RpcError(INVALID_PARAMS, "images 里每一项都要是非空字符串（本机文件路径）")
+        duration_sec = args.get("duration_sec")
+        if duration_sec is not None and (
+            isinstance(duration_sec, bool) or not isinstance(duration_sec, (int, float))
+        ):
+            raise RpcError(INVALID_PARAMS, "duration_sec 必须是数字")
+        output_dir = args.get("output_dir")
+        if output_dir is not None and (not isinstance(output_dir, str) or not output_dir.strip()):
+            raise RpcError(INVALID_PARAMS, "output_dir 必须是目录路径")
+        try:
+            run = await self._renders().run(
+                target_id,
+                run_params,
+                images=images,
+                duration_sec=duration_sec,
+                output_dir=output_dir,
+            )
+        except RendersError as err:
+            raise RpcError(INVALID_PARAMS, str(err)) from err
+        return run.to_json()
+
+    def _renders(self) -> RenderCatalog:
+        if self.renders is None:
+            raise RpcError(
+                INTERNAL_ERROR,
+                "宿主没挂渲染目录：启动方没把 RenderCatalog 传进来（见 __main__ 的启动参数）",
+            )
+        return self.renders
 
     def agent_config(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
         _object(params, "agent/config")
@@ -1926,6 +1996,7 @@ async def serve_stdio(
             agents=agent_catalog,
             novels=novels,
             projects=projects,
+            renders=RenderCatalog(hub),
             settings=settings_store,
             turn_timeout=turn_timeout,
         )

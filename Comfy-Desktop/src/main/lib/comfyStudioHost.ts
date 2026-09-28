@@ -43,8 +43,17 @@ export const STUDIO_QUERY_TIMEOUT_MS = 30 * 1000
  *  S0–S7 and each stage is one model call, so its duration is decided by the
  *  work, not by whether the host is alive. Left query-shaped it would be dropped
  *  at 30s while the run kept going in the child — the panel would report a
- *  timeout for a pipeline that actually completed. */
-const SLOW_METHODS = new Set(['agent/chat', 'skills/run', 'novels/import', 'pipeline/run'])
+ *  timeout for a pipeline that actually completed.
+ *
+ *  `renders/run` is `skills/run` for the render targets (角色定妆板 / 视频试片 …),
+ *  and it is the LONGEST of them: a video target renders hundreds of frames. */
+const SLOW_METHODS = new Set([
+  'agent/chat',
+  'skills/run',
+  'renders/run',
+  'novels/import',
+  'pipeline/run'
+])
 
 /** Pick the parent-side timeout for a method (see the two constants above). */
 export function studioTimeoutForMethod(method: string): number {

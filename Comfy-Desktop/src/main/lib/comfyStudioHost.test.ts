@@ -162,6 +162,11 @@ describe('studioTimeoutForMethod', () => {
     // 只会让面板那排控件一直禁用 —— 开一次抽屉会同时发好几条这种请求。
     expect(studioTimeoutForMethod('agent/chat')).toBe(STUDIO_SLOW_TIMEOUT_MS)
     expect(studioTimeoutForMethod('skills/run')).toBe(STUDIO_SLOW_TIMEOUT_MS)
+    // 渲染目标是这一族里最长的一跑（视频那种要出几百帧）：留在查询档就会 30 秒把面板放开，
+    // 而子进程那边还在出帧 —— 面板报"超时"，实际它跑完了。
+    expect(studioTimeoutForMethod('renders/run')).toBe(STUDIO_SLOW_TIMEOUT_MS)
+    // 但列目标本身是毫秒级的事，得留在查询档（开一次抽屉会连着发好几条）。
+    expect(studioTimeoutForMethod('renders/list')).toBe(STUDIO_QUERY_TIMEOUT_MS)
     // 流水线走 S0–S7、每段一次模型调用：长度由活决定，不由"宿主还活着吗"决定。
     // 留在查询档 = 30 秒就把面板放开，而子进程那一跑还在继续 —— 面板会报一个
     // 超时，可实际那次跑完了。

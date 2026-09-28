@@ -12,7 +12,7 @@ from .config import (
     engine_web_tools,
     parse_extra_servers,
 )
-from .hub import McpHub
+from .hub import McpHub, resolve_tool
 from .result import error_message, result_json, result_text, tool_text
 
 __all__ = [
@@ -29,6 +29,7 @@ __all__ = [
     "engine_web_tools",
     "error_message",
     "parse_extra_servers",
+    "resolve_tool",
     "result_json",
     "result_text",
     "tool_text",

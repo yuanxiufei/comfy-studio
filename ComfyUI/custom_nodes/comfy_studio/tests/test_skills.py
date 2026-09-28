@@ -1,4 +1,4 @@
-"""skills 层：模板加载/校验、参数合并与类型检查、参数注入、输出收集。"""
+"""skills 层：模板加载/校验、参数合并与类型检查、参数注入（产物回收见 test_skills_outputs.py）。"""
 
 from __future__ import annotations
 
@@ -7,10 +7,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from ..skills import WORKFLOWS_DIR, build_prompt, collect_images, load_skills, merge_params
+from ..skills import WORKFLOWS_DIR, build_prompt, load_skills, merge_params
 from ..skills.loader import load_skill_file, validate_skill
 from ..skills.params import SEED_RANDOM
-from ..skills.types import SkillOutputImage, SkillParam
+from ..skills.types import SkillParam
 from .support import make_skill
 
 #: 一份合法的最小 skill 文档，各用例在它上面改坏一处。
@@ -244,42 +244,6 @@ class BuildPromptTest(unittest.TestCase):
         skill = validate_skill(GOOD, "mem")
         with self.assertRaises(ValueError):
             build_prompt(skill, {"ckpt_name": "a.safetensors", "steps": "8"})
-
-
-class CollectImagesTest(unittest.TestCase):
-    def test_normalizes_and_skips_garbage(self) -> None:
-        entry = {
-            "outputs": {
-                "9": {
-                    "images": [
-                        {"filename": "a.png"},
-                        {"filename": "b.png", "subfolder": "sub", "type": "temp"},
-                        {"no_filename": True},
-                        "不是对象",
-                    ]
-                },
-                "10": "不是对象",
-                "11": {"images": "不是数组"},
-                "12": {},
-            }
-        }
-        images = collect_images(entry)
-        self.assertEqual(
-            [(i.node, i.filename, i.subfolder, i.type) for i in images],
-            [("9", "a.png", "", "output"), ("9", "b.png", "sub", "temp")],
-        )
-
-    def test_missing_outputs_is_empty(self) -> None:
-        self.assertEqual(collect_images({}), ())
-        self.assertEqual(collect_images({"outputs": None}), ())
-
-    def test_url_matches_the_view_route(self) -> None:
-        image = SkillOutputImage(node="9", filename="a b.png", subfolder="子 目录", type="output")
-        url = image.url("http://127.0.0.1:8188/")
-        self.assertTrue(url.startswith("http://127.0.0.1:8188/view?"))
-        self.assertIn("filename=a+b.png", url)
-        self.assertIn("subfolder=", url)
-        self.assertIn("type=output", url)
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ import asyncio
 from abc import ABC, abstractmethod
 from typing import Any
 
-from ..skills import Skill, SkillRunResult, build_prompt, collect_images
+from ..skills import Skill, SkillRunResult, build_prompt, collect_media
 from ..skills.runner import DEFAULT_TIMEOUT, StatusCallback, cancel_quietly
 
 
@@ -147,7 +147,7 @@ class EngineClient(ABC):
             raise
         return SkillRunResult(
             prompt_id=prompt_id,
-            images=collect_images(entry),
+            media=collect_media(entry),
             outputs=entry.get("outputs") or {},
         )
 

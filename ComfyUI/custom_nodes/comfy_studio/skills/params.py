@@ -75,4 +75,25 @@ def merge_params(skill: Skill, params: dict[str, Any] | None) -> dict[str, Any]:
     return merged
 
 
-__all__ = ["SEED_RANDOM", "merge_params", "NO_DEFAULT"]
+def param_entry(param: SkillParam) -> dict[str, Any]:
+    """参数在**对外返回**里的统一形状（``comfy_list_skills`` / ``comfy_list_renders`` 与
+    ``GET /comfy-studio/*`` 共用一套键）——前端与桌面宿主只认这一套字段。
+
+    单独抽出来是因为它曾经漂过：渲染目标那份一度用 ``has_default`` / ``hint``，于是同一件事有了
+    两种形状，调用方得写两份解析。这里定死键名，两边都从这里取。
+
+    ``hasDefault`` 与 ``default`` 是**两个**字段，不能只留后者：``default`` 为 ``None`` 既可能是
+    "默认值就是 null"，也可能是"没有默认值"，调用方（桌面宿主、面板）要判"这个参数能不能省"就
+    必须看它 —— 宿主侧 ``skills/catalog.py::SkillParam.to_json`` 报的是同一套六个键。
+    """
+    return {
+        "name": param.name,
+        "type": param.type,
+        "required": param.required,
+        "default": param.default if param.has_default else None,
+        "description": param.hint(),
+        "hasDefault": param.has_default,
+    }
+
+
+__all__ = ["SEED_RANDOM", "merge_params", "param_entry", "NO_DEFAULT"]

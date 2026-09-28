@@ -23,8 +23,10 @@ from aiohttp.test_utils import TestClient, TestServer
 from .. import routes
 from ..agent.types import ChatMessage, ToolCall
 from ..engine import EngineError
+from ..skills.render import RENDER_TARGETS, WORKFLOWS_ENV, find_target
 from ..web import WebFetcher
 from .support import FakeEngine, FakeLLM
+from .test_tools import GENERIC_TOOLS
 
 WORKFLOW_BODY = {"params": {"ckpt_name": "a.safetensors", "positive": "一只猫", "seed": 7}}
 
@@ -202,7 +204,8 @@ class RouteContractTest(unittest.IsolatedAsyncioTestCase):
             status, body = await self.json_of("get", "/comfy-studio/agent/config")
         self.assertEqual(status, 200)
         self.assertEqual(body["model"], "qwen")
-        self.assertEqual(body["tool_count"], 13, "9 个通用工具 + 每 skill 一个 + 联网 3 把")
+        # 从工具表算，不写死数字：加了通用工具却忘了改这里的数字，正是最容易被忽略的谎报。
+        self.assertEqual(body["tool_count"], len(GENERIC_TOOLS) + 1 + 3, "通用工具 + 每 skill 一个 + 联网 3 把")
 
     def test_the_panel_handle_is_a_real_fetcher_and_is_reused(self) -> None:
         """取回来必须是**真句柄**，而且取第二次得是同一个（进程级共用一份）。
@@ -387,6 +390,87 @@ class RouteContractTest(unittest.IsolatedAsyncioTestCase):
                     await (await self.client.post("/comfy-studio/agent/chat", json={"message": "c", "session_id": "s3"})).text()
                     self.assertEqual(sorted(routes._sessions), ["s2", "s3"])
                     self.assertEqual(oldest.messages, [], "被淘汰的会话要清掉历史，别把上下文留在内存里")
+
+
+#: 渲染路由用的一张最小视频图（08 补帧：只留 LoadVideo 一个节点）。真图是开发机上那 12 张，
+#: 这里只验"面板这条路接线通了" —— 真跑视频生成占 GPU，不塞进单测。
+RENDER_DOC = {"nodes": [{"id": 1, "type": "LoadVideo", "mode": 0, "widgets_values": ["in.mp4"]}], "links": []}
+RENDER_OBJECT_INFO = {
+    "LoadVideo": {
+        "input": {"required": {"file": [["in.mp4"], {"video_upload": True}]}},
+        "output": ["VIDEO"],
+    },
+}
+
+
+class RenderRouteTest(RouteContractTest):
+    """渲染路由：与 MCP 的 comfy_list_renders / comfy_render 同一套组装，别长出两套口径。"""
+
+    def workflows_with(self, target_id: str = "video-interpolate") -> Path:
+        """把工作流目录换成临时目录，并只放指定的那一张。"""
+        tmp = tempfile.TemporaryDirectory(prefix="comfy-studio-render-routes-")
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name, "workflows")
+        root.mkdir()
+        (root / find_target(target_id).file).write_text(json.dumps(RENDER_DOC), encoding="utf-8")
+        env = mock.patch.dict(os.environ, {WORKFLOWS_ENV: str(root)})
+        env.start()
+        self.addCleanup(env.stop)
+        return root
+
+    async def test_renders_endpoint_lists_targets_and_flags_missing_files(self) -> None:
+        root = self.workflows_with()
+        status, body = await self.json_of("get", "/comfy-studio/renders")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["workflows_dir"], str(root))
+        self.assertIsNone(body["note"])
+        by_id = {item["id"]: item for item in body["targets"]}
+        self.assertEqual(sorted(by_id), sorted(target.id for target in RENDER_TARGETS))
+        self.assertIs(by_id["video-interpolate"]["file_exists"], True)
+        self.assertIs(by_id["video-draft"]["file_exists"], False, "缺的图要如实标出来，别假装列出来的都能跑")
+        self.assertIs(by_id["video-draft"]["reference_images"], True)
+        self.assertNotIn("reference_images", by_id["video-interpolate"])
+
+    async def test_renders_endpoint_says_so_when_the_directory_is_gone(self) -> None:
+        with mock.patch.dict(os.environ, {WORKFLOWS_ENV: str(Path(self._tmpdir.name, "没有这个目录"))}):
+            status, body = await self.json_of("get", "/comfy-studio/renders")
+        self.assertEqual(status, 200)
+        self.assertIn(WORKFLOWS_ENV, body["note"])
+        self.assertEqual(len(body["targets"]), len(RENDER_TARGETS))
+
+    async def test_render_route_runs_the_target(self) -> None:
+        self.workflows_with()
+        self.engine.object_info_map = dict(RENDER_OBJECT_INFO)
+        status, body = await self.json_of(
+            "post", "/comfy-studio/renders/video-interpolate/run", json={"params": {"file": "in.mp4"}}
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["prompt_id"], "prompt-1")
+        self.assertEqual(body["target"], "video-interpolate")
+        self.assertEqual(len(self.engine.submitted), 1)
+        self.assertEqual(self.engine.submitted[0]["1"]["inputs"]["file"], "in.mp4")
+
+    async def test_render_route_rejects_bad_input_without_submitting(self) -> None:
+        self.workflows_with()
+        status, body = await self.json_of("post", "/comfy-studio/renders/没有这个目标/run", json={})
+        self.assertEqual(status, 400, body)
+        self.assertIn("video-draft", json.dumps(body, ensure_ascii=False), "目标名写错要列出可用的")
+
+        status, body = await self.json_of("post", "/comfy-studio/renders/video-draft/run", json={"images": "a.png"})
+        self.assertEqual(status, 400, body)
+        self.assertIn("images", json.dumps(body, ensure_ascii=False))
+
+        status, body = await self.json_of("post", "/comfy-studio/renders/video-draft/run", json={"duration_sec": 0})
+        self.assertEqual(status, 400, f"{body} —— 时长要正数这条规则住在组装期，路由不该自己另写一份")
+
+        self.assertEqual(self.engine.submitted, [], "输入不成立就不该提交任何东西")
+
+    async def test_render_route_reports_a_missing_workflow_file(self) -> None:
+        self.workflows_with()  # 只放了 08 那一张
+        status, body = await self.json_of("post", "/comfy-studio/renders/video-draft/run", json={"prompt": "x"})
+        self.assertEqual(status, 400, body)
+        self.assertIn(WORKFLOWS_ENV, json.dumps(body, ensure_ascii=False))
+        self.assertEqual(self.engine.submitted, [])
 
 
 if __name__ == "__main__":

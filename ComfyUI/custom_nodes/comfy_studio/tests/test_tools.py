@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from ..engine import EngineError, MODEL_PROBES
-from ..mcp.tools import Tool, build_tools, error_result, schema_for, text_result
+from ..mcp.tools import Tool, build_tools, error_result, schema_for, skill_entry, text_result
 from ..skills import SkillRegistry, load_skills, WORKFLOWS_DIR
+from ..skills.render import RENDER_TARGETS, WORKFLOWS_ENV, RenderError, find_target
 from ..skills.types import SkillParam
 from .support import FakeEngine, WORKFLOW, make_skill
 
@@ -29,6 +32,8 @@ GENERIC_TOOLS = [
     "comfy_get_history",
     "comfy_get_queue",
     "comfy_interrupt",
+    "comfy_list_renders",
+    "comfy_render",
 ]
 
 
@@ -367,6 +372,130 @@ class SaveSkillToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(skill.params[1].has_default)
         self.assertEqual(skill.params[1].default, "a cat")
         self.assertEqual(skill.tags, ("人像",))
+
+
+#: 渲染工具用的一张最小视频图（08 补帧：只留 LoadVideo 一个节点）。
+#: 真图是开发机上那 12 张（见 ``skills/render.py`` 的目标表）；这里只验"接线通了" ——
+#: 真跑一次视频生成是真的占 GPU，不该塞进单测。
+RENDER_DOC = {"nodes": [{"id": 1, "type": "LoadVideo", "mode": 0, "widgets_values": ["in.mp4"]}], "links": []}
+RENDER_OBJECT_INFO = {
+    "LoadVideo": {
+        "input": {"required": {"file": [["in.mp4"], {"video_upload": True}]}},
+        "output": ["VIDEO"],
+    },
+}
+
+
+class RenderToolsTest(unittest.IsolatedAsyncioTestCase):
+    """渲染工具：与 ``skills/render.py`` 同源；参数不过关先报错，绝不提交半张图。"""
+
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory(prefix="comfy-studio-renders-")
+        self.addCleanup(self._tmpdir.cleanup)
+        self.workflows = Path(self._tmpdir.name, "workflows")
+        self.workflows.mkdir()
+        self.target = find_target("video-interpolate")
+        (self.workflows / self.target.file).write_text(json.dumps(RENDER_DOC), encoding="utf-8")
+        # 工作流目录按环境变量换掉（render.py 就是这么发现的，不写死机器路径）
+        env = mock.patch.dict(os.environ, {WORKFLOWS_ENV: str(self.workflows)})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def tools(self, engine: FakeEngine) -> dict[str, Tool]:
+        return {tool.name: tool for tool in build_tools(engine, registry_of(()))}
+
+    async def test_list_renders_reports_every_target_and_the_file_state(self) -> None:
+        payload = as_json(await self.tools(FakeEngine())["comfy_list_renders"].handler({}))
+        self.assertEqual(payload["workflows_dir"], str(self.workflows))
+        self.assertIsNone(payload["note"])
+        self.assertEqual([item["id"] for item in payload["targets"]], [t.id for t in RENDER_TARGETS])
+        by_id = {item["id"]: item for item in payload["targets"]}
+        self.assertIs(by_id["video-interpolate"]["file_exists"], True)
+        self.assertIs(by_id["video-draft"]["file_exists"], False, "缺的图要如实标 false，不许假装能跑")
+        self.assertIs(by_id["video-draft"]["reference_images"], True)
+        self.assertNotIn("reference_images", by_id["video-interpolate"])
+
+    async def test_list_renders_says_so_when_the_directory_is_gone(self) -> None:
+        missing = Path(self._tmpdir.name, "没有这个目录")
+        with mock.patch.dict(os.environ, {WORKFLOWS_ENV: str(missing)}):
+            payload = as_json(await self.tools(FakeEngine())["comfy_list_renders"].handler({}))
+        self.assertIn(WORKFLOWS_ENV, payload["note"])
+        self.assertEqual(len(payload["targets"]), len(RENDER_TARGETS), "列不出来也要把目标表给全")
+        self.assertTrue(all(not item["file_exists"] for item in payload["targets"]))
+
+    async def test_render_params_use_the_exact_keys_skill_params_use(self) -> None:
+        """前端与桌面宿主只认一套字段。
+
+        这条是防回归的：渲染目标那份参数表一度用 ``has_default`` / ``hint``，与 skill 的
+        ``default`` / ``description`` 漂成了两种形状 —— 调用方得写两份解析。键名逐字对着。
+        里面必须有 ``hasDefault``：只有 ``default`` 分不开"默认值就是 null"与"没有默认值"
+        （见 ``skills/params.py::param_entry``），而"这个参数能不能省"正靠它判。
+        """
+        listing = as_json(await self.tools(FakeEngine())["comfy_list_renders"].handler({}))
+        render_param = listing["targets"][0]["params"][0]
+        skill = make_skill(
+            params=(SkillParam(name="positive", type="string", node="4", field="text", description="正向提示词"),)
+        )
+        self.assertEqual(set(render_param), set(skill_entry(skill)["params"][0]))
+        self.assertEqual(
+            set(render_param),
+            {"name", "type", "required", "default", "description", "hasDefault"},
+        )
+
+    async def test_bad_arguments_are_rejected_before_anything_is_submitted(self) -> None:
+        engine = FakeEngine()
+        handler = self.tools(engine)["comfy_render"].handler
+        cases = [
+            ({}, "target_id"),
+            ({"target_id": self.target.id, "params": "prompt"}, "params 必须是对象"),
+            ({"target_id": self.target.id, "images": "a.png"}, "必须是数组"),
+            ({"target_id": self.target.id, "images": ["a.png", 2]}, "非空字符串"),
+            ({"target_id": self.target.id, "duration_sec": "5"}, "必须是数字"),
+            ({"target_id": self.target.id, "duration_sec": 0}, "大于 0"),
+            ({"target_id": self.target.id, "output_dir": "   "}, "output_dir"),
+        ]
+        for args, message in cases:
+            with self.subTest(args=args):
+                with self.assertRaises(ValueError) as ctx:
+                    await handler(args)
+                self.assertIn(message, str(ctx.exception))
+        self.assertEqual(engine.submitted, [], "参数不过关就不该提交任何东西")
+
+    async def test_unknown_target_lists_the_alternatives(self) -> None:
+        engine = FakeEngine()
+        with self.assertRaises(RenderError) as ctx:
+            await self.tools(engine)["comfy_render"].handler({"target_id": "视频试片"})
+        self.assertIn("video-draft", str(ctx.exception))
+        self.assertEqual(engine.submitted, [])
+
+    async def test_render_runs_the_target_and_hands_back_the_target_id(self) -> None:
+        engine = FakeEngine()
+        engine.object_info_map = dict(RENDER_OBJECT_INFO)
+        payload = as_json(
+            await self.tools(engine)["comfy_render"].handler(
+                {"target_id": self.target.id, "params": {"file": "in.mp4"}}
+            )
+        )
+        self.assertEqual(payload["prompt_id"], "prompt-1")
+        self.assertEqual(payload["target"], self.target.id)
+        self.assertEqual(len(engine.submitted), 1)
+        self.assertEqual(engine.submitted[0]["1"]["inputs"]["file"], "in.mp4")
+
+    async def test_output_dir_saves_the_media_and_returns_paths(self) -> None:
+        engine = FakeEngine()
+        engine.object_info_map = dict(RENDER_OBJECT_INFO)
+        saved = Path(self._tmpdir.name, "out", "shot-001.mp4")
+        saver = mock.AsyncMock(return_value=(saved,))
+        with mock.patch("comfy_studio.mcp.tools.save_media_batch", saver):
+            payload = as_json(
+                await self.tools(engine)["comfy_render"].handler(
+                    {"target_id": self.target.id, "params": {"file": "in.mp4"}, "output_dir": str(saved.parent)}
+                )
+            )
+        self.assertEqual(payload["saved"], [str(saved)])
+        self.assertEqual(len(saver.await_args.args[0]), 1, "假引擎回一份产物，落盘就只该收到这一份")
+        self.assertEqual(saver.await_args.args[1], str(saved.parent))
+        self.assertEqual(saver.await_args.kwargs["base_url"], engine.base_url)
 
 
 if __name__ == "__main__":

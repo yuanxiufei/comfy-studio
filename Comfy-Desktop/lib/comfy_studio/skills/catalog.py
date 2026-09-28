@@ -17,7 +17,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from ..mcp import ENGINE_SERVER_NAME, McpHub, error_message, result_json, result_text
+from ..mcp import ENGINE_SERVER_NAME, McpHub, error_message, resolve_tool, result_json, result_text
 
 #: 引擎侧提供 skill 目录的工具名。
 LIST_SKILLS_TOOL = "comfy_list_skills"
@@ -71,8 +71,13 @@ class SkillParam:
         description = raw.get("description") or ""
         if not isinstance(description, str):
             raise SkillsError(f"{where}.description 必须是字符串")
-        # 引擎明确用 null 表示「没有默认值」（skills 侧 SkillParam.has_default 为假）。
-        default: Any = raw["default"] if raw.get("default") is not None else NO_DEFAULT
+        # 有没有默认值：引擎报了 hasDefault 就以它为准 —— ``default: null`` 的两种含义（"默认值就是
+        # null" / "没有默认值"）只有那个字段分得开（见引擎 ``skills/params.py::param_entry``）。没报
+        # （老版本引擎）才退回"default 不是 null 就有"。
+        declared = raw.get("hasDefault")
+        if not isinstance(declared, bool):
+            declared = raw.get("default") is not None
+        default: Any = raw.get("default") if declared else NO_DEFAULT
         return SkillParam(
             name=name, type=type_, required=required, description=description, default=default
         )
@@ -219,14 +224,7 @@ class SkillCatalog:
     # ---- 内部 -----------------------------------------------------------
 
     def _tool(self, tool: str) -> str:
-        name = f"{self._server}__{tool}"
-        available = {t.qualified_name for t in self._hub.tools}
-        if name not in available:
-            listed = ", ".join(sorted(available)) or "（无）"
-            if not available:
-                raise SkillsError("手上一个 MCP 工具都没有：MCP server 还没 start()？")
-            raise SkillsError(f"MCP server {self._server} 没有工具 {tool}；可用: {listed}")
-        return name
+        return resolve_tool(self._hub, self._server, tool, error=SkillsError)
 
 
 __all__ = [

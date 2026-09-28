@@ -65,6 +65,11 @@ const PROJECT_FILE_FIND_NEXT_ID = 'comfy-desktop-studio-project-file-find-next'
 const PROJECT_FILE_FIND_CLEAR_ID = 'comfy-desktop-studio-project-file-find-clear'
 const SKILL_ID = 'comfy-desktop-studio-chat-skill'
 const SKILL_RUN_ID = 'comfy-desktop-studio-chat-skill-run'
+const RENDER_ID = 'comfy-desktop-studio-chat-render'
+const RENDER_RUN_ID = 'comfy-desktop-studio-chat-render-run'
+const RENDER_ARGS_ID = 'comfy-desktop-studio-chat-render-args'
+const RENDER_ARG_PREFIX = 'comfy-desktop-studio-chat-render-arg-'
+const RENDER_IMAGES_ID = 'comfy-desktop-studio-chat-render-images'
 const FIND_ID = 'comfy-desktop-studio-chat-find'
 const FIND_COUNT_ID = 'comfy-desktop-studio-chat-find-count'
 const FIND_PREV_ID = 'comfy-desktop-studio-chat-find-prev'
@@ -4223,6 +4228,353 @@ describe('getComfyStudioChatContentScript', () => {
       await send('你刚说的那个再跑一遍')
 
       expect(skillSelect().value).toBe('text-to-video')
+    })
+  })
+
+  describe('一键跑渲染目标', () => {
+    /**
+     * 宿主 renders/list 里的一条目标（形状见 lib/comfy_studio/renders/catalog.py 的 to_json）：
+     * params 用的是与 skill 同一套字段（name/type/required/default/hasDefault/description），
+     * referenceImages 说明这只目标收不收参考图（视频那几只收）。
+     */
+    const target = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+      id: 'character-board',
+      title: '角色定妆板',
+      description: '给一个角色出定妆板',
+      file: '01_角色定妆板_Qwen2512.json',
+      fileExists: true,
+      tags: ['image'],
+      referenceImages: false,
+      params: [
+        {
+          name: 'prompt',
+          type: 'string',
+          required: true,
+          default: null,
+          hasDefault: false,
+          description: '这个角色长什么样'
+        }
+      ],
+      ...over
+    })
+
+    const listing = (targets: unknown[], over: Record<string, unknown> = {}): unknown => ({
+      ok: true,
+      result: {
+        workflows_dir: 'D:/comfy/user/default/workflows/AIGC中国风漫剧',
+        note: null,
+        targets,
+        ...over
+      }
+    })
+
+    /** 跑完一次的引擎回包，形状与 skill 那次同一份（多 notes / saved 两样）。 */
+    const runResult = (over: Record<string, unknown> = {}): unknown => ({
+      ok: true,
+      result: {
+        target_id: 'character-board',
+        isError: false,
+        text: '跑完了',
+        data: {
+          images: [
+            {
+              filename: 'comfy-studio_00001_.png',
+              url: 'http://127.0.0.1:8188/view?filename=comfy-studio_00001_.png&type=output'
+            }
+          ]
+        },
+        ...over
+      }
+    })
+
+    /** 只有 renders/* 那两件事走自己的桩；开抽屉要问的那些保持默认。 */
+    const host =
+      (handlers: Record<string, unknown>): RequestStub =>
+      (method, params) =>
+        method in handlers
+          ? typeof handlers[method] === 'function'
+            ? (handlers[method] as RequestStub)(method, params)
+            : handlers[method]
+          : { ok: true, result: { text: '答案在此' } }
+
+    const renderSelect = (): HTMLSelectElement =>
+      document.getElementById(RENDER_ID) as HTMLSelectElement
+    const runButton = (): HTMLButtonElement =>
+      document.getElementById(RENDER_RUN_ID) as HTMLButtonElement
+    const argBox = (name: string): HTMLInputElement =>
+      document.getElementById(RENDER_ARG_PREFIX + name) as HTMLInputElement
+    const imagesBox = (): HTMLInputElement | null =>
+      document.getElementById(RENDER_IMAGES_ID) as HTMLInputElement | null
+    const card = (): Element | null => rows('render')[0] ?? null
+    const runCalls = (bridge: StudioBridge): unknown[][] =>
+      bridge.request.mock.calls.filter((call: unknown[]) => call[0] === 'renders/run')
+
+    /** 开面板 + 选目标 + 跑一遍（用例里几乎每个都要这几步）。 */
+    const runOnce = async (
+      handlers: Record<string, unknown> = {},
+      pick = 'character-board'
+    ): Promise<{ bridge: StudioBridge; card: Element | null }> => {
+      const bridge = installBridge({ request: host(handlers) })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      if (pick !== '') {
+        renderSelect().value = pick
+        renderSelect().dispatchEvent(new Event('change'))
+      }
+      runButton().click()
+      await flush()
+      await flush()
+      return { bridge, card: card() }
+    }
+
+    it('lists what the engine reported, and marks the ones whose workflow file is gone', async () => {
+      installBridge({
+        request: host({
+          'renders/list': listing([
+            target(),
+            target({
+              id: 'video-draft',
+              title: '视频试片',
+              file: '06_视频试片.json',
+              fileExists: false,
+              tags: ['video'],
+              referenceImages: true
+            })
+          ])
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      expect(renderSelect().options).toHaveLength(2)
+      // 缺文件那几条在下拉里就标出来：点下去才发现跑不起来，比提前说一句坏得多。
+      expect(renderSelect().options[1]?.textContent).toBe('视频试片（工作流文件没找到）')
+      expect(runButton().disabled, 'the first one is fine, so the button is usable').toBe(false)
+    })
+
+    it('asks for the parameters a workflow has no default for, and sends exactly those', async () => {
+      const { bridge } = await runOnce({
+        'renders/list': listing([target()]),
+        'renders/run': () => runResult()
+      })
+
+      // 面板替它编一句提示词不会报错，只会出另一张图 —— 所以那个框得由用户填（见面板里那一节）。
+      expect(argBox('prompt'), 'the required parameter gets a box').not.toBeNull()
+      expect(runCalls(bridge), 'an empty box must not fire a render').toHaveLength(0)
+      expect(document.getElementById(STATUS_ID)?.textContent).toContain('prompt')
+
+      argBox('prompt').value = '黑衣女刺客，正面半身'
+      runButton().click()
+      await flush()
+      await flush()
+
+      expect(runCalls(bridge)[0]?.[1]).toEqual({
+        target_id: 'character-board',
+        params: { prompt: '黑衣女刺客，正面半身' }
+      })
+    })
+
+    it('only sends the required ones, leaving the workflow picker values alone', async () => {
+      const { bridge } = await runOnce({
+        'renders/list': listing([
+          target({
+            params: [
+              {
+                name: 'prompt',
+                type: 'string',
+                required: true,
+                default: null,
+                hasDefault: false,
+                description: '提示词'
+              },
+              {
+                name: 'width',
+                type: 'integer',
+                required: false,
+                default: 1024,
+                hasDefault: true,
+                description: '宽度'
+              }
+            ]
+          })
+        ]),
+        'renders/run': () => runResult()
+      })
+
+      expect(argBox('width'), 'a parameter with a default is not the panel business').toBeNull()
+      argBox('prompt').value = '一张侧脸'
+      runButton().click()
+      await flush()
+      await flush()
+
+      // 参数表里只有必填那一个：可选的一律照图上原值，面板不替它填 1024。
+      expect(runCalls(bridge)[0]?.[1]).toEqual({
+        target_id: 'character-board',
+        params: { prompt: '一张侧脸' }
+      })
+    })
+
+    it('offers the reference-image box only for the targets that take images', async () => {
+      const video = target({
+        id: 'video-draft',
+        title: '视频试片',
+        tags: ['video'],
+        referenceImages: true,
+        params: []
+      })
+      installBridge({
+        request: host({ 'renders/list': listing([target(), video]) })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      expect(imagesBox(), 'an image target takes no reference image').toBeNull()
+
+      renderSelect().value = 'video-draft'
+      renderSelect().dispatchEvent(new Event('change'))
+
+      expect(imagesBox(), 'a video target can take first/last frames').not.toBeNull()
+    })
+
+    it('hands the reference images over in order, and leaves the key out when there are none', async () => {
+      const video = target({
+        id: 'video-draft',
+        title: '视频试片',
+        tags: ['video'],
+        referenceImages: true,
+        params: []
+      })
+      const { bridge } = await runOnce(
+        { 'renders/list': listing([video]), 'renders/run': () => runResult() },
+        'video-draft'
+      )
+
+      // 没给图就是不带这一项：带个空数组过去，读的人会以为"打算给图但没给"。
+      expect(runCalls(bridge)[0]?.[1]).toEqual({ target_id: 'video-draft', params: {} })
+
+      imagesBox()!.value = 'D:/shots/first.png; D:/shots/last.png'
+      runButton().click()
+      await flush()
+      await flush()
+
+      expect(runCalls(bridge)[1]?.[1]).toEqual({
+        target_id: 'video-draft',
+        params: {},
+        images: ['D:/shots/first.png', 'D:/shots/last.png']
+      })
+    })
+
+    it('shows a finished video as a video, not as a broken image', async () => {
+      const video = target({
+        id: 'video-draft',
+        title: '视频试片',
+        tags: ['video'],
+        referenceImages: true,
+        params: []
+      })
+      const { card: painted } = await runOnce(
+        {
+          'renders/list': listing([video]),
+          // 产物不都是图：视频目标出 mp4，拿 <img> 去装它只会得到"这张图加载不出来"。
+          'renders/run': () =>
+            runResult({
+              target_id: 'video-draft',
+              data: {
+                images: [
+                  {
+                    filename: 'shot_00001_.mp4',
+                    url: 'http://127.0.0.1:8188/view?filename=shot_00001_.mp4'
+                  }
+                ]
+              }
+            })
+        },
+        'video-draft'
+      )
+
+      expect(painted?.querySelector('video[data-media="video"]')).not.toBeNull()
+      expect(painted?.querySelector('img')).toBeNull()
+      expect(painted?.textContent).toContain('shot_00001_.mp4')
+    })
+
+    it('puts the engine complaint on the card when the run itself failed', async () => {
+      installBridge({
+        request: host({
+          'renders/list': listing([target()]),
+          'renders/run': () => runResult({ isError: true, text: '显存不够：把另一张图先关掉' })
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      // 必填没填时那次点击不发请求，所以卡也要等填完之后才会有。
+      argBox('prompt').value = '一张脸'
+      runButton().click()
+      await flush()
+      await flush()
+
+      const painted = card()
+      expect(painted?.getAttribute('data-state')).toBe('error')
+      expect(painted?.textContent).toContain('显存不够')
+      expect(document.getElementById(STATUS_ID)?.textContent).toContain('失败')
+    })
+
+    it('says the workflow file is gone instead of running into a late error', async () => {
+      const { bridge } = await runOnce({
+        'renders/list': listing([target({ fileExists: false, params: [] })])
+      })
+
+      // 文件缺了这一趟必跑不起来（引擎那边也会报），但话说在前面，别让人等到模型加载完。
+      expect(runCalls(bridge), 'nothing to run without the workflow').toHaveLength(0)
+      expect(document.getElementById(STATUS_ID)?.textContent).toContain('工作流文件不在')
+    })
+
+    it('keeps the directory and the engine note on the picker instead of hiding them', async () => {
+      installBridge({
+        request: host({
+          'renders/list': listing([target({ params: [] })], {
+            workflows_dir: 'D:/comfy/user/default/workflows',
+            note: '工作流目录不存在: D:/comfy/user/default/workflows'
+          })
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      // 目标表是引擎侧代码定死的，目录整个不在时下拉里照样有 12 条 —— 那得让人看得见图该去哪儿找。
+      expect(renderSelect().title).toContain('D:/comfy/user/default/workflows')
+      expect(renderSelect().title).toContain('工作流目录不存在')
+    })
+
+    it('says so when the engine reported no targets at all', async () => {
+      installBridge({ request: host({ 'renders/list': listing([]) }) })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      expect(renderSelect().options[0]?.textContent).toBe('（引擎没报出渲染目标）')
+      expect(runButton().disabled).toBe(true)
+      // 参数区也不该空着占一块地方，那看着像"漏了输入框"。
+      expect((document.getElementById(RENDER_ARGS_ID) as HTMLElement).style.display).toBe('none')
+    })
+
+    it('refuses a second run while one is still going', async () => {
+      const { bridge } = await runOnce({
+        'renders/list': listing([target({ params: [] })]),
+        // 这一趟一直挂着：渲染要占满显存好些分钟，叠着跑两边都慢（与技能那边同一个口径）。
+        'renders/run': () => new Promise(() => {})
+      })
+
+      runButton().click()
+      await flush()
+
+      expect(runCalls(bridge)).toHaveLength(1)
+      expect(document.getElementById(STATUS_ID)?.textContent).toContain('还在跑')
     })
   })
 

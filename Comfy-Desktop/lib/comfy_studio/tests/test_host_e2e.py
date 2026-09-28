@@ -517,6 +517,9 @@ class StudioHostE2ETest(unittest.TestCase):
         self.assertEqual(info.get("name"), "comfy-studio-desktop")
         self.assertIn("agent/chat", info.get("methods", []))
         self.assertIn("skills/run", info.get("methods", []))
+        # 渲染目标那两条与 skills 一起挂上来（面板的两块入口走同一套 RPC）。
+        self.assertIn("renders/list", info.get("methods", []))
+        self.assertIn("renders/run", info.get("methods", []))
         # 状态里如实报出各条回程通道挂没挂：画布没开，审核与计划开了（见启动参数）。
         self.assertIs(info.get("canvas"), False)
         self.assertIs(info.get("review"), True)
@@ -1033,6 +1036,43 @@ class StudioHostE2ETest(unittest.TestCase):
             self.assertEqual(response.get("error", {}).get("code"), -32602, response)
         # 被拒的值不该改掉当前选择
         self.assertEqual(self.call(211, "agent/agent").get("result", {}).get("agent"), "general")
+
+
+    def test_25_renders_catalog_comes_from_the_engine(self) -> None:
+        """渲染目标：宿主读的就是引擎那份表（**跨进程契约**的机械核对）。
+
+        工具名在引擎 ``mcp/tools.py`` 与宿主 ``renders/catalog.py`` 各写了一遍；写错时宿主会
+        明说"没有这把工具"而不是回一张空表，这条用例就是那种错法的探测器。
+        """
+        listing = self.call(220, "renders/list", timeout=SKILLS_TIMEOUT).get("result", {})
+        targets = listing.get("targets")
+        self.assertIsInstance(targets, list, listing)
+        self.assertGreaterEqual(len(targets), 12, listing)
+        self.assertTrue(listing.get("workflows_dir"), "引擎报的工作流目录要一路带出来")
+        by_id = {target["id"]: target for target in targets}
+        self.assertIn("video-draft", by_id)
+        # 参数形状与 skill 那边**逐字同键**（引擎侧那条守卫的跨进程版）：面板只认一套字段。
+        for target in targets:
+            self.assertIsInstance(target.get("fileExists"), bool, target)
+            self.assertIsInstance(target.get("params"), list, target)
+            for param in target["params"]:
+                self.assertEqual(
+                    set(param),
+                    {"name", "type", "required", "default", "description", "hasDefault"},
+                    param,
+                )
+
+    def test_26_unknown_render_target_is_minus_32602(self) -> None:
+        """目标 id 写错是**参数问题**（-32602），而且回话里要列出手上能用的 id。"""
+        self.call(221, "renders/list", timeout=SKILLS_TIMEOUT)
+        response = self.call(222, "renders/run", {"target_id": "看板", "params": {}})
+        self.assertEqual(response.get("error", {}).get("code"), -32602, response)
+        self.assertIn("video-draft", json.dumps(response, ensure_ascii=False))
+
+    def test_27_render_run_dislikes_a_wrong_shaped_images(self) -> None:
+        """``images`` 给成一条字符串是最常见的手滑：当场按参数错误挡掉，不送进引擎去跑。"""
+        response = self.call(223, "renders/run", {"target_id": "video-draft", "images": "a.png"})
+        self.assertEqual(response.get("error", {}).get("code"), -32602, response)
 
 
 if __name__ == "__main__":

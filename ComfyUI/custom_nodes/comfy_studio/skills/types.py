@@ -77,13 +77,18 @@ class Skill:
 
 
 @dataclass(frozen=True)
-class SkillOutputImage:
-    """一次运行产出的单张图片。"""
+class SkillOutputMedia:
+    """一次运行产出的单个文件（图 / 视频 / 音频）。
+
+    ``kind`` 只能按扩展名判，不能按键名：``SaveVideo`` 的视频同样挂在 history 的
+    ``images`` 键下（出处见 ``skills/outputs.py`` 顶部）。判据是 ``outputs.guess_kind``。
+    """
 
     node: str
     filename: str
     subfolder: str
     type: str
+    kind: str
 
     def url(self, base_url: str) -> str:
         """拼出可直接 GET 的 /view 地址（与 server.py 的 view_image 参数一致）。"""
@@ -92,26 +97,42 @@ class SkillOutputImage:
         query = urlencode({"filename": self.filename, "subfolder": self.subfolder, "type": self.type})
         return f"{base_url.rstrip('/')}/view?{query}"
 
+    def to_json(self, base_url: str) -> dict[str, Any]:
+        return {
+            "node": self.node,
+            "filename": self.filename,
+            "subfolder": self.subfolder,
+            "type": self.type,
+            "kind": self.kind,
+            "url": self.url(base_url),
+        }
+
 
 @dataclass(frozen=True)
 class SkillRunResult:
     """run_skill 的返回值。"""
 
     prompt_id: str
-    images: tuple[SkillOutputImage, ...]
+    media: tuple[SkillOutputMedia, ...]
     outputs: dict[str, Any]
 
+    @property
+    def images(self) -> tuple[SkillOutputMedia, ...]:
+        return tuple(item for item in self.media if item.kind == "image")
+
+    @property
+    def videos(self) -> tuple[SkillOutputMedia, ...]:
+        return tuple(item for item in self.media if item.kind == "video")
+
+    @property
+    def audios(self) -> tuple[SkillOutputMedia, ...]:
+        return tuple(item for item in self.media if item.kind == "audio")
+
     def to_json(self, base_url: str) -> dict[str, Any]:
+        # images 保持原样（面板与 MCP 工具已在用），videos / audios 是这次补上的。
         return {
             "prompt_id": self.prompt_id,
-            "images": [
-                {
-                    "node": img.node,
-                    "filename": img.filename,
-                    "subfolder": img.subfolder,
-                    "type": img.type,
-                    "url": img.url(base_url),
-                }
-                for img in self.images
-            ],
+            "images": [item.to_json(base_url) for item in self.images],
+            "videos": [item.to_json(base_url) for item in self.videos],
+            "audios": [item.to_json(base_url) for item in self.audios],
         }

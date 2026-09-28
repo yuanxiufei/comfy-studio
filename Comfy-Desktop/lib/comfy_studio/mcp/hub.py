@@ -88,4 +88,23 @@ class McpHub:
         return await client.call_tool(tool.name, arguments, cancel=cancel)
 
 
-__all__ = ["McpHub"]
+def resolve_tool(hub: McpHub, server: str, tool: str, *, error: type[Exception]) -> str:
+    """把 ``<server>__<tool>`` 解析成 hub 里真实存在的限定名，不存在就抛 ``error``。
+
+    抽出来是因为 skill 目录与渲染目录各要一份**逐字相同**的报错口径（"手上一个 MCP 工具都没有：
+    MCP server 还没 start()？"这句尤其要一样）—— 抄两份迟早漂成两种说法。
+
+    ``error`` 是各自的领域错误类型（:class:`~comfy_studio.skills.SkillsError` /
+    :class:`~comfy_studio.renders.RendersError`）：调用方按自己的错误族接住它。
+    """
+    name = f"{server}__{tool}"
+    available = {t.qualified_name for t in hub.tools}
+    if name not in available:
+        if not available:
+            raise error("手上一个 MCP 工具都没有：MCP server 还没 start()？")
+        listed = ", ".join(sorted(available)) or "（无）"
+        raise error(f"MCP server {server} 没有工具 {tool}；可用: {listed}")
+    return name
+
+
+__all__ = ["McpHub", "resolve_tool"]

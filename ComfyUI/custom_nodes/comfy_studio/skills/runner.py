@@ -1,4 +1,4 @@
-"""skill 的执行：注入参数 → 入引擎队列 → 等执行结束 → 收集输出图片。
+"""skill 的执行：注入参数 → 入引擎队列 → 等执行结束 → 收集产物（见 outputs.py）。
 
 走的是引擎**进程内**的队列（``server.PromptServer.instance.prompt_queue``），
 不是对着本机端口发 HTTP；因此本模块只能在引擎进程里使用。
@@ -17,8 +17,9 @@ import time
 import uuid
 from typing import Any, Awaitable, Callable
 
+from .outputs import collect_media
 from .params import SEED_RANDOM, merge_params
-from .types import PromptWorkflow, Skill, SkillOutputImage, SkillRunResult
+from .types import PromptWorkflow, Skill, SkillRunResult
 
 # 状态回调：state ∈ {"queued", "running", "done"}，data 里带 prompt_id 等细节。
 StatusCallback = Callable[[str, dict[str, Any]], "Awaitable[None] | None"]
@@ -200,26 +201,6 @@ async def cancel_quietly(prompt_id: str, cancel: CancelFn | None = None) -> None
         )
 
 
-def collect_images(entry: dict[str, Any]) -> tuple[SkillOutputImage, ...]:
-    """从 history 条目的 outputs 里取出图片（结构来源：SaveImage 的 ui.images）。"""
-    images: list[SkillOutputImage] = []
-    for node_id, output in (entry.get("outputs") or {}).items():
-        if not isinstance(output, dict):
-            continue
-        for file in output.get("images") or []:
-            if not isinstance(file, dict) or not file.get("filename"):
-                continue
-            images.append(
-                SkillOutputImage(
-                    node=str(node_id),
-                    filename=str(file["filename"]),
-                    subfolder=str(file.get("subfolder") or ""),
-                    type=str(file.get("type") or "output"),
-                )
-            )
-    return tuple(images)
-
-
 async def run_skill(
     skill: Skill,
     params: dict[str, Any] | None = None,
@@ -240,7 +221,7 @@ async def run_skill(
         raise
     return SkillRunResult(
         prompt_id=prompt_id,
-        images=collect_images(entry),
+        media=collect_media(entry),
         outputs=entry.get("outputs") or {},
     )
 
@@ -253,7 +234,6 @@ __all__ = [
     "build_prompt",
     "cancel_prompt",
     "cancel_quietly",
-    "collect_images",
     "run_skill",
     "submit_prompt",
     "wait_for_prompt",

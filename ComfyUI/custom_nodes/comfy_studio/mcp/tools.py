@@ -29,7 +29,8 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from ..engine import EngineClient, EngineError
-from ..skills import PARAM_TYPES, Skill, SkillRegistry
+from ..skills import PARAM_TYPES, Skill, SkillRegistry, param_entry, save_media_batch
+from ..skills.render import prepare_render, render_listing, workflows_dir
 from ..web import (
     SEARCH_BACKEND_BING,
     SEARCH_BACKEND_SEARXNG,
@@ -101,7 +102,34 @@ def schema_for(skill: Skill) -> dict[str, Any]:
     return schema
 
 
+def _string_list(args: dict[str, Any], key: str) -> tuple[str, ...]:
+    """取一个"字符串数组"参数。给了别的形状就报错 —— 只给一条字符串是最常见的手滑，
+    静默当成一项会让"少接了一张图"变成一场没人发现的猜谜。"""
+    value = args.get(key) or ()
+    if isinstance(value, str):
+        raise ValueError(f"{key} 必须是数组（哪怕只有一项也要写成 [\"…\"]）")
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{key} 必须是字符串数组")
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"{key} 里每一项都要是非空字符串")
+    return tuple(value)
+
+
+def _optional_number(args: dict[str, Any], key: str) -> float | None:
+    """取一个可选的正数参数；不给就是 ``None``（由下游按图上的帧数折算）。"""
+    value = args.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{key} 必须是数字")
+    if value <= 0:
+        raise ValueError(f"{key} 必须大于 0，给的是 {value}")
+    return float(value)
+
+
 def _require_str(args: dict[str, Any], key: str) -> str:
+    """取一个必填的非空字符串参数。"""
     value = args.get(key)
     if not isinstance(value, str) or value == "":
         raise ValueError(f"缺少参数 {key}（应为非空字符串）")
@@ -109,23 +137,18 @@ def _require_str(args: dict[str, Any], key: str) -> str:
 
 
 def skill_entry(skill: Skill) -> dict[str, Any]:
-    """skill 在工具返回值里的统一形状（``comfy_list_skills`` 与 ``comfy_save_skill`` 共用）。"""
+    """skill 在工具返回值里的统一形状（``comfy_list_skills`` 与 ``comfy_save_skill`` 共用）。
+
+    参数形状取自 :func:`~comfy_studio.skills.params.param_entry` —— 渲染目标那边也用同一份，
+    免得前端要对两套键名。
+    """
     return {
         "id": skill.id,
         "title": skill.title,
         "description": skill.description,
         "tags": list(skill.tags),
         "file": skill.source,
-        "params": [
-            {
-                "name": p.name,
-                "type": p.type,
-                "required": p.required,
-                "default": p.default if p.has_default else None,
-                "description": p.hint(),
-            }
-            for p in skill.params
-        ],
+        "params": [param_entry(p) for p in skill.params],
     }
 
 
@@ -279,6 +302,32 @@ def build_tools(
         await engine.interrupt()
         return text_result("interrupted")
 
+    async def list_renders(_args: dict[str, Any]) -> Any:
+        # 装配只有一处（render.render_listing），面板那条 GET 路由取的也是它。
+        return text_result(render_listing(workflows_dir()))
+
+    async def render_target(args: dict[str, Any]) -> Any:
+        target_id = _require_str(args, "target_id")
+        params = args.get("params") or {}
+        if not isinstance(params, dict):
+            raise ValueError("params 必须是对象")
+        images = _string_list(args, "images")
+        duration_sec = _optional_number(args, "duration_sec")
+        output_dir = args.get("output_dir")
+        if output_dir is not None and (not isinstance(output_dir, str) or not output_dir.strip()):
+            raise ValueError("output_dir 必须是目录路径（不给就只回引擎里那些产物的地址）")
+
+        plan = await prepare_render(engine, target_id, images=images, duration_sec=duration_sec)
+        result = await engine.run_skill(plan.skill, params)
+        payload: dict[str, Any] = {**result.to_json(engine.base_url), "target": plan.target.id}
+        # 组装期的让步（时长是按帧数折的、接的是外部组）必须带给模型：它可能据此改提示词或改接法。
+        if plan.notes:
+            payload["notes"] = list(plan.notes)
+        if output_dir is not None:
+            saved = await save_media_batch(result.media, output_dir, base_url=engine.base_url)
+            payload["saved"] = [str(path) for path in saved]
+        return text_result(payload)
+
     tools = [
         Tool(
             name="comfy_list_models",
@@ -403,6 +452,45 @@ def build_tools(
             description="中断当前正在执行的任务",
             input_schema={"type": "object", "properties": {}},
             handler=interrupt,
+        ),
+        Tool(
+            name="comfy_list_renders",
+            description=(
+                "列出这台机器上配好的**渲染目标**（角色定妆板 / 场景卡 / 视频试片 / 音乐 / 补帧 …）："
+                "每个目标对应一张现成的生产工作流 + 一列可填参数，用 comfy_render 跑它。"
+                "先看这里再动手 —— 目标 id 与参数名不要猜；file_exists=false 表示那张图不在"
+            ),
+            input_schema={"type": "object", "properties": {}},
+            handler=list_renders,
+        ),
+        Tool(
+            name="comfy_render",
+            description=(
+                "跑一个渲染目标并等待完成，返回产物地址（给了 output_dir 就落盘并回文件路径）。"
+                "参数定义与目标 id 由 comfy_list_renders 给出。"
+                "images 只在视频目标上有用：按顺序对应提示词里的「图片1、图片2…」"
+                "（试片/母版是首帧、尾帧；多镜连贯是参考素材），是**这台机器上的文件路径**，"
+                "内部会先搬进引擎 input/。这种时候 duration_sec 最好显式给（不给按图上帧数折算）"
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "target_id": {"type": "string", "description": "渲染目标 id，见 comfy_list_renders"},
+                    "params": {"type": "object", "description": "该目标的参数（名字见 comfy_list_renders）"},
+                    "images": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "参考图/首尾帧的文件路径，按「图片1、图片2…」顺序；只有视频目标收",
+                    },
+                    "duration_sec": {
+                        "type": "number",
+                        "description": "每组时长（秒）。接了参考图（外部组）时组的这个字段必填，不给就按图上帧数折算",
+                    },
+                    "output_dir": {"type": "string", "description": "给就把产物落进这个目录并按顺序回路径"},
+                },
+                "required": ["target_id"],
+            },
+            handler=render_target,
         ),
     ]
 
