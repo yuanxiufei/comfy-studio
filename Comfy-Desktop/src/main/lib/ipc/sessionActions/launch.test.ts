@@ -1103,6 +1103,15 @@ describe('core beta report placement', () => {
     expect(reportedEvents()).toContain('comfy.desktop.core_beta.opt_state')
   })
 
+  /** An empty file to point `GIT_CONFIG_GLOBAL` at. `os.devNull` is `\\.\nul` on Windows, which
+   *  git-for-windows refuses to read as the global config ("unable to access ... Invalid
+   *  argument"), taking the whole `git init` down with it. */
+  function emptyGitConfig(): string {
+    const file = path.join(os.tmpdir(), 'core-beta-launch-test-gitconfig')
+    fs.writeFileSync(file, '')
+    return file
+  }
+
   function gitInitComfyUI(): string {
     const cwd = path.join(installDir, 'ComfyUI')
     const env = {
@@ -1112,7 +1121,7 @@ describe('core beta report placement', () => {
       GIT_COMMITTER_NAME: 't',
       GIT_COMMITTER_EMAIL: 't@example.com',
       GIT_CONFIG_NOSYSTEM: '1',
-      GIT_CONFIG_GLOBAL: os.devNull
+      GIT_CONFIG_GLOBAL: emptyGitConfig()
     }
     execFileSync('git', ['init', '-q'], { cwd, env })
     execFileSync('git', ['commit', '--allow-empty', '-q', '-m', 'c'], { cwd, env })

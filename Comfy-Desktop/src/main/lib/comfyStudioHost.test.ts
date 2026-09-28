@@ -89,7 +89,12 @@ describe('resolveEngineStorageDirs', () => {
 
   it('关掉共享时改用 per-install 字段', () => {
     const dirs = resolveEngineStorageDirs(
-      makeInstall({ useSharedInput: false, useSharedOutput: false, inputDir: '/own/in', outputDir: '/own/out' })
+      makeInstall({
+        useSharedInput: false,
+        useSharedOutput: false,
+        inputDir: '/own/in',
+        outputDir: '/own/out'
+      })
     )
 
     expect(dirs).toEqual({ inputDir: '/own/in', outputDir: '/own/out' })
@@ -98,7 +103,9 @@ describe('resolveEngineStorageDirs', () => {
   it('关掉共享又没有 per-install 目录时给 null，让两边一起回落到 <base>/{input,output}', () => {
     // 引擎那次启动不会注入 --input-directory/--output-directory，宿主也不该硬塞一个，
     // 否则两边算出来的就不是同一个目录了。
-    const dirs = resolveEngineStorageDirs(makeInstall({ useSharedInput: false, useSharedOutput: false }))
+    const dirs = resolveEngineStorageDirs(
+      makeInstall({ useSharedInput: false, useSharedOutput: false })
+    )
 
     expect(dirs).toEqual({ inputDir: null, outputDir: null })
   })
@@ -132,7 +139,9 @@ describe('resolveStudioCommand', () => {
     // import_file 拷进去的素材引擎读不到、list_files 报的产出路径也是错的。
     expect(argValue(command.args, '--input-dir')).toBe('/global/in')
     expect(argValue(command.args, '--output-dir')).toBe('/global/out')
-    expect(argValue(command.args, '--comfyui-dir')).toBe(path.join(installation.installPath, 'ComfyUI'))
+    expect(argValue(command.args, '--comfyui-dir')).toBe(
+      path.join(installation.installPath, 'ComfyUI')
+    )
     expect(command.comfyuiDir).toBe(path.join(installation.installPath, 'ComfyUI'))
   })
 

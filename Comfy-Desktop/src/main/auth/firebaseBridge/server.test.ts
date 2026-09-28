@@ -2,11 +2,24 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { BRIDGE_PORT, startBridgeServer } from './server'
 
-// oauth.ts goes through Chromium's net.fetch; delegate to the global fetch so
-// the raw-OAuth initiator arm keeps its pre-existing live-call behavior here.
-vi.mock('electron', () => ({
-  net: { fetch: (...args: Parameters<typeof fetch>) => globalThis.fetch(...args) }
-}))
+// oauth.ts reaches Identity Toolkit through Chromium's net.fetch. Answer it from a fixture rather
+// than delegating to the global fetch: a live call makes the raw-OAuth test depend on Google being
+// reachable, and it then hangs into its 5s timeout wherever the network is closed.
+const netFetch = vi.hoisted(() =>
+  vi.fn(async (url: string) => {
+    if (url.includes('/accounts:createAuthUri')) {
+      return new Response(
+        JSON.stringify({
+          authUri: 'https://accounts.google.com/o/oauth2/v2/auth?client_id=test-client-id',
+          sessionId: 'test-session-id'
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    }
+    throw new Error(`unexpected net.fetch in this test: ${url}`)
+  })
+)
+vi.mock('electron', () => ({ net: { fetch: (url: string) => netFetch(url) } }))
 
 describe('startBridgeServer', () => {
   it('serves a 204 for /favicon.ico', async () => {

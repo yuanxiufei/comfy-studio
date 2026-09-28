@@ -185,7 +185,9 @@ describe('handleDelete lock detail', () => {
     const details = await runDelete({ ok: false, reason: 'timeout' })
     expect(details).toHaveLength(1)
     expect(details[0]).toContain('errors.deleteLockedUnidentified')
-    expect(details[0]).toContain(h.lockedPath.value)
+    // The stub formats the params as JSON, so the path arrives escaped inside the payload: on
+    // Windows `C:\dir\main.py` is spelled `C:\\dir\\main.py` there.
+    expect(details[0]).toContain(JSON.stringify(h.lockedPath.value).slice(1, -1))
   })
 
   it('says the same when the platform tool could not be run at all', async () => {

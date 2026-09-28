@@ -16,6 +16,15 @@ import { commitPresence } from './git'
 import { selectCoreBetaGrantArgs } from './coreBetaGrants'
 import type { CoreBetaGrant, CoreVersionState } from './coreBetaGrants'
 
+/** An empty file to point `GIT_CONFIG_GLOBAL` at. `os.devNull` is `\\.\nul` on Windows, which
+ *  git-for-windows refuses to read as the global config ("unable to access ... Invalid
+ *  argument"), taking every git call in this file down with it. */
+function emptyGitConfig(): string {
+  const file = path.join(os.tmpdir(), 'core-beta-ancestry-gitconfig')
+  fs.writeFileSync(file, '')
+  return file
+}
+
 function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', args, {
     cwd,
@@ -27,7 +36,7 @@ function git(cwd: string, ...args: string[]): string {
       GIT_COMMITTER_NAME: 't',
       GIT_COMMITTER_EMAIL: 't@example.com',
       GIT_CONFIG_NOSYSTEM: '1',
-      GIT_CONFIG_GLOBAL: os.devNull
+      GIT_CONFIG_GLOBAL: emptyGitConfig()
     }
   }).trim()
 }

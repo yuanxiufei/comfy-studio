@@ -59,7 +59,11 @@ function fail(message, hint) {
 
 function git(args, cwd) {
   try {
-    return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
+    return execFileSync('git', args, {
+      cwd,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore']
+    }).trim()
   } catch {
     return ''
   }
@@ -108,7 +112,8 @@ function upstreamBaseline() {
     return fail(`读不了 ${file}：${err.message}`)
   }
   for (const key of ['repo', 'commit', 'branch']) {
-    if (!desc[key]) return fail(`${file} 没记 ${key}：认不出压在哪份上游上`, '升级上游时同步改这份自述')
+    if (!desc[key])
+      return fail(`${file} 没记 ${key}：认不出压在哪份上游上`, '升级上游时同步改这份自述')
   }
   return {
     commit: desc.commit,
@@ -126,11 +131,14 @@ function upstreamBaseline() {
 const embedded = !fs.existsSync(path.join(comfyDir, '.git'))
 const baseline = embedded ? upstreamBaseline() : null
 
-const branch = embedded ? baseline.branch : git(['rev-parse', '--abbrev-ref', 'HEAD'], comfyDir) || 'master'
+const branch = embedded
+  ? baseline.branch
+  : git(['rev-parse', '--abbrev-ref', 'HEAD'], comfyDir) || 'master'
 const commit = embedded ? baseline.commit : git(['rev-parse', 'HEAD'], comfyDir) || ''
 const repo = embedded
   ? baseline.repo
-  : git(['config', '--get', 'remote.origin.url'], comfyDir) || 'https://github.com/Comfy-Org/ComfyUI.git'
+  : git(['config', '--get', 'remote.origin.url'], comfyDir) ||
+    'https://github.com/Comfy-Org/ComfyUI.git'
 const commitMessage = embedded
   ? `${commit.slice(0, 8)} 上游基线${baseline.version ? ` ${baseline.version}` : ''}${baseline.subject ? `：${baseline.subject}` : ''}（已入库）`
   : `${commit.slice(0, 8)} (本仓检出)`
@@ -170,7 +178,9 @@ fs.mkdirSync(userDataDir, { recursive: true })
 const installationsFile = path.join(userDataDir, 'installations.json')
 const existing = readJsonIfExists(installationsFile)
 const records = Array.isArray(existing) ? existing : []
-const idx = records.findIndex((r) => r && (r.id === record.id || r.installPath === record.installPath))
+const idx = records.findIndex(
+  (r) => r && (r.id === record.id || r.installPath === record.installPath)
+)
 if (idx >= 0) records[idx] = { ...records[idx], ...record }
 else records.push(record)
 fs.writeFileSync(installationsFile, JSON.stringify(records, null, 2))
@@ -193,9 +203,15 @@ console.log(
 console.log(`     写入        : ${installationsFile}`)
 console.log(`     写入        : ${settingsFile}  (firstUseCompleted=true)`)
 if (embedded) {
-  console.log('\n     注意        : ComfyUI 已整份收进父仓库（自己没有 .git）：起壳与跑引擎都不受影响，')
-  console.log('                   但桌面详情页里依赖 .git 的动作（git pull 之类）对这个安装不可用。')
-  console.log('                   要更新上游：另行 clone 上游到临时目录，把内容搬回来，再改引擎树里那份')
+  console.log(
+    '\n     注意        : ComfyUI 已整份收进父仓库（自己没有 .git）：起壳与跑引擎都不受影响，'
+  )
+  console.log(
+    '                   但桌面详情页里依赖 .git 的动作（git pull 之类）对这个安装不可用。'
+  )
+  console.log(
+    '                   要更新上游：另行 clone 上游到临时目录，把内容搬回来，再改引擎树里那份'
+  )
   console.log('                   custom_nodes/comfy_studio/upstream-baseline.json 的基线。')
 }
 console.log('\n     下一步起壳：npm run dev\n')

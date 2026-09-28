@@ -141,6 +141,10 @@ function readShallowGrafts(repoPath: string): string[] | null {
     const common = fs.existsSync(commondir)
       ? path.resolve(gitDir, fs.readFileSync(commondir, 'utf-8').trim())
       : gitDir
+    // The marker can only live in a directory. Windows reports ENOENT - not ENOTDIR - for a path
+    // under a plain file, so a `commondir` that does not name a directory has to be caught here;
+    // below, its ENOENT would otherwise read as a proven absence, i.e. a complete clone.
+    if (!fs.statSync(common).isDirectory()) return null
     const file = path.join(common, 'shallow')
     try {
       fs.statSync(file)

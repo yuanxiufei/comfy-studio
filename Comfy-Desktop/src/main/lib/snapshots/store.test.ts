@@ -80,6 +80,18 @@ const mockedReadGitHead = vi.mocked(readGitHead)
 const mockedScanCustomNodes = vi.mocked(scanCustomNodes)
 
 /**
+ * The key one file lives under in the memory below, and a real filesystem answers
+ * to any spelling of the same path. The store reaches a snapshot both ways -
+ * `writeSnapshot`/`listSnapshots` through `path.join`, `loadSnapshot` through
+ * `path.resolve`, which on Windows adds the drive letter (`\test\install` ->
+ * `d:\test\install`) - so keying on the resolved path is what keeps the two from
+ * reading as two different files.
+ */
+function memoryKey(filePath: string): string {
+  return path.resolve(filePath)
+}
+
+/**
  * Stateful in-memory `fs.promises` mock — `writeFile`/`rename` route into a
  * Map keyed by absolute path; `readdir`/`readFile`/`unlink` read from the same
  * Map. Lets us drive `captureSnapshotIfChanged`'s `loadSnapshot` /
@@ -89,31 +101,31 @@ const mockedScanCustomNodes = vi.mocked(scanCustomNodes)
 function installFsMemory(): Map<string, string> {
   const memory = new Map<string, string>()
   vi.mocked(fs.promises.writeFile).mockImplementation(async (p, data) => {
-    memory.set(String(p), String(data))
+    memory.set(memoryKey(String(p)), String(data))
   })
   vi.mocked(fs.promises.rename).mockImplementation(async (from, to) => {
-    const data = memory.get(String(from))
+    const data = memory.get(memoryKey(String(from)))
     if (data === undefined) throw new Error(`rename: missing ${String(from)}`)
-    memory.set(String(to), data)
-    memory.delete(String(from))
+    memory.set(memoryKey(String(to)), data)
+    memory.delete(memoryKey(String(from)))
   })
   vi.mocked(fs.promises.readdir).mockImplementation(async (dir) => {
-    const prefix = String(dir).replace(/[\\/]+$/, '') + path.sep
+    const prefix = memoryKey(String(dir).replace(/[\\/]+$/, '')) + path.sep
     const files: string[] = []
-    for (const key of memory.keys()) {
-      if (key.startsWith(prefix) && !key.slice(prefix.length).includes(path.sep)) {
-        files.push(key.slice(prefix.length))
+    for (const stored of memory.keys()) {
+      if (stored.startsWith(prefix) && !stored.slice(prefix.length).includes(path.sep)) {
+        files.push(stored.slice(prefix.length))
       }
     }
     return files as unknown as Awaited<ReturnType<typeof fs.promises.readdir>>
   })
   vi.mocked(fs.promises.readFile).mockImplementation(async (p) => {
-    const data = memory.get(String(p))
+    const data = memory.get(memoryKey(String(p)))
     if (data === undefined) throw new Error(`readFile: missing ${String(p)}`)
     return data as unknown as Awaited<ReturnType<typeof fs.promises.readFile>>
   })
   vi.mocked(fs.promises.unlink).mockImplementation(async (p) => {
-    memory.delete(String(p))
+    memory.delete(memoryKey(String(p)))
   })
   return memory
 }
@@ -327,12 +339,10 @@ describe('captureSnapshotIfChanged telemetry', () => {
       }
     }
     const lastFilename = 'last.json'
-    // loadSnapshot reads through `resolveSnapshotPath` which uses
-    // `path.resolve` — on Windows that prepends the drive letter, so the
-    // memory key has to be the resolved absolute path, not a path.join
-    // form, or the readFile mock won't find it.
+    // `memoryKey` is the spelling the mocked fs stores under, whichever way the
+    // reader addresses the same file.
     memory.set(
-      path.resolve('/test/install', '.launcher', 'snapshots', lastFilename),
+      memoryKey(path.join('/test/install', '.launcher', 'snapshots', lastFilename)),
       JSON.stringify(matching)
     )
 
@@ -373,7 +383,7 @@ describe('captureSnapshotIfChanged telemetry', () => {
     // `listSnapshots`).
     const intermediateFilename = '20260101_120000_000-restart-aaaaaa.json'
     memory.set(
-      path.join('/test/install', '.launcher', 'snapshots', intermediateFilename),
+      memoryKey(path.join('/test/install', '.launcher', 'snapshots', intermediateFilename)),
       JSON.stringify(intermediate)
     )
 
@@ -440,7 +450,7 @@ describe('ensureCurrentSnapshotOnTop', () => {
 
   function seedTopSnapshot(memory: Map<string, string>, snapshot: object, filename: string): void {
     memory.set(
-      path.join('/test/install', '.launcher', 'snapshots', filename),
+      memoryKey(path.join('/test/install', '.launcher', 'snapshots', filename)),
       JSON.stringify(snapshot)
     )
   }
@@ -461,17 +471,19 @@ describe('ensureCurrentSnapshotOnTop', () => {
     // The imported snapshot is kept (retry can still use it).
     expect(
       memory.has(
-        path.join(
-          '/test/install',
-          '.launcher',
-          'snapshots',
-          '20250101_000000_000-manual-imported.json'
+        memoryKey(
+          path.join(
+            '/test/install',
+            '.launcher',
+            'snapshots',
+            '20250101_000000_000-manual-imported.json'
+          )
         )
       )
     ).toBe(true)
     // The written snapshot records the live commit.
     const written = JSON.parse(
-      memory.get(path.join('/test/install', '.launcher', 'snapshots', result.filename!))!
+      memory.get(memoryKey(path.join('/test/install', '.launcher', 'snapshots', result.filename!)))!
     )
     expect(written.comfyui.commit).toBe('abc1234')
     expect(written.trigger).toBe('post-restore')
