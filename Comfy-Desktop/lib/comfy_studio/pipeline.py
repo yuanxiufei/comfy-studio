@@ -50,11 +50,13 @@ from .novels import NovelLibrary, NovelsError, resolve_novel
 from .projects import DEFAULT_EPISODES, ProjectLibrary
 from .projects_spec import (
     PROJECT_DIRS,
+    ROOT_INPUT,
     STAGE_BY_CODE,
     STAGE_ORDER,
     STEP_ORDER,
     WORKBENCH_STEPS,
     resolve_project,
+    root_of,
     scan_project,
     stage_how,
     step_gaps,
@@ -231,10 +233,13 @@ STAGE_RENDER: dict[str, tuple[tuple[str, str], ...]] = {
     ),
     # 音频这一类，引擎侧目前**只有主题曲这一张图**（见下面的 STAGE_RENDER_NOTE）。
     "S6": (("music", "11_AUDIO"),),
-    # 成片母版走放大；补帧是可选的那一步。两张都落交付那一格。
+    # 成片母版走放大；补帧是可选的那一步。
+    # 两张都落 `12_FILMS`（**产物根**）—— 它是成片，要被下游按 `名[output]` 注解引用，
+    # 而引擎那条注解读的就是 output 根。落 `00_PROJECT/04_交付与出图`（资料根）的话，
+    # 引用一次要整份拷一遍，而成片动辄几百兆。那张格子仍然留着，放的是**合成单**。
     "S7a": (
-        ("video-upscale", "00_PROJECT/04_交付与出图"),
-        ("video-interpolate", "00_PROJECT/04_交付与出图"),
+        ("video-upscale", "12_FILMS"),
+        ("video-interpolate", "12_FILMS"),
     ),
 }
 
@@ -623,6 +628,7 @@ class NovelToVideoPipeline:
         project: str | os.PathLike[str],
         novel: str | os.PathLike[str] | None = None,
         *,
+        project_out: str | os.PathLike[str] | None = None,
         catalog: AgentCatalog | None = None,
         runner: StageRunner | None = None,
         config: LLMConfig | None = None,
@@ -634,6 +640,17 @@ class NovelToVideoPipeline:
             self.project = Path(resolve_project(str(project)))
         except Exception as err:  # ProjectError：项目不在 / 项目根没探测到
             raise PipelineError(f"项目用不了：{err}") from err
+        # **产物根**下那个同名目录（`09_SHOTS` / `12_FILMS` 在那儿，见 DIR_ROOTS）。
+        # 显式给了就用（`:meth:`landing_dir`` 靠它把那一格拼对）；没给则由资料根推，
+        # 推不出来时回**资料根自己** —— 那是**单树布局**，与"两个根"之前的行为逐字一致，
+        # 所以老调用方（只传一个 project）一行都不用改。
+        try:
+            resolved_out = Path(resolve_project(
+                str(project_out if project_out is not None else self.project),
+                must_exist=False, kind=ROOT_OUTPUT))
+        except Exception:  # ProjectError：两个根都没探测到（调用方自己挑的目录也走这儿）
+            resolved_out = self.project
+        self.project_out = resolved_out
         # 原文也走"必须明说在哪"的口径：给了就读，读不了当场报错。静默跳过的失效模式是
         # 模型按"没有原著"编出一部剧来，而报告上一切正常。
         self.novel = Path(novel).expanduser() if novel is not None else None
@@ -652,7 +669,33 @@ class NovelToVideoPipeline:
         )
         if self.stage_timeout <= 0:
             raise PipelineError(f"单段上限必须是正数（秒），收到 {stage_timeout!r}")
+        # 状态账落 `00_PROJECT/05_流程/`（资料根）—— 那一格本来就是"流程与进度"的落点。
         self.state_path = self.project / STATE_REL
+
+    # ---- 路径 -----------------------------------------------------------
+
+    def landing_dir(self, rel: str) -> Path:
+        """一部剧的某个落点**在盘上的绝对路径**（按 ``DIR_ROOTS`` 分派到两个根）。
+
+        面板与对话工具都该走这一个入口 —— 谁也别自己拼 `项目根 + rel`：
+        落点挂在哪个根上是事实源说了算，自己拼就会拼到错的那个根上，
+        而**"落错根"是不报错的**（图出了、也在盘上，就是不在引擎读得到的地方）。
+        """
+        root = self.project if root_of(rel) == ROOT_INPUT else self.project_out
+        return root / rel.replace("/", os.sep)
+
+    def roots_payload(self) -> dict[str, Any]:
+        """两个根 + 每个落点挂在哪个根上 —— **随载荷发给面板，别让它自己猜**。
+
+        面板一直是"`payload.project` + `/` + 相对路径"这么拼的，那在只有一个根的时候
+        成立。`12_FILMS` 在**产物根**下，再按老办法拼就会拼到资料根上 ——
+        与 `STAGE_RENDER` 绑错落点是同一种错法，也一样静默。
+        """
+        return {
+            "roots": {ROOT_INPUT: str(self.project), "output": str(self.project_out)},
+            "dir_roots": {rel: root_of(rel) for rel in PROJECT_DIRS},
+            "single_root": self.project == self.project_out,
+        }
 
     # ---- 计划 -----------------------------------------------------------
 
@@ -988,6 +1031,7 @@ class NovelToVideoPipeline:
             "not_ran": [task.code for task in tasks[len(outcomes):]],
             "render_required": [o.code for o in outcomes if o.render_pending],
             "stages": [o.to_json() for o in outcomes],
+            **self.roots_payload(),
         }
         await self._emit({"type": "pipeline", "phase": "finished", **report})
         return report
@@ -1152,6 +1196,11 @@ def _build_parser() -> argparse.ArgumentParser:
                     "图 / 视频 / 音频要引擎侧渲染。",
     )
     parser.add_argument("--project", required=True, help="项目目录，或 projects/ 下的项目名")
+    parser.add_argument(
+        "--project-out", default=None,
+        help="**产物根**下那个同名目录（逐镜片子与成片落这儿）；不给就跟着 --project ——"
+             "那是单树布局，与分成两个根之前的行为逐字一致。两个根的分工见 projects_spec.DIR_ROOTS",
+    )
     parser.add_argument("--novel", default=None, help="原著文本文件（.txt/.md，UTF-8）")
     parser.add_argument("--episodes", type=int, default=1, help="目标集数（默认 1）")
     parser.add_argument("--from", dest="from_code", default=None, help="从哪一段起（S0a–S7a）")
@@ -1166,7 +1215,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
         pipeline = NovelToVideoPipeline(
-            args.project, args.novel, episodes=args.episodes
+            args.project, args.novel, project_out=args.project_out, episodes=args.episodes
         )
         tasks = _slice_tasks(pipeline.plan(), args.from_code, args.to_code)
     except PipelineError as err:
@@ -1231,6 +1280,7 @@ def plan_payload(pipeline: NovelToVideoPipeline) -> dict[str, Any]:
         "stages": [task.to_json() for task in tasks],
         "state": state.get("stages", {}),
         "render_required": [task.code for task in tasks if task.needs_render],
+        **pipeline.roots_payload(),
     }
 
 
@@ -1242,6 +1292,7 @@ def state_payload(pipeline: NovelToVideoPipeline) -> dict[str, Any]:
         "version": state.get("version"),
         "updated": state.get("updated"),
         "stages": state.get("stages", {}),
+        **pipeline.roots_payload(),
     }
 
 
@@ -1329,6 +1380,11 @@ def steps_payload(
                 {
                     "rel": rel,
                     "title": rel.rsplit("/", 1)[-1],
+                    # 这一格的**绝对路径**由这边算好（按 `DIR_ROOTS` 分派到两个根）。
+                    # 面板拿到就直接用，不必"项目根 + rel"——那一拼法在
+                    # `12_FILMS` 这种落在**产物根**的格子上会拼错，而且不报错。
+                    "dir": str(pipeline.landing_dir(rel)),
+                    "root": root_of(rel),
                     "shelf": item.get("shelf", ""),
                     "scope": item.get("scope", ""),
                     "exists": bool(item.get("exists")),
@@ -1386,6 +1442,7 @@ def steps_payload(
         "current": next((step["key"] for step in steps if step["state"] != MARK_DONE), ""),
         "steps": steps,
         "render_required": [task.code for task in tasks.values() if task.needs_render],
+        **pipeline.roots_payload(),
     }
 
 

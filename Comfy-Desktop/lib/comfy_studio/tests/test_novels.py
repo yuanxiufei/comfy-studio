@@ -21,9 +21,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from comfy_studio.layout import INPUT_SUBDIR
 from comfy_studio.mcp import McpError, McpHub
 from comfy_studio.novels import (
-    MANJU_REL,
     NOVEL_SUBDIR,
     NovelLibrary,
     NovelsClient,
@@ -43,8 +43,8 @@ class NovelLibraryTest(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="comfy-studio-novels-")
         self.repo = Path(self._tmp.name)
-        # 默认落点：<comfyui-dir>/custom_nodes/comfy_studio/manju/novel
-        self.novel_dir = self.repo / MANJU_REL / NOVEL_SUBDIR
+        # 默认落点：<comfyui-dir>/input/novel
+        self.novel_dir = self.repo / INPUT_SUBDIR / NOVEL_SUBDIR
         self.library = NovelLibrary(self.novel_dir)
         # "用户本机那份原文"另放一处：它当然不在 ComfyUI 检出里。
         self._src_tmp = tempfile.TemporaryDirectory(prefix="comfy-studio-novel-src-")
@@ -72,9 +72,14 @@ class NovelLibraryTest(unittest.TestCase):
         # 默认落点必须是**仓库内相对路径**拼出来的：换机器、换检出照样成立，
         # 不许出现哪台机器的盘符（见仓库根 README 里"不写死路径"那条）。
         self.assertEqual(default_novel_dir(self.repo), self.novel_dir)
-        self.assertEqual(default_novel_dir(self.repo).relative_to(self.repo), MANJU_REL / NOVEL_SUBDIR)
+        # INPUT_SUBDIR 是**字符串**（引擎那个子目录的名字），拼层级要先变成 Path。
+        self.assertEqual(
+            default_novel_dir(self.repo).relative_to(self.repo), Path(INPUT_SUBDIR) / NOVEL_SUBDIR
+        )
         # 用 parts 比对：Windows 上 str() 是反斜杠，钉分隔符没意义，钉层级才有意义。
-        self.assertEqual(MANJU_REL.parts, ("custom_nodes", "comfy_studio", "manju"))
+        # 顶头那层是 **input** 而不是 manju：原文要按名被引擎的加载类节点读，
+        # 而它只认 input —— 落在别处的原文，工作流根本读不到。
+        self.assertEqual((Path(INPUT_SUBDIR) / NOVEL_SUBDIR).parts, ("input", "novel"))
         self.assertEqual(NOVEL_SUBDIR, "novel")
 
     # ---- list -----------------------------------------------------------
@@ -429,7 +434,7 @@ class NovelsRpcTest(unittest.TestCase):
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="comfy-studio-novels-rpc-")
-        self.novel_dir = Path(self._tmp.name) / MANJU_REL / NOVEL_SUBDIR
+        self.novel_dir = Path(self._tmp.name) / INPUT_SUBDIR / NOVEL_SUBDIR
         self.library = NovelLibrary(self.novel_dir)
         self.hub = McpHub([], extra_clients=[])
         self.host = StudioHost(
@@ -534,7 +539,7 @@ class NovelsToolsTest(unittest.TestCase):
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="comfy-studio-novels-tools-")
-        self.novel_dir = Path(self._tmp.name) / MANJU_REL / NOVEL_SUBDIR
+        self.novel_dir = Path(self._tmp.name) / INPUT_SUBDIR / NOVEL_SUBDIR
         self.library = NovelLibrary(self.novel_dir)
         self.novel_dir.mkdir(parents=True, exist_ok=True)
         # 按**字节**写：``write_text`` 在 Windows 上会把 ``\n`` 翻成 ``\r\n``，

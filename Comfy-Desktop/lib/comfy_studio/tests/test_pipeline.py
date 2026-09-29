@@ -812,14 +812,16 @@ class RpcWiringTest(unittest.TestCase):
     """RPC 三件套：注册过、形状对、纯查询不碰模型。
 
     **不拉起整个 ``StudioHost``**（那要 ComfyUI 路径、引擎 venv 一堆环境，测试会变成环境考试）。
-    这里只把三个处理器当函数喂一个最小的 ``self`` —— 它们实际用到的只有 ``novels`` 与
-    ``_make_pipeline`` / ``_pipeline_novel_path`` 两个方法。
+    这里只把三个处理器当函数喂一个最小的 ``self`` —— 它们实际用到的只有 ``novels`` / ``projects``
+    与 ``_make_pipeline`` / ``_pipeline_novel_path`` / ``_pipeline_roots`` 三个方法。
+    ``projects=None`` 就代表"宿主没挂项目目录"：这时项目名原样交给流水线，产物根不另算。
     """
 
     @staticmethod
-    def _host(novels=None):
-        host = SimpleNamespace(novels=novels)
+    def _host(novels=None, projects=None):
+        host = SimpleNamespace(novels=novels, projects=projects)
         host._pipeline_novel_path = types.MethodType(StudioHost._pipeline_novel_path, host)
+        host._pipeline_roots = types.MethodType(StudioHost._pipeline_roots, host)
         host._make_pipeline = types.MethodType(StudioHost._make_pipeline, host)
         return host
 

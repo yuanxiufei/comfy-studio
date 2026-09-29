@@ -117,8 +117,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "漫剧原文目录（面板「管理小说」那一页读写的落点，novels/* 那几张 RPC）；"
-            "默认取 <comfyui-dir>/custom_nodes/comfy_studio/manju/novel —— "
-            "漫剧业务数据住在引擎检出里，这条是仓库内相对路径（也可用 COMFY_STUDIO_NOVEL_DIR）。"
+            "默认取 <comfyui-dir>/input/novel（也可用 COMFY_STUDIO_NOVEL_DIR）。"
+            "落在 input 下是有意的：原文要按名被引擎的加载类节点读，"
+            "而它只认 input 目录（引擎的 --input-directory 改过时才需要自己给这条）。"
             "不给 --comfyui-dir 又不给这个，就挂不上原文目录，面板那一页会照实说"
         ),
     )
@@ -126,11 +127,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--project-dir",
         default=None,
         help=(
-            "漫剧项目目录（面板「项目管理」那一页读写的落点，projects/* 那几张 RPC）："
-            "一剧一目录，落点清单来自身边工作流里的 src/project.py；"
-            "默认取 <comfyui-dir>/custom_nodes/comfy_studio/manju/projects（也可用 "
-            "COMFY_STUDIO_PROJECT_DIR）。不给 --comfyui-dir 又不给这个，就挂不上项目目录，"
-            "面板那一页会照实说"
+            "漫剧项目**资料根**（面板「项目管理」那一页读写的落点，projects/* 那几张 RPC）："
+            "一剧一目录，装剧本 / 设定 / 素材 —— 都要按名被工作流读，所以默认取 "
+            "<comfyui-dir>/input（也可用 COMFY_STUDIO_PROJECT_DIR）。落点清单来自包内的 "
+            "projects_spec.py，不来自引擎检出。不给 --comfyui-dir 又不给这个，"
+            "就挂不上项目目录，面板那一页会照实说"
+        ),
+    )
+    parser.add_argument(
+        "--project-out-dir",
+        default=None,
+        help=(
+            "漫剧项目**产物根**（逐镜片子与成片落在哪儿）：默认取 <comfyui-dir>/output"
+            "（也可用 COMFY_STUDIO_PROJECT_OUT_DIR）。分成两个根是有意的 —— 引擎的加载类节点"
+            "只认 input、产物注解读的只有 output，成片落在 input 下**下游合成引用不到**，"
+            "只能整份拷过去（成片动辄几百兆）。把这两个根指成**同一个目录**就是单树布局，"
+            "与分成两个根之前的行为逐字一致（面板上「产物」那一栏会自己收起来）"
         ),
     )
     parser.add_argument(
@@ -243,6 +255,8 @@ def main(argv: list[str] | None = None) -> int:
                 output_dir=args.output_dir or os.environ.get("COMFY_OUTPUT_DIR"),
                 novel_dir=args.novel_dir or os.environ.get("COMFY_STUDIO_NOVEL_DIR"),
                 project_dir=args.project_dir or os.environ.get("COMFY_STUDIO_PROJECT_DIR"),
+                project_out_dir=args.project_out_dir
+                or os.environ.get("COMFY_STUDIO_PROJECT_OUT_DIR"),
                 memory=not args.no_memory,
                 memory_dir=args.memory_dir or os.environ.get("COMFY_STUDIO_MEMORY_DIR"),
                 agents_dir=args.agents_dir or os.environ.get("COMFY_STUDIO_AGENTS_DIR"),

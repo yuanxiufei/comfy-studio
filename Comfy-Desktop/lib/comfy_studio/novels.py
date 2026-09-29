@@ -15,14 +15,21 @@
 模型手里没有任何能碰到原文的家伙，只能凭前面几段转述过的内容往下编。导入与删除**不给模型**：
 那是"落盘 / 删文件"，由人在面板上按（见 :class:`NovelsClient`）。
 
-**目录从哪来**：漫剧那份业务数据住在引擎侧（``ComfyUI/custom_nodes/comfy_studio/manju/``），
-原文在它的 ``novel/`` 下 —— 落点见 :data:`MANJU_REL`，与 ``.codebuddy/agents/_build.py`` 里那份
-指的是同一个地方。桌面侧只知道 ``--comfyui-dir``，所以默认 =
+**目录从哪来**：原文落在**输入根**下的一级 ``novel/``，默认 =
 
-``<comfyui-dir>/custom_nodes/comfy_studio/manju/novel``（:func:`default_novel_dir`），
+``<input>/<ns>/novel``（:func:`default_novel_dir`）——
+
+桌面侧只知道 ``--comfyui-dir``，所以无覆盖时就等于 ``<comfyui-dir>/input/novel``。
+
+落在 ``input/`` 下不是随手摆的：原文要**按名**被引擎的加载类节点读（``LoadImage`` 那一路
+走 ``folder_paths``，它拿 ``is_within_directory`` 校验，出界直接 ``ValueError``），
+落在别处 = 引擎读不到，每次都得先拷一份进 ``input/``，而那次拷贝**不报错**、只是白花时间。
+"哪个落点在哪个根"一律问 :mod:`comfy_studio.projects_spec` 的 ``DIR_ROOTS``，
+这个模块不抄第二份（抄一份的失效模式是两边各说各的，而谁都不报错）。
 
 ``--novel-dir`` / ``COMFY_STUDIO_NOVEL_DIR`` 可以改。换机器、换检出，这条**仓库内相对路径**
-照样成立；代码里不写盘符，也不去猜别的位置。
+照样成立；代码里不写盘符，也不去猜别的位置。老落点（引擎检出里的
+``custom_nodes/comfy_studio/manju/``）只留 :data:`MANJU_REL` 一个常量给迁移与辨认用。
 
 **只管原文目录**：素材与产出是 :mod:`comfy_studio.localfiles` 的地盘（input/output），
 两边过同一套越界检查（:func:`comfy_studio.localfiles.is_within`），谁也走不出自己的目录。
@@ -50,14 +57,17 @@ from pathlib import Path
 from typing import Any
 
 from .cancel import CancelToken
+from .layout import NOVEL_SUBDIR, default_novel_dir
 from .localfiles import is_within
 from .mcp import McpError, McpTool
 
-#: 漫剧业务数据在引擎检出里的相对落点（相对 ``--comfyui-dir``）。
+#: **老**落点：漫剧业务数据在引擎检出里的相对位置（相对 ``--comfyui-dir``）。
+#:
+#: 原文与项目**不再**落这儿（见 :func:`default_novel_dir` 与本模块开头）。这个常量留着是
+#: 为了两件事：① 迁移要知道东西原来在哪；② 辨认一份老检出。新代码不要再用它拼路径 ——
+#: 引擎的加载类节点只认 ``input/``，落在 manju/ 下等于每次都要先拷一份进 input/，
+#: 而那次拷贝**不报错**，只是白花时间。完整缘由写在 :mod:`comfy_studio.layout` 开头。
 MANJU_REL = Path("custom_nodes") / "comfy_studio" / "manju"
-
-#: 原文就放在业务数据根下的这一层。
-NOVEL_SUBDIR = "novel"
 
 #: 认得出是原文的后缀。别的文件在列表里也照报（标成 ``text: false``），但不许当原文导进来。
 TEXT_SUFFIXES = (".txt", ".md")
@@ -228,9 +238,13 @@ def decode_text(raw: bytes, name: str) -> tuple[str, str]:
     return text, "gb18030"
 
 
-def default_novel_dir(comfyui_dir: str | os.PathLike[str]) -> Path:
-    """默认原文目录：``<comfyui-dir>/custom_nodes/comfy_studio/manju/novel``。"""
-    return Path(comfyui_dir).expanduser().resolve() / MANJU_REL / NOVEL_SUBDIR
+# `default_novel_dir` / `NOVEL_SUBDIR` 由文件头的 import 从 `.layout` 引进来 ——
+# 那两个值现在**只有一个出处**（``layout.py``）。这里刻意不再自己拼一遍：
+# 老实现拼的是 `…/manju/novel`（引擎检出目录**内部**），而引擎的加载类节点只认 `input/`，
+# 落在那儿等于每次都要先把原文拷进 input/ 才读得到。完整缘由写在 `layout.py` 开头。
+#
+# 新默认落点是 `<input>/<命名空间>/novel`，与项目目录同级 —— 原文与项目是同一部剧的两头，
+# 摆在一起才知道谁是谁的。
 
 
 class NovelLibrary:

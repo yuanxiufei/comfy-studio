@@ -86,6 +86,7 @@ from .history import (
     entries as history_entries,
     title_of,
 )
+from .layout import StudioLayout, layout_of
 from .localfiles import LocalFiles, LocalFilesClient
 from .memory import MemoryClient, MemoryStore, MemoryStoreError, memory_home
 from .mcp import McpHub, McpServerConfig, engine_web_tools
@@ -102,7 +103,6 @@ from .novels import (
     NovelLibrary,
     NovelsClient,
     NovelsError,
-    default_novel_dir,
     resolve_novel,
 )
 from .panel import PanelContextError, describe_context, parse_context
@@ -124,7 +124,6 @@ from .projects import (
     ProjectLibrary,
     ProjectsClient,
     ProjectsError,
-    default_project_dir,
 )
 from .renders import RenderCatalog, RendersError
 from .review import ReviewChannel, ReviewClient
@@ -295,8 +294,10 @@ class StudioHost:
         self.novels = novels
         #: 面板里填过的模型配置（``settings.json``）；None = 这个宿主没挂它，配置只能靠环境变量。
         self.settings = settings
-        #: 漫剧项目目录（一剧一目录，面板「项目管理」那一页）：``--project-dir``，或由
-        #: ``--comfyui-dir`` 推出默认落点（与原文同一个父目录下的 ``projects/``）。
+        #: 漫剧项目目录（一剧一目录，面板「项目管理」那一页）：``--project-dir`` 是**资料根**、
+        #: ``--project-out-dir`` 是**产物根**，两个都没给时由 ``--comfyui-dir`` 那一对目录推。
+        #: 对象里已经带着这两个根（``directory`` / ``out_directory``），所以"项目在盘上哪两个
+        #: 目录"这个问题到这一层就问全了 —— ``_pipeline_roots`` 也是从这里取的。
         #: None 时 ``projects/*`` 会明确说"宿主没挂项目目录"，而不是回一个空项目表。
         self.projects = projects
         #: 渲染目标目录（这台机器上那 12 张生产工作流的入口）：由启动方挂上来，因为它要用
@@ -369,6 +370,7 @@ class StudioHost:
         self.server.on("projects/read", self.projects_read)
         self.server.on("projects/write", self.projects_write)
         self.server.on("projects/create", self.projects_create)
+        self.server.on("projects/migrate", self.projects_migrate)
         self.server.on("projects/link_novel", self.projects_link_novel)
         self.server.on("projects/brief", self.projects_brief)
         self.server.on("pipeline/plan", self.pipeline_plan)
@@ -1465,6 +1467,27 @@ class StudioHost:
         except ProjectsError as err:
             raise RpcError(INTERNAL_ERROR, str(err)) from err
 
+    def projects_migrate(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
+        """把一部**老结构**的项目搬到当前结构（v1 → v2 → v3）—— 只移动、不覆盖、可反复跑。
+
+        ``dry: true`` 只报**会搬什么**，盘上不动一个字节：面板要先让人看见这份清单再动手，
+        而这件事最贵的错法是"人点了搬，回来一看文件没了"。所以预演是默认用法，
+        面板那一下「搬」才传 ``dry: false``。
+
+        与 ``projects/create`` 的分工：那条是"建新项目"，只管把缺的落点补出来；
+        这条是"老项目搬家"，动的是**已经有内容的**目录。两条都走事实源那同一份判据
+        （``DIR_ROOTS`` / ``MIGRATIONS``），这里只挡形状。
+        """
+        args = _object(params, "projects/migrate")
+        name = _text(args, "name")
+        dry = args.get("dry")
+        if dry is not None and not isinstance(dry, bool):
+            raise RpcError(INVALID_PARAMS, "dry 必须是布尔值")
+        try:
+            return self._projects().migrate(name, dry=bool(dry))
+        except ProjectsError as err:
+            raise RpcError(INTERNAL_ERROR, str(err)) from err
+
     def projects_link_novel(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
         """单独登记 / 换一次原著（建完项目之后又想起来来源是哪本时用）。
 
@@ -1508,6 +1531,37 @@ class StudioHost:
         except NovelsError as err:
             raise RpcError(INVALID_PARAMS, str(err)) from err
 
+    def _pipeline_roots(self, name: str) -> tuple[str, str | None]:
+        """项目名 → ``(资料根下那一份, 产物根下那一份)``，两个都算成**绝对路径**。
+
+        为什么不把名字直接交给流水线：那边走的是事实源 ``resolve_project``，而它靠环境变量
+        与工作区探测（``projects_root`` / ``find_workspace``）找根 —— 宿主这里的根是
+        ``--project-dir`` / ``--comfyui-dir`` 算出来的，两者**可以不是同一个**，并且两边都不
+        报错：产物只是安静地落到另一个地方。面板点出来的那是"我明明建了项目"，很贵。
+        """
+        if self.projects is None:
+            return name, None
+        raw = name.strip()
+        if Path(raw).name != raw:
+            # 给的是**路径**而不是名字（``pipeline__plan`` 的说明里允许多给一个目录）。
+            # 认得它在宿主资料根底下，就对出产物根那一份；认不出来就原样交回去 ——
+            # 那是**单树布局**，与"分成两个根"之前逐字一致。不猜一个新落点出来：
+            # 猜错同样不报错，只是产物掉在没人找得到的地方。
+            given = Path(raw).expanduser()
+            base, out = self.projects.directory, self.projects.out_directory
+            if base == out:
+                return raw, None
+            try:
+                rel = given.resolve().relative_to(base)
+            except (OSError, ValueError):
+                return raw, None
+            return raw, str(out / rel)
+        try:
+            project, project_out = self.projects.roots(raw)
+        except ProjectsError as err:
+            raise RpcError(INVALID_PARAMS, str(err)) from err
+        return str(project), str(project_out)
+
     def _make_pipeline(
         self, args: dict[str, Any], method: str, *, config: LLMConfig | None
     ) -> NovelToVideoPipeline:
@@ -1516,10 +1570,12 @@ class StudioHost:
         if novel is not None and not isinstance(novel, str):
             raise RpcError(INVALID_PARAMS, "novel 必须是字符串（原文库里的名字）")
         episodes = _int_param(args, "episodes", DEFAULT_EPISODES, low=1, high=9999, method=method)
+        project, project_out = self._pipeline_roots(_text(args, "name"))
         try:
             return NovelToVideoPipeline(
-                _text(args, "name"),
+                project,
                 self._pipeline_novel_path(novel),
+                project_out=project_out,
                 config=config,
                 episodes=episodes,
             )
@@ -1945,6 +2001,25 @@ def _pipeline_tool_config(host_box: list[StudioHost]) -> LLMConfig:
         raise PipelineError(str(err)) from err
 
 
+def _landing(explicit: str | None, layout: StudioLayout | None, which: str) -> Path | None:
+    """一个业务落点"在盘上是哪个目录"：**显式参数 > 布局算出来的 > 不挂上**。
+
+    ``which`` 是 :class:`StudioLayout` 上那个取值方法的**名字**（``novel_dir`` /
+    ``projects_root`` / ``projects_out_root``）：三个的名字两两不同，没法参数化绕过去。
+
+    显式参数那一路在 ``layout`` 为 ``None`` 时是**唯一**给出答案的一路，所以它必须留着：
+    "引擎还没挂上，但先给一个原文目录翻着看"是合法配置，不该被连坐（:func:`layout_of`
+    在既没 ``--comfyui-dir`` 也没引擎那三个开关时回 ``None``）。
+
+    **环境变量不在这里读** —— 那一级归 :func:`comfy_studio.layout.resolve_layout` 管，
+    它已经把它写进布局里了。这里再读一遍就是同一个判断写两处，而分歧的表现是
+    "指了这个目录、落在另一个目录"，两边都不报错。
+    """
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    return getattr(layout, which)() if layout is not None else None
+
+
 async def serve_stdio(
     configs: list[McpServerConfig],
     request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
@@ -1957,6 +2032,7 @@ async def serve_stdio(
     output_dir: str | None = None,
     novel_dir: str | None = None,
     project_dir: str | None = None,
+    project_out_dir: str | None = None,
     memory: bool = True,
     memory_dir: str | None = None,
     agents_dir: str | None = None,
@@ -1976,18 +2052,24 @@ async def serve_stdio(
     本机文件那几张（:mod:`comfy_studio.localfiles`）不需要谁接话，只要 ``comfyui_dir``
     给了就挂上；``input_dir`` / ``output_dir`` 用来对应引擎启动参数
     ``--input-directory`` / ``--output-directory``（默认就是 comfyui_dir 下的同名目录）。
-    漫剧原文（:mod:`comfy_studio.novels`，面板「管理小说」那一页的活）同理，但它不吃引擎的
-    启动参数：``novel_dir`` 直接给，否则由 ``comfyui_dir`` 推出默认落点 —— 业务数据住在引擎
-    检出的 ``custom_nodes/comfy_studio/manju/`` 下，原文在它的 ``novel/`` 里
-    （:func:`comfy_studio.novels.default_novel_dir`）。两个都没给就挂不上，``novels/*`` 会
-    照实说 —— 那比回一个空书库好："目录还没建"和"没挂上"在面板上是两句不同的话。
-    漫剧项目（:mod:`comfy_studio.projects`，面板「项目管理」那一页的活）与原文同一处父目录：
-    ``project_dir`` 直接给，否则由 ``comfyui_dir`` 推出 ``manju/projects/``
-    （:func:`comfy_studio.projects.default_project_dir`）。它另外还要一份**落点清单**，
-    也就是 ``comfy_studio.projects_spec`` —— **与 projects 模块同一个包**，不需要任何人
-    接话（:func:`comfy_studio.projects.default_spec_path` 从 ``__file__`` 定位）。要换成
-    包外的实现才走 ``spec_path``。载不上时 ``projects/*`` 会连路径带修法一起报出来，
-    而不是装作"这个项目一个文件都没有"。
+    后面三个业务落点（原文 / 项目资料 / 项目产物）的默认值**一律由** :mod:`.layout` 从这一对
+    根算出来，而不是各自拼一份 ``<comfyui-dir>/input`` —— 引擎只从**它自己那两个目录**里读
+    素材、往那里写产物，宿主自己拼一份就会拼到引擎看不见的地方，而且**不报错**。
+    漫剧原文（:mod:`comfy_studio.novels`，面板「管理小说」那一页的活）：``novel_dir`` 直接给，
+    否则推 ``<input>/novel``。两个都没给就挂不上，``novels/*`` 会照实说 ——
+    那比回一个空书库好："目录还没建"和"没挂上"在面板上是两句不同的话。
+    漫剧项目（:mod:`comfy_studio.projects`，面板「项目管理」那一页的活）与原文同一处父目录，
+    但它有**两个根**：``project_dir`` 是**资料根**（``<input>``，剧本/设定/素材这些要按名被
+    工作流读的东西），``project_out_dir`` 是**产物根**（``<output>``，逐镜片子与成片）。
+    两者都没给时各推一份；**只挂资料根**（或两个给成同一个目录）就是**单树布局**，与"分成
+    两个根"之前逐字一致，``projects.status()["single_root"]`` 是判据 ——
+    面板据此决定要不要把"产物"那一栏摆出来。哪个落点在哪个根上不在这里判断，
+    一律问事实源 ``projects_spec.DIR_ROOTS`` ——"落错根"是不报错的
+    （产物在盘上、就是不在引擎读得到的地方），所以只认一处。
+    它另外还要一份**落点清单**，也就是 ``comfy_studio.projects_spec`` —— **与 projects 模块
+    同一个包**，不需要任何人接话（:func:`comfy_studio.projects.default_spec_path` 从
+    ``__file__`` 定位）。要换成包外的实现才走 ``spec_path``。载不上时 ``projects/*`` 会连路径带
+    修法一起报出来，而不是装作"这个项目一个文件都没有"。
     长期记忆（:mod:`comfy_studio.memory`）同样不需要谁接话，而且它是这个工作台该有的
     记性，所以**默认开着**：一份落在用户数据目录的 JSON，``memory_dir`` 换地方，
     ``memory=False`` 整个关掉（工具表里就没有 memory__* 了）。
@@ -2025,21 +2107,45 @@ async def serve_stdio(
         if comfyui_dir
         else None
     )
-    # 漫剧原文目录：面板「管理小说」那一页读写的就是它。这两种给法都算数，
-    # 都没给就挂不上（那几张 RPC 会照实说，而不是回一个空书库）。
-    novel_root = (
-        Path(novel_dir).expanduser()
-        if novel_dir
-        else (default_novel_dir(comfyui_dir) if comfyui_dir else None)
+    # 三个业务落点的**默认值**统一由 `.layout` 算（见那个模块开头）：它按
+    # 「显式参数 > 同名环境变量 > 从 comfyui-dir 推」把输入根 / 输出根定下来。
+    # 这里**不自己拼** `<comfyui-dir>/input`：桌面壳会把引擎的 `--input-directory` /
+    # `--output-directory` 显式传进来（共享存储下是 `Shared/input`、`Shared/output`），
+    # 而引擎只从**它那两个目录**里读素材、往那里写产物 —— 宿主按 `<comfyui-dir>/input`
+    # 自己拼一份就会拼到引擎看不见的地方，且**不报错**：素材导进去、图也出了，
+    # 就是"还缺图"永远不消。算不出来（既没 comfyui-dir 也没那两个开关）= 还没挂上，
+    # 不是错误，下面各自照实说。
+    # 三个业务落点也一并交给它（含各自的同名环境变量），免得"显式 > 环境变量"那一级
+    # 在 `__main__` 里再写一遍 —— 两处各判一次，分歧的表现是"命令行指了这个目录，
+    # 跑起来却落在另一个目录"，谁也不报错。
+    layout = layout_of(
+        comfyui_dir,
+        input_dir=input_dir,
+        output_dir=output_dir,
+        novel_dir=novel_dir,
+        project_dir=project_dir,
+        project_out_dir=project_out_dir,
     )
+    # 三个业务落点的**显式参数**再问一遍，不是重复劳动：`layout` 那一步在
+    # "只给了 --novel-dir、没给 --comfyui-dir" 时会整个算不出来（引擎那两个根确实推不出），
+    # 而"引擎还没挂上，但先给一个原文目录翻着看"是个合法配置。
+    # 环境变量不在这里读：那一级归 `resolve_layout` 管（见它末尾那段）。显式参数优先于它。
+    novel_root = _landing(novel_dir, layout, "novel_dir")
     novels = NovelLibrary(novel_root) if novel_root is not None else None
-    # 漫剧项目目录（一剧一目录）：面板「项目管理」那一页读写的就是它。与原文同一处父目录。
-    project_root = (
-        Path(project_dir).expanduser()
-        if project_dir
-        else (default_project_dir(comfyui_dir) if comfyui_dir else None)
+    # 漫剧项目目录（一剧一目录）：面板「项目管理」那一页读写的就是它。与原文同一处父目录，
+    # 但它有**两个根**（见 `projects_spec.DIR_ROOTS`）：资料根装剧本 / 设定 / 素材
+    # （要按名被工作流读），产物根装逐镜片子与成片。哪个落点在哪个根上不在这里判断 ——
+    # 一律问事实源；这里只回答"这两个根在盘上是哪两个目录"。
+    project_root = _landing(project_dir, layout, "projects_root")
+    # 产物根与资料根是分开的**默认**（`<output>` 与 `<input>`）：成片落在资料根下时，
+    # 引擎那条 `名[output]` 注解读不到它，下游合成只能整份拷过去（成片动辄几百兆）。
+    # 两个根给成同一个目录 = **单树布局**，与分成两个根之前逐字一致（判据是 `single_root`）。
+    project_out_root = _landing(project_out_dir, layout, "projects_out_root")
+    projects = (
+        ProjectLibrary(project_root, out_directory=project_out_root)
+        if project_root is not None
+        else None
     )
-    projects = ProjectLibrary(project_root) if project_root is not None else None
     memory_client = (
         MemoryClient(MemoryStore(memory_dir or memory_home())) if memory else None
     )

@@ -59,6 +59,7 @@
 
 import os
 import re
+import shutil
 from dataclasses import dataclass
 from datetime import date
 
@@ -109,6 +110,7 @@ PROJECT_DIRS = (
     "09_SHOTS",
     "10_CONSISTENCY",
     "11_AUDIO",
+    "12_FILMS",
 )
 
 #: 粒度的三个取值。**不是审美，是归属判据**（规范 §二 的警示）：
@@ -156,7 +158,80 @@ DIR_SCOPES = {
     "09_SHOTS": SCOPE_EPISODE,
     "10_CONSISTENCY": SCOPE_WHOLE,
     "11_AUDIO": SCOPE_EPISODE,
+    "12_FILMS": SCOPE_EPISODE,
 }
+
+
+# ─────────────────────────────────────────────────────────────
+# 一·二、落点分属哪个**根**（资料根 / 产物根）—— 第二份事实源
+# ─────────────────────────────────────────────────────────────
+
+#: 一个落点可以落在两个根上，**只有这两个取值**。
+#:
+#: **为什么要有这份表**：落点从来不只是"项目下的哪一级"，还含"在哪个根下"。
+#: 而 ComfyUI 把这件事钉死了 —— 引擎的加载类节点只认 ``input/``
+#: （``folder_paths.annotated_filepath`` 拿 ``is_within_directory`` 校验，
+#: 出界直接 ``ValueError``，连"相对路径绕一下"都不行），产物注解只认 ``output/``。
+#: 于是：**要按名被工作流读的**（原文、剧本、素材）必须落 input，
+#: **工作流产出的**（逐镜片子、成片）必须落 output。这不是审美，是引擎的硬约束。
+#:
+#: 不写这份表的后果是**静默**的：图出了、也算出了东西，只是不在引擎读得到的地方 ——
+#: 面板上"还缺图"永远不消，人以为白跑一趟（与 ``STAGE_RENDER`` 的落点绑错同一种错法）。
+ROOT_INPUT = "input"
+ROOT_OUTPUT = "output"
+
+#: 落点 → 它的根。**没写的一律 input**（表是"例外清单"，不是全量清单）——
+#: 全量清单会随 ``PROJECT_DIRS`` 增删而失配，而失配的失效模式是"新加的格默默落错根"。
+DIR_ROOTS = {
+    "09_SHOTS": ROOT_OUTPUT,
+    "12_FILMS": ROOT_OUTPUT,
+}
+
+
+def root_of(rel: str) -> str:
+    """一个落点落在哪个根（``ROOT_INPUT`` / ``ROOT_OUTPUT``）。"""
+    return DIR_ROOTS.get(rel, ROOT_INPUT)
+
+
+def dirs_in_root(kind: str) -> tuple:
+    """只落在某个根上的落点，顺序照 ``PROJECT_DIRS``（= 面板显示顺序）。"""
+    if kind not in (ROOT_INPUT, ROOT_OUTPUT):
+        raise ProjectError("未知的根 %r；只有 %r 与 %r" % (kind, ROOT_INPUT, ROOT_OUTPUT))
+    return tuple(rel for rel in PROJECT_DIRS if root_of(rel) == kind)
+
+
+#: 两个根各自有哪些落点。建项目、体检、迁移都靠它分派 ——
+#: 两边各写一遍"哪个落点在哪"，就会一边落 input、一边找 output，而**谁都不报错**。
+PROJECT_DIRS_IN = dirs_in_root(ROOT_INPUT)
+PROJECT_DIRS_OUT = dirs_in_root(ROOT_OUTPUT)
+
+
+def root_of_path(rel: str) -> str:
+    """一个**文件**路径落在哪个根：按 ``DIR_ROOTS`` 里最长的那个落点前缀判。
+
+    目录用 :func:`root_of`（精确查表）；文件得按前缀问 —— 落点存的是目录，
+    文件是它下面的东西（``09_SHOTS/EP01_SH003.mp4``）。
+    取最长前缀而不是第一个命中的：落点之间会嵌套（``00_PROJECT/06_对白`` 与
+    ``00_PROJECT/06_对白/对白稿``），取短的会把里层那个判到外层的根上去。
+
+    ⚠️ 没命中任何落点 = ``ROOT_INPUT``：项目根下确实有不在任何格子里的文件
+    （``README.md``、``_work/``），它们的根是资料根。
+    """
+    rel = rel.replace(os.sep, "/")
+    kind, best = ROOT_INPUT, -1
+    for landing in PROJECT_DIRS:
+        if (rel == landing or rel.startswith(landing + "/")) and len(landing) > best:
+            kind, best = root_of(landing), len(landing)
+    return kind
+
+#: 中间产物里**不值得留**的那一类（预览、试跑切片、放大前的源）的目录名。
+#: 它落引擎的 ``temp/``（原生语义：随时可清），落项目树里的只有 ``_work/`` 那一层。
+TEMP_WORK_DIR = "temp"
+
+#: 中间产物里**要留**的那一类放在项目产物根下的哪一级。
+#: 前置下划线 = "不是业务格"：不写进 ``PROJECT_DIRS``（不进面板、不进体检），
+#: 与 ``_分集大纲.json`` / ``_SEED_PATTERNS`` 同一个记号。
+WORK_SUBDIR = "_work"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -340,10 +415,14 @@ STAGE_SPECS = (
     ),
     StageSpec(
         code="S7a", name="短剧合成", owner="04 视频生成",
-        landings=("00_PROJECT/04_交付与出图",),
+        # 成片落**产物根**（见 ``DIR_ROOTS``）：下游合成要按 ``名[output]`` 注解引用它，
+        # 而引擎那条注解读的就是 output 根。留在 ``04_交付与出图``（资料根）里，
+        # 要引用就得整份拷过来 —— 而成片动辄几百兆。
+        # 那张格子仍然留着，放的是**合成单**：文本稿，落资料根。
+        landings=("00_PROJECT/04_交付与出图", "12_FILMS"),
         # 查的是**成片**（视频后缀），不是那张合成单：合成单是"要怎么合"的稿，
         # 它先于成片存在。拿 .md 判"合成完成"就是拿计划当结果。
-        check_dirs=("00_PROJECT/04_交付与出图",), check_exts=(".mp4", ".mov", ".mkv"),
+        check_dirs=("12_FILMS",), check_exts=(".mp4", ".mov", ".mkv"),
         entries=(StageEntry("cli", "pipeline",
                             "python -m comfy_studio.pipeline --project <项目> "
                             "--from S7a --to S7a"),),
@@ -466,7 +545,7 @@ WORKBENCH_STEPS = (
         key="cut", name="短剧合成",
         goal="把镜头、声音、字幕合成成片，跑一遍合规项，交出一部能发布的短剧。",
         stages=("S7", "S7a"),
-        landings=("10_CONSISTENCY", "00_PROJECT/05_流程"),
+        landings=("10_CONSISTENCY", "00_PROJECT/05_流程", "12_FILMS"),
         needs=("video", "dialogue"),
         note="合成单与成片是两件事：写完成合单不等于合成完了，成片才是结果。",
     ),
@@ -673,12 +752,55 @@ def find_workspace(start=None) -> str:
 
 
 def projects_root() -> str:
-    """项目根：环境变量 `VOIDE_PROJECTS_ROOT` 优先，否则动态探测。"""
+    """**资料根**：环境变量 `VOIDE_PROJECTS_ROOT` 优先，否则动态探测。
+
+    与 :func:`projects_out_root` 是**两个根**（见 :data:`DIR_ROOTS`）。宿主侧一律显式给
+    （``--project-dir`` / ``--comfyui-dir``，统一由 :mod:`.layout` 算出来）——
+    这个函数只在"拿路径直接跑本文件"时才是主路径。
+    """
     env = os.getenv("VOIDE_PROJECTS_ROOT")
     if env:
         return os.path.abspath(env)
     ws = find_workspace()
     return os.path.join(ws, "projects") if ws else ""
+
+
+def projects_out_root() -> str:
+    """**产物根**：环境变量 `VOIDE_PROJECTS_OUT_ROOT` 优先。
+
+    没配就回**空串**，含义是"单树布局"：产物与资料落同一个根（见 :func:`out_root_for`）。
+    这不是兜底，是一种正式配置 —— 只有一部剧、不跑合成的时候，分成两个根只是多一层要维护的东西；
+    而且它让"今天只认一个根的调用方"一行都不用改。
+    """
+    env = os.getenv("VOIDE_PROJECTS_OUT_ROOT")
+    return os.path.abspath(env) if env else ""
+
+
+def out_root_for(path: str, *, root: str = None, out_root: str = None) -> str:
+    """给一个**资料根下的项目目录**，推它的产物根；推不出来就回它自己（单树）。
+
+    **两个根**：`root` / `out_root` 给了就用它们，不给就按环境变量（宿主侧惯用的
+    `--project-dir` / `--project-out-dir` 走的就是这一条）。显式给不是为了省事：
+    宿主自己知道两个根在哪（它算过），而环境变量**可能没设** —— 那时这里会去
+    `projects_root()` 往上找 `projects/`，推出的落点跟面板看到的**不是同一个**。
+
+    "推不出来"有两种，都不报错：
+    ① 没配产物根（`out_root` 与环境变量都没有）；
+    ② 给的路径不在 `root` 底下（调用方自己挑的目录，无从推算同级）——
+       这一条尤其重要：单测与 ``--project-dir`` 常常就是这么给的，
+       它们要的是"跟以前一模一样"，不是"猜一个新的落点出来"。
+    """
+    out = os.path.abspath(out_root) if out_root else projects_out_root()
+    base = os.path.abspath(root) if root else projects_root()
+    if not out or not base:
+        return path
+    try:
+        rel = os.path.relpath(path, base)
+    except ValueError:                       # Windows 上跨盘，relpath 直接抛
+        return path
+    if rel == os.curdir or rel.startswith(os.pardir):
+        return path
+    return os.path.normpath(os.path.join(out, rel))
 
 
 def list_projects() -> list:
@@ -689,10 +811,22 @@ def list_projects() -> list:
                   if os.path.isdir(os.path.join(d, n)) and not n.startswith("."))
 
 
-def resolve_project(name_or_path: str, *, must_exist: bool = True) -> str:
-    """把「项目名」或「路径」统一成绝对路径。
+def resolve_project(name_or_path: str, *, must_exist: bool = True,
+                    kind: str = ROOT_INPUT, root: str = None,
+                    out_root: str = None) -> str:
+    """把「项目名」或「路径」统一成**某个根下的**项目目录绝对路径。
 
-    给的是名字时到 `projects_root()` 下找 —— 找不到就**报错并说清怎么修**，
+    ``kind=ROOT_INPUT``（默认）解析**资料根**，``kind=ROOT_OUTPUT`` 解析**产物根**。
+    单树布局下两者解析出**同一个目录**，所以今天只认一个根的调用方一行都不用改。
+
+    **两个根**（`root` / `out_root`）：给了就用它们，不给就按环境变量与工作区探测。
+    宿主侧一律显式给 —— 它自己算过这两个根，而环境变量可能没设（见 `out_root_for`）。
+
+    ⚠️ 解析产物根时**一律传 `must_exist=False`**：成片还没做出来的项目，
+    产物根下那个目录本来就还不存在 —— 那不是"项目不存在"，是"还没出片"。
+    拿 `must_exist=True` 去问它，会把一个正常状态报成错误。
+
+    给的是名字时到对应的根下找 —— 找不到就**报错并说清怎么修**，
     不要退回一个相对路径继续跑（那会建到错误的目录里）。
     """
     p = str(name_or_path).strip()
@@ -700,13 +834,22 @@ def resolve_project(name_or_path: str, *, must_exist: bool = True) -> str:
         raise ProjectError("项目名不能为空。")
     if os.path.isabs(p) or os.sep in p or "/" in p:
         cand = os.path.abspath(p)
+        if kind == ROOT_OUTPUT:
+            cand = out_root_for(cand, root=root, out_root=out_root)
     else:
-        root = projects_root()
-        if not root:
+        if kind == ROOT_OUTPUT:
+            base = (os.path.abspath(out_root) if out_root else projects_out_root()) or (
+                os.path.abspath(root) if root else projects_root())
+        else:
+            base = os.path.abspath(root) if root else projects_root()
+        if not base:
             raise ProjectError(
                 "没探测到项目根。两种修法：① 设环境变量 VOIDE_PROJECTS_ROOT 指向 projects 目录；"
                 "② 在工作区里建一个 projects/ 目录（宿主侧会从工作区往上找）。")
-        cand = os.path.join(root, p)
+        cand = os.path.join(base, p)
+    # 这一步要**两条路都走**。"给的是路径"不是"这个项目一定在"：`--project D:/x/没这个项目`
+    # 是一条最常敲错的命令，而它曾经在 `--plan` 下静默成功、回一份计划 —— 计划看着完全正常，
+    # 只是那份计划属于一个不存在的项目。老实现这里是一道贯穿到底的检查，别再提前 return。
     if must_exist and not os.path.isdir(cand):
         raise ProjectError("项目不存在：%s" % cand)
     return cand
@@ -728,13 +871,19 @@ def _is_empty_dir(path: str) -> bool:
 
 
 def create_project(name: str, *, episodes: int = 12, root: str = None,
-                   upgrade: bool = False, dry: bool = False, log=print) -> dict:
+                   out_root: str = None, upgrade: bool = False, dry: bool = False,
+                   log=print) -> dict:
     """按规范建一个项目（或给已有项目补落点）。
+
+    **两个根**：资料根（`root`，默认 `projects_root()`）与产物根（`out_root`）。
+    哪个落点归哪个根由 :data:`DIR_ROOTS` 说了算，这里只分派、不判断。
+    `out_root` 不给时跟着 `projects_out_root()`；那个也没配就是**单树布局**
+    （产物与资料同一个根），与两个根之前的行为逐字一致 —— 所以老调用方不用改。
 
     幂等：**已存在的目录与文件一律不覆盖**。`upgrade=True` 时允许目标已存在；
     否则目标已存在就报错（避免把误输入的项目名建到别人项目头上）。
 
-    返回 `{"path", "dirs", "files", "skipped", "pending"}`。
+    返回 `{"path", "path_out", "dirs", "dirs_out", "files", "skipped", "pending"}`。
     """
     if episodes < 1:
         raise ProjectError("集数必须 ≥ 1，收到 %r。" % episodes)
@@ -745,6 +894,10 @@ def create_project(name: str, *, episodes: int = 12, root: str = None,
             "没探测到项目根。两种修法：① 设环境变量 VOIDE_PROJECTS_ROOT；"
             "② 在工作区里建 projects/ 目录（宿主侧会自动往上找）。")
     path = os.path.join(base, name)
+    # 产物根：显式给的 > 环境变量配的 > **跟着资料根**（单树布局）。
+    path_out = os.path.join(
+        os.path.abspath(out_root if out_root is not None else (projects_out_root() or base)),
+        name)
 
     if os.path.isdir(path):
         if not upgrade and not _is_empty_dir(path):
@@ -757,11 +910,16 @@ def create_project(name: str, *, episodes: int = 12, root: str = None,
     if not os.path.isdir(TEMPLATE_DIR):
         raise ProjectError("找不到模板目录：%s" % TEMPLATE_DIR)
 
-    result = {"path": path, "dirs": [], "files": [], "skipped": [], "pending": []}
+    result = {"path": path, "path_out": path_out, "dirs": [], "dirs_out": [],
+              "files": [], "skipped": [], "pending": []}
 
-    # ① 目录（含 .gitkeep，空目录才存得进版本库）
+    # ① 目录（含 .gitkeep，空目录才存得进版本库）。
+    # 每个落点按**自己的根**拼 —— 这里要是图省事全拼在 `path` 下，
+    # `09_SHOTS` / `12_FILMS` 就会在资料根里也长出来一格，而引擎那边读不到它
+    # （加载类节点只认 input、产物注解只认 output，见 `DIR_ROOTS`）。
     for rel in PROJECT_DIRS:
-        full = os.path.join(path, rel.replace("/", os.sep))
+        parent = path_out if root_of(rel) == ROOT_OUTPUT else path
+        full = os.path.join(parent, rel.replace("/", os.sep))
         if os.path.isdir(full):
             result["skipped"].append(rel + "/")
             continue
@@ -771,7 +929,7 @@ def create_project(name: str, *, episodes: int = 12, root: str = None,
             if _is_empty_dir(full) and not os.path.exists(keep):
                 with open(keep, "w", encoding="utf-8") as fh:
                     fh.write("")
-        result["dirs"].append(rel + "/")
+        result["dirs" if root_of(rel) == ROOT_INPUT else "dirs_out"].append(rel + "/")
 
     # ② 预置空表（模板渲染；已存在不覆盖）
     mapping = {
@@ -787,6 +945,14 @@ def create_project(name: str, *, episodes: int = 12, root: str = None,
         src_path = os.path.join(TEMPLATE_DIR, src)
         if not os.path.isfile(src_path):
             raise ProjectError("模板缺失：%s（规范与模板必须同时存在）" % src_path)
+        # 空表一律落**资料根**：它们是剧本/台账/对白这类要被人打开读、动手改的文本。
+        # 真有人往产物根里加一张空表的时候在这里挡住 —— 那种失配不报错的话，
+        # 面板上那一格永远是空的，而人对着"项目已建好"的提示找不到东西。
+        owner = root_of_path(dst)
+        if owner != ROOT_INPUT:
+            raise ProjectError(
+                "空表 %s 被摆到了产物根（%s）：预置模板只写资料根里的文本稿，"
+                "请把它挪到 %s 下的某个落点里。" % (dst, ROOT_OUTPUT, ROOT_INPUT))
         dst_path = os.path.join(path, dst.replace("/", os.sep))
         if os.path.exists(dst_path):
             result["skipped"].append(dst)
@@ -803,7 +969,11 @@ def create_project(name: str, *, episodes: int = 12, root: str = None,
     if log:
         verb = "（预演，未落盘）" if dry else ""
         log("项目：%s%s" % (path, verb))
-        log("目录：新建 %d 个，已存在 %d 个" % (len(result["dirs"]), len(result["skipped"])))
+        if os.path.normcase(path_out) != os.path.normcase(path):
+            log("产物：%s" % path_out)
+        log("目录：新建 %d 个（资料 %d / 产物 %d），已存在 %d 个"
+            % (len(result["dirs"]) + len(result["dirs_out"]),
+               len(result["dirs"]), len(result["dirs_out"]), len(result["skipped"])))
         log("空表：写出 %d 份（%s）" % (len(result["files"]), "、".join(result["files"]) or "无"))
         if result["pending"]:
             log("⚠️ 这些文件是**空模板**，里面的 %s 要你填：%s"
@@ -824,8 +994,71 @@ def _same_file(a: str, b: str) -> bool:
         return False
 
 
-def migrate_project(name_or_path: str, *, dry: bool = False, log=print) -> dict:
-    """把 v1 结构的项目升到 v2 —— **只移动，不覆盖，可反复跑**。
+def _prune_empty_dirs(root: str) -> None:
+    """把 `root` 底下搬空了的目录自下而上收掉（`root` 自己留着）。
+
+    不收的话，搬完之后资料根里会剩一串空壳目录 + `.gitkeep` ——
+    面板上那一格仍然"在"，只是永远是空的，而人以为片子还在那儿。
+    """
+    for cur, _dirs, _files in os.walk(root, topdown=False):
+        if os.path.normcase(cur) == os.path.normcase(root):
+            continue
+        try:
+            if not any(True for _ in os.scandir(cur)):
+                os.rmdir(cur)
+        except OSError:
+            pass
+
+
+def _move_tree(src: str, dst: str, *, dry: bool) -> list:
+    """把 `src` 这棵树搬进 `dst`，**逐文件**按「先查目标再动源」判。
+
+    返回 `[(状态, 相对 src 的路径), …]`，状态与 :func:`migrate_project` 那张表同一套。
+
+    为什么不整个目录 `shutil.move`：目标已经有一份的时候，move 会把两棵树**揉在一起**，
+    同名文件直接覆盖 —— 正是迁移最该防的那种失败（把人写的正本换成一份旧副本）。
+    逐文件才判得出"这一份到底是不是同一份"。
+    """
+    actions = []
+    for cur, dirs, files in os.walk(src):
+        dirs[:] = [d for d in dirs if d not in PRUNE_DIRS]
+        for name in sorted(files):
+            if name == ".gitkeep":
+                continue
+            here = os.path.join(cur, name)
+            rel = os.path.relpath(here, src)
+            there = os.path.join(dst, rel)
+            if os.path.isfile(there):
+                actions.append(("duplicate" if _same_file(here, there) else "conflict", rel))
+                continue
+            if not dry:
+                # `shutil.move` 而不是 `os.replace`：两个根可能在**不同盘**上
+                # （引擎的 output 目录常被单配到别处），`os.replace` 跨卷会直接失败。
+                # 目标不存在这件事上面刚查过，所以 move 不会覆盖任何东西。
+                os.makedirs(os.path.dirname(there), exist_ok=True)
+                shutil.move(here, there)
+            actions.append(("moved", rel))
+    if not dry and actions and not any(state == "conflict" for state, _r in actions):
+        _prune_empty_dirs(src)
+    return actions
+
+
+def migrate_project(name_or_path: str, *, root: str = None, out_root: str = None,
+                    dry: bool = False, log=print) -> dict:
+    """把老结构的项目升到当前结构（v1 → v2 → v3）—— **只移动，不覆盖，可反复跑**。
+
+    两件事：
+
+    ① `MIGRATIONS`：v1 → v2，同根内把全剧级设定收回 `00_总纲/`；
+    ② `PROJECT_DIRS_OUT`：v2 → v3，把该落**产物根**的那两格（`09_SHOTS` / `12_FILMS`）
+       整个从资料根挪过去。第 ② 步只在**配了产物根**（两个根不是同一个目录）时才有事可做，
+       单树布局下它逐格报 `skip`。
+
+    **两个根**（`root` / `out_root`）：给了就用它们，不给就按环境变量与工作区探测。
+    宿主侧一律显式给（它自己算过 `--project-dir` / `--project-out-dir`）——
+    环境变量可能没设，那时这里会去 `projects_root()` 往上找 `projects/`，
+    推出的产物根跟面板看到的**不是同一个**。而搬错了**不报错**：
+    文件好好地在另一个目录里，面板那一格却是空的 —— 事后没人知道东西去哪了。
 
     每条 `MIGRATIONS` 的判定顺序（**先查目标再动源，绝不先删后写**）：
 
@@ -842,10 +1075,10 @@ def migrate_project(name_or_path: str, *, dry: bool = False, log=print) -> dict:
     迁移脚本最坏的失效模式不是报错，是**把人写的正本换成一份旧副本**。
     所以第 3 行（冲突）宁可不迁也要停下来喊人。
 
-    返回 `{"path", "actions": [(状态, 源, 目标)], "ok"}`。
+    返回 `{"path", "path_out", "actions": [(状态, 源, 目标)], "ok"}`。
     `ok=False` 是"有冲突要人看"，不是脚本自己失败。
     """
-    path = resolve_project(name_or_path)
+    path = resolve_project(name_or_path, root=root, out_root=out_root)
     actions = []
     for src_rel, dst_rel in MIGRATIONS:
         src = os.path.join(path, src_rel.replace("/", os.sep))
@@ -865,6 +1098,29 @@ def migrate_project(name_or_path: str, *, dry: bool = False, log=print) -> dict:
         else:
             actions.append(("absent", src_rel, dst_rel))
 
+    # ② 跨根搬落点（v2 → v3）：判据是 `DIR_ROOTS`，不是又抄一份清单 ——
+    #    以后再有落点从资料根挪到产物根，改那张表就够了，这里自动跟上。
+    out_path = resolve_project(name_or_path, must_exist=False, kind=ROOT_OUTPUT,
+                              root=root, out_root=out_root)
+    if os.path.normcase(out_path) != os.path.normcase(path):
+        for rel in PROJECT_DIRS_OUT:
+            label = rel + "/"
+            src = os.path.join(path, rel.replace("/", os.sep))
+            dst = os.path.join(out_path, rel.replace("/", os.sep))
+            if not os.path.isdir(src):
+                actions.append(("skip" if os.path.isdir(dst) else "absent", label, label))
+                continue
+            moved = _move_tree(src, dst, dry=dry)
+            if not moved:                # 只有 .gitkeep 的空壳：视为"本来就没有"
+                actions.append(("absent", label, label))
+                continue
+            for state, inside in moved:
+                # `inside` 是 `os.path.relpath` 出来的（Windows 上是反斜杠），
+                # 而上面那几行与 `MIGRATIONS` 一律用 `/`：不归一的话，同一份清单里
+                # 一半是 `00_PROJECT/01_剧本/…`、一半是 `09_SHOTS/EP01\EP01_SH001.mp4`。
+                shown = label + inside.replace(os.sep, "/")
+                actions.append((state, shown, shown))
+
     ok = not any(state == "conflict" for state, _s, _d in actions)
     if log:
         label = {
@@ -882,10 +1138,10 @@ def migrate_project(name_or_path: str, *, dry: bool = False, log=print) -> dict:
         if not ok:
             log("⚠️ 有冲突没处理：请人工比对上面两份，脚本不会替你选一份。")
         elif not any(state == "moved" for state, _s, _d in actions):
-            log("无需变更：全剧级数据都已在 00_总纲/。")
+            log("无需变更：全剧级数据都已在 00_总纲/，该进产物根的也都已经在了。")
         log("提示：引用旧路径的模块提示词与文档要同步改"
             "（搜「分集大纲与三表」「角色小传」）。")
-    return {"path": path, "actions": actions, "ok": ok}
+    return {"path": path, "path_out": out_path, "actions": actions, "ok": ok}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -893,10 +1149,13 @@ def migrate_project(name_or_path: str, *, dry: bool = False, log=print) -> dict:
 # ─────────────────────────────────────────────────────────────
 
 #: 遍历时绕开的目录名 —— 生成物，不是资料。
-#: ⚠️ 刻意**只放 `__pycache__`**：面板上的"文件数"原先由 `projects._count_files` 算，
-#: 它也只绕这一个；多绕一个都会让那个数字悄悄变掉（老面板与新面板对不上账）。
+#: `__pycache__` 是原先就绕的那一个。
+#: `_work`（:data:`WORK_SUBDIR`）是加这个根划分时一起加的：中间产物不是"这一格有什么"，
+#: 数进"文件数"只会让那个数字随一次失败的重跑而跳动，而面板拿它排序（见 ``projects.list``）。
+#: ⚠️ 这份表只管**两个项目根里的遍历**，不管 ``temp/``：可弃中间产物压根不进项目树
+#: （落引擎的 ``temp/``），所以不必在这里再绕一个 ``temp``。
 #: 项目目录在父仓库里、自身不是独立仓库，所以现实中也见不到 `.git`。
-PRUNE_DIRS = frozenset({"__pycache__"})
+PRUNE_DIRS = frozenset({"__pycache__", WORK_SUBDIR})
 
 
 def _seed_rel_paths() -> frozenset:
@@ -938,26 +1197,40 @@ def _claimants(path: str) -> dict:
     return {key: tuple(value) for key, value in out.items()}
 
 
-def scan_project(name_or_path: str) -> dict:
-    """体检：落点齐不齐 + 各阶段有没有实质产物 + 有没有 v1 老结构没迁。
+def scan_project(name_or_path: str, *, out_path: str = None) -> dict:
+    """体检：落点齐不齐 + 各阶段有没有实质产物 + 有没有老结构没迁。
 
-    返回 `{"path", "missing", "legacy", "stages", "files", "mtime", "stage_specs"}`。
-    `files` / `mtime` 是**同一次遍历顺手算出来的**（数文件 + 最近改动），口径与原先
-    `projects._count_files` / `projects._latest_mtime` 逐字一致，调用方不必再各走
-    一遍全树。
+    返回 `{"path", "path_out", "missing", "legacy", "stages", "files", "files_in",
+    "files_out", "mtime", "stage_specs"}`。
+
+    **两个根**："落点齐不齐"按 :data:`DIR_ROOTS` 分别到资料根 / 产物根里查；
+    `files` / `mtime` 是**两个根一起**算的 —— 一部剧的体量本来就横跨两边，
+    只数一边会得出"这部戏几乎是空的"这种谁也对不上的结论。
+    另有 `files_in` / `files_out` 给出拆分：只有"`09_SHOTS` 里有 300 个文件"这种话
+    说得出口，人才知道下一步该往哪边看。
+
+    `files` / `mtime` 都是**同一次遍历顺手算出来的**（数文件 + 最近改动），
+    调用方不必再各走一遍全树。
     `legacy` 是**还躺在 v1 位置**的全剧级设定 —— 光看"落点齐不齐"是发现不了它的：
     `01_剧本/` 一直都在，只是里面混着两种粒度的东西。
     """
     path = resolve_project(name_or_path)
-    missing = [rel for rel in PROJECT_DIRS
-               if not os.path.isdir(os.path.join(path, rel.replace("/", os.sep)))]
+    # 产物根：显式给的 > 由资料根推 > 就是资料根自己（**单树布局**）。
+    out_root = os.path.abspath(out_path) if out_path else out_root_for(path)
+    single = os.path.normcase(out_root) == os.path.normcase(path)
+
+    missing = []
+    for rel in PROJECT_DIRS:
+        base = path if root_of(rel) == ROOT_INPUT else out_root
+        if not os.path.isdir(os.path.join(base, rel.replace("/", os.sep))):
+            missing.append(rel)
     legacy = [src_rel for src_rel, _dst_rel in MIGRATIONS
               if os.path.isfile(os.path.join(path, src_rel.replace("/", os.sep)))]
 
-    claimants = _claimants(path)
     seeds = _seed_rel_paths()
     buckets: list = [[] for _ in STAGE_OUTPUTS]
     total = 0
+    counts = {ROOT_INPUT: 0, ROOT_OUTPUT: 0}
     latest = 0.0
 
     # **一遍走完**。老实现是「按阶段各自走一遍 check_dirs」（S6/S7 的落点还互相重叠），
@@ -972,51 +1245,64 @@ def scan_project(name_or_path: str) -> dict:
     #
     # `owners` 随栈带下去而不是每层往上重算：`check_dirs` 的前缀式认领在进目录时
     # 只要加一次，整棵树就都不必回看了。
-    stack: list = [(path, ())]
-    while stack:
-        dirpath, owners = stack.pop()
-        owners = owners + claimants.get(os.path.normcase(dirpath), ())
-        try:
-            entries = list(os.scandir(dirpath))
-        except OSError:
-            continue
+    #
+    # 两个根跑同一段代码，只是 `claimants` 各建一份（键是绝对路径，各查各的）。
+    # 单树布局下产物根**就是**资料根 —— 那时只走一遍，否则同一棵树会被数两次。
+    roots = [(path, ROOT_INPUT)]
+    if not single:
+        roots.append((out_root, ROOT_OUTPUT))
 
-        try:                            # 目录自身也算一次改动（新建空落点就是一次）
-            latest = max(latest, os.stat(dirpath).st_mtime)
-        except OSError:
-            pass
-
-        for entry in entries:
+    for base, kind in roots:
+        claimants = _claimants(base)
+        stack: list = [(base, ())]
+        while stack:
+            dirpath, owners = stack.pop()
+            owners = owners + claimants.get(os.path.normcase(dirpath), ())
             try:
-                if entry.is_dir(follow_symlinks=False):
-                    if entry.name not in PRUNE_DIRS:
-                        stack.append((entry.path, owners))
-                    continue
-                if not entry.is_file():
-                    continue
-                if entry.name == ".gitkeep":
-                    continue
-                stamp = entry.stat().st_mtime
+                entries = list(os.scandir(dirpath))
             except OSError:
                 continue
-            latest = max(latest, stamp)
-            total += 1
-            if not owners:
-                continue
-            if entry.path[len(path) + 1:] in seeds and _looks_like_blank_template(entry.path):
-                continue
-            lower = entry.name.lower()
-            for idx, exts in owners:
-                if exts and not lower.endswith(exts):
+
+            try:                        # 目录自身也算一次改动（新建空落点就是一次）
+                latest = max(latest, os.stat(dirpath).st_mtime)
+            except OSError:
+                pass
+
+            for entry in entries:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        if entry.name not in PRUNE_DIRS:
+                            stack.append((entry.path, owners))
+                        continue
+                    if not entry.is_file():
+                        continue
+                    if entry.name == ".gitkeep":
+                        continue
+                    stamp = entry.stat().st_mtime
+                except OSError:
                     continue
-                buckets[idx].append(entry.path)
+                latest = max(latest, stamp)
+                total += 1
+                counts[kind] += 1
+                if not owners:
+                    continue
+                # 相对各自那个根 —— 种子表写的是"项目下的哪一级"，
+                # 两个根下项目那一层同名，所以同一套路径在两边都成立。
+                if entry.path[len(base) + 1:] in seeds and _looks_like_blank_template(entry.path):
+                    continue
+                lower = entry.name.lower()
+                for idx, exts in owners:
+                    if exts and not lower.endswith(exts):
+                        continue
+                    buckets[idx].append(entry.path)
 
     # `rel` 仍是**字符串**（桌面/面板只把它当文字念），一格有多个落点时用「、」连
     stages = [(label, "、".join(rels), sorted(buckets[idx]))
               for idx, (label, rels, _exts) in enumerate(STAGE_OUTPUTS)]
-    return {"path": path, "missing": missing, "legacy": legacy,
-            "stages": stages, "files": total, "mtime": latest,
-            "stage_specs": STAGE_SPECS}
+    return {"path": path, "path_out": out_root, "missing": missing, "legacy": legacy,
+            "stages": stages, "files": total,
+            "files_in": counts[ROOT_INPUT], "files_out": counts[ROOT_OUTPUT],
+            "mtime": latest, "stage_specs": STAGE_SPECS}
 
 
 def format_report(res: dict) -> str:

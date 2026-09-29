@@ -25,21 +25,23 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from comfy_studio import projects as projects_module
+from comfy_studio import projects_spec as spec_module
+from comfy_studio.layout import INPUT_SUBDIR, OUTPUT_SUBDIR
 from comfy_studio.mcp import McpError, McpHub
-from comfy_studio.novels import MANJU_REL
 from comfy_studio.projects import (
     DEFAULT_READ_CHARS,
     MAX_READ_CHARS,
     MAX_TREE_FILES,
     PROJECT_SHELVES,
-    PROJECT_SUBDIR,
     SPEC_NAME,
     ProjectLibrary,
     ProjectsClient,
     ProjectsError,
     default_project_dir,
+    default_project_out_dir,
     default_spec_path,
     load_spec,
     shelf_gaps,
@@ -172,8 +174,12 @@ class ProjectsLibraryTest(unittest.TestCase):
     def test_default_paths_are_repo_relative(self) -> None:
         # 默认落点必须是**检出内相对路径**拼出来的：换机器、换检出照样成立，
         # 不许出现哪台机器的盘符（见仓库根 README「不写死路径」那条）。
-        self.assertEqual(default_project_dir(self.repo), self.repo / "custom_nodes/comfy_studio/manju/projects")
-        self.assertEqual(PROJECT_SUBDIR, "projects")
+        # 两个默认落点各归各的根，而且**都在引擎真正读写的目录**里：资料根 =
+        # <检出>/input（加载类节点只认 input）、产物根 = <检出>/output（产物注解只认
+        # output）。落反了不报错 —— 产物在盘上，就是不在引擎读得到的地方。
+        self.assertEqual(default_project_dir(self.repo), self.repo / INPUT_SUBDIR)
+        self.assertEqual(default_project_out_dir(self.repo), self.repo / OUTPUT_SUBDIR)
+        self.assertEqual((INPUT_SUBDIR, OUTPUT_SUBDIR), ("input", "output"))
         # 事实源与 projects 模块**同包**：从 __file__ 定位 —— 不用知道 ComfyUI 装在哪，
         # 也不许受当前工作目录影响（换台机器、换检出照样成立）。
         spec = default_spec_path()
@@ -656,12 +662,249 @@ class ProjectsLibraryTest(unittest.TestCase):
         self.assertEqual(self.library.linked_novel(self.root / "剧癸"), "")
 
 
+class TwoRootLayoutTest(unittest.TestCase):
+    """资料根与产物根分开时：每个落点归哪个根**只有** ``DIR_ROOTS`` 一处说了算。
+
+    这一组用**包内那份真规范**（不套 ``FAKE_SPEC``）：两个根是规范里 ``DIR_ROOTS`` 定义的，
+    换一份老规范就没有这件事了 —— "老规范照样能用"由 :class:`ProjectsLibraryTest` 那组守着。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="comfy-studio-two-roots-")
+        self.repo = Path(self._tmp.name)
+        # 与宿主侧同一个算法：两个根从 comfyui-dir 那一对目录推出来（见 layout 模块）。
+        self.in_root = self.repo / "input"
+        self.out_root = self.repo / "output"
+        self.library = ProjectLibrary(self.in_root, out_directory=self.out_root)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    # ---- 根怎么分 -------------------------------------------------------
+
+    def test_not_giving_an_out_root_means_one_tree(self) -> None:
+        """不给产物根 = 单树布局。老调用方一行不改还能跑，全靠这一条。"""
+        one = ProjectLibrary(self.in_root)
+        self.assertTrue(one.single_root)
+        self.assertEqual(one.out_directory, one.directory)
+        self.assertFalse(self.library.single_root)
+        self.assertTrue(self.library.status()["single_root"] is False)
+        self.assertEqual(self.library.status()["dir_out"], str(self.out_root))
+
+    def test_every_landing_has_exactly_one_root(self) -> None:
+        """每个落点都得有归属，而且**只能有一个**。
+
+        漏一个 = 那一格不知道往哪儿落；两半重叠 = 同一个落点会在两个根下各建一个目录，
+        而面板只会去其中一个里找。
+        """
+        kinds_in = spec_module.dirs_in_root(spec_module.ROOT_INPUT)
+        kinds_out = spec_module.dirs_in_root(spec_module.ROOT_OUTPUT)
+        self.assertEqual(sorted(kinds_in + kinds_out), sorted(spec_module.PROJECT_DIRS))
+        self.assertEqual(set(kinds_in) & set(kinds_out), set())
+        # 逐镜片子与成片在产物根（引擎的产物注解读得到），剧本/素材/音频在资料根
+        # （加载类节点按名读得到）。
+        for rel in ("09_SHOTS", "12_FILMS"):
+            self.assertEqual(spec_module.root_of(rel), spec_module.ROOT_OUTPUT, rel)
+        for rel in ("11_AUDIO", "08_STORYBOARDS"):
+            self.assertEqual(spec_module.root_of(rel), spec_module.ROOT_INPUT, rel)
+
+    def test_a_bare_name_still_means_the_data_root(self) -> None:
+        """没列进 ``DIR_ROOTS`` 的落点一律落**资料根** —— 那张表是**例外表**，不是白名单。
+
+        反过来的话，规范里新加一格而这里忘了登记，那一格会**静默**落到产物根：目录建出来了、
+        面板上也看得见，就是引擎按名读不到它。
+        """
+        self.assertEqual(spec_module.root_of("98_没人登记过的格子"), spec_module.ROOT_INPUT)
+
+    # ---- 建项目 ---------------------------------------------------------
+
+    def test_create_puts_each_dir_in_its_own_root(self) -> None:
+        self.library.create("剧甲")
+        for rel in spec_module.dirs_in_root(spec_module.ROOT_INPUT):
+            self.assertTrue((self.in_root / "剧甲" / rel).is_dir(), rel)
+            self.assertFalse((self.out_root / "剧甲" / rel).exists(), rel)
+        for rel in spec_module.dirs_in_root(spec_module.ROOT_OUTPUT):
+            self.assertTrue((self.out_root / "剧甲" / rel).is_dir(), rel)
+            self.assertFalse((self.in_root / "剧甲" / rel).exists(), rel)
+
+    def test_create_reports_the_two_roots_separately(self) -> None:
+        """两个根**分开报**：合成一份的话，人看见 ``12_FILMS`` 在列表里，就会去资料根下找它。"""
+        made = self.library.create("剧甲")
+        self.assertEqual(made["path"], str(self.in_root / "剧甲"))
+        self.assertEqual(made["path_out"], str(self.out_root / "剧甲"))
+        self.assertEqual(set(made["dirs"]), set(spec_module.PROJECT_DIRS_IN))
+        self.assertEqual(set(made["dirs_out"]), set(spec_module.PROJECT_DIRS_OUT))
+
+    # ---- 读写要落到对的那个根 -------------------------------------------
+
+    def test_reading_and_writing_a_product_cell_crosses_roots(self) -> None:
+        """产物那一格的读写落在**产物根**，而面板拿回来的 ``rel`` 相对**它自己那个根**。
+
+        拿资料根去 relpath，面板会收到 `../../output/剧/09_SHOTS/…` 这种既长又指不到
+        地方的字符串 —— 它按这个字符串回来读写，就再也找不到那份文件了。
+        """
+        self.library.create("剧甲")
+        wrote = self.library.write(
+            "剧甲", "09_SHOTS/视频提示词.md", "S5 视频提示词：特写，推镜。", base_digest=""
+        )
+        self.assertEqual(wrote["rel"], "09_SHOTS/视频提示词.md")
+        self.assertTrue((self.out_root / "剧甲/09_SHOTS/视频提示词.md").is_file())
+        self.assertFalse((self.in_root / "剧甲/09_SHOTS").exists())
+
+        got = self.library.read("剧甲", "09_SHOTS/视频提示词.md")
+        self.assertEqual(got["rel"], "09_SHOTS/视频提示词.md")
+        self.assertIn("推镜", got["text"])
+
+    def test_roots_hands_the_host_two_absolute_paths(self) -> None:
+        """宿主侧就靠这一条：两个根都算成绝对路径，再**显式**交给流水线。
+
+        不显式给的话，流水线只能拿项目**名字**去问事实源，而那条路走环境变量与工作区探测 ——
+        和宿主算出来的可以不是同一个根，并且两边都不报错。
+        """
+        self.library.create("剧甲")
+        project, project_out = self.library.roots("剧甲")
+        self.assertEqual(project, (self.in_root / "剧甲").resolve())
+        self.assertEqual(project_out, (self.out_root / "剧甲").resolve())
+        with self.assertRaises(ProjectsError):
+            self.library.roots("没有这部剧")
+
+
+class SpecMigrationTest(unittest.TestCase):
+    """`migrate_project` 的 v2 → v3 那一步：把该进产物根的两格**跨根搬**过去。
+
+    这一步动的是真文件（`shutil.move`，不是 copy），而它最坏的失效模式不是报错 ——
+    是**把人写好的正本换成一份旧副本**，或者搬丢一份而面板上只是"那一格空了"。
+    所以逐条钉住三件事：该搬的搬对、两边都有且内容不同时**一个字节都不动**、预演不落盘。
+
+    两个根由环境变量给（`VOIDE_PROJECTS_ROOT` / `VOIDE_PROJECTS_OUT_ROOT`）——
+    那是 :func:`spec.resolve_project` 找根的路，也就是跑 `main.py project migrate` 时走的那条。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="comfy-studio-migrate-")
+        self.repo = Path(self._tmp.name)
+        self.in_root = self.repo / "input"
+        self.out_root = self.repo / "output"
+        self.project = self.in_root / "剧甲"
+        self.project.mkdir(parents=True)
+        self.env = mock.patch.dict(
+            os.environ,
+            {
+                "VOIDE_PROJECTS_ROOT": str(self.in_root),
+                "VOIDE_PROJECTS_OUT_ROOT": str(self.out_root),
+            },
+        )
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.addCleanup(self._tmp.cleanup)
+
+    def _write(self, root: Path, rel: str, text: str) -> Path:
+        path = root / "剧甲" / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def _states(self, res: dict) -> dict:
+        """``源相对路径 → 状态``。迁移表的行与跨根那两格都在这一个字典里。"""
+        return {src: state for state, src, _dst in res["actions"]}
+
+    def test_the_cross_root_step_moves_what_dir_roots_says(self) -> None:
+        """该进产物根的两格搬过去，不该动的一格**原地不动**。
+
+        判据只有事实源的 ``DIR_ROOTS`` 一处：这里另抄一份"哪两格要搬"的话，
+        规范将来再把一格挪到产物根，迁移脚本就不会跟着动 —— 而它不报错，只是不搬。
+        """
+        shot = self._write(self.in_root, "09_SHOTS/EP01/EP01_SH001.mp4", "逐镜片子")
+        film = self._write(self.in_root, "12_FILMS/成片.mp4", "成片")
+        audio = self._write(self.in_root, "11_AUDIO/EP01.wav", "音频")
+
+        res = spec_module.migrate_project("剧甲", log=None)
+
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["path"], str(self.project.resolve()))
+        expected = {
+            "09_SHOTS/EP01/EP01_SH001.mp4": "逐镜片子",
+            "12_FILMS/成片.mp4": "成片",
+        }
+        for rel, text in expected.items():
+            there = self.out_root / "剧甲" / rel
+            self.assertTrue(there.is_file(), "%s 该搬到产物根" % rel)
+            self.assertEqual(there.read_text(encoding="utf-8"), text)
+            self.assertEqual(self._states(res)[rel], "moved", rel)
+        for gone in (shot, film):
+            self.assertFalse(gone.exists(), "%s 该搬走（源不能留着）" % gone)
+        # 旧位置底下搬空了的**子目录**自下而上收掉 —— 留着的话资料根里会挂着一层
+        # 谁也对不上的空壳。（落点那一级自己留着，见 `_prune_empty_dirs` 的说明。）
+        self.assertFalse((self.project / "09_SHOTS/EP01").exists())
+        self.assertEqual(list((self.project / "09_SHOTS").rglob("*")), [])
+        self.assertEqual(list((self.project / "12_FILMS").rglob("*")), [])
+        # 资料根那一格（音频）一个字节都不该动。
+        self.assertTrue(audio.is_file())
+        self.assertEqual(audio.read_text(encoding="utf-8"), "音频")
+        self.assertFalse((self.out_root / "剧甲/11_AUDIO").exists())
+
+    def test_a_conflict_is_reported_and_nothing_is_touched(self) -> None:
+        """两边都有、内容不同 → 报 ``conflict``、``ok=False``，并且**两边都不动**。
+
+        脚本替人挑一份正是它最该拒的事：挑错了就是把人的正本换成旧副本，
+        而盘上两份都还在，看起来"迁完了"。
+        """
+        mine = self._write(self.in_root, "09_SHOTS/EP01_SH001.mp4", "我改过的")
+        theirs = self._write(self.out_root, "09_SHOTS/EP01_SH001.mp4", "产物根里那份")
+
+        res = spec_module.migrate_project("剧甲", log=None)
+
+        self.assertFalse(res["ok"])
+        self.assertEqual(self._states(res)["09_SHOTS/EP01_SH001.mp4"], "conflict")
+        self.assertEqual(mine.read_text(encoding="utf-8"), "我改过的")
+        self.assertEqual(theirs.read_text(encoding="utf-8"), "产物根里那份")
+
+    def test_a_duplicate_is_reported_without_deleting_anything(self) -> None:
+        """两份一样时报 ``duplicate``（内容相同 = 多半是上一次搬到一半又跑了一遍）。
+
+        报 ``duplicate`` 而不是"删掉多的那一份"：删不删是人定的事，
+        而脚本多删一份的代价，跟它多覆盖一份是一样的。
+        """
+        self._write(self.in_root, "09_SHOTS/EP01_SH001.mp4", "同一份")
+        keep = self._write(self.out_root, "09_SHOTS/EP01_SH001.mp4", "同一份")
+
+        res = spec_module.migrate_project("剧甲", log=None)
+
+        self.assertTrue(res["ok"])
+        self.assertEqual(self._states(res)["09_SHOTS/EP01_SH001.mp4"], "duplicate")
+        self.assertTrue(keep.is_file())
+        self.assertTrue((self.project / "09_SHOTS/EP01_SH001.mp4").is_file())
+
+    def test_a_dry_run_reports_but_does_not_touch_the_disk(self) -> None:
+        """预演只报不落盘 —— 人要先看见"会搬什么"才敢让它真搬。"""
+        shot = self._write(self.in_root, "09_SHOTS/EP01_SH001.mp4", "逐镜片子")
+
+        res = spec_module.migrate_project("剧甲", dry=True, log=None)
+
+        self.assertEqual(self._states(res)["09_SHOTS/EP01_SH001.mp4"], "moved")
+        self.assertTrue(shot.is_file())
+        self.assertFalse((self.out_root / "剧甲/09_SHOTS/EP01_SH001.mp4").exists())
+
+    def test_one_tree_has_nothing_to_move(self) -> None:
+        """单树布局（没配产物根）下这一步**无事可做**，而且不该报错。
+
+        两个根是同一个目录时还去"跨根搬"，目标就是源自己 —— 那样搬一步就把文件弄丢了。
+        """
+        self._write(self.in_root, "09_SHOTS/EP01_SH001.mp4", "逐镜片子")
+        with mock.patch.dict(os.environ, {"VOIDE_PROJECTS_OUT_ROOT": ""}):
+            res = spec_module.migrate_project("剧甲", log=None)
+
+        self.assertTrue(res["ok"])
+        self.assertNotIn("09_SHOTS/EP01_SH001.mp4", self._states(res))
+        self.assertTrue((self.project / "09_SHOTS/EP01_SH001.mp4").is_file())
+
+
 class ProjectsToolTableTest(unittest.IsolatedAsyncioTestCase):
     """汇进 MCP 工具表那两张：名字、参数、以及"建项目不在这张表里"这条决定。"""
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="comfy-studio-projects-tools-")
-        self.root = Path(self._tmp.name) / MANJU_REL / PROJECT_SUBDIR
+        self.root = Path(self._tmp.name) / INPUT_SUBDIR
         self.spec_path = Path(self._tmp.name) / "fake_spec.py"
         self.spec_path.write_text(FAKE_SPEC, encoding="utf-8")
         self.library = ProjectLibrary(self.root, spec_path=self.spec_path)
@@ -783,6 +1026,7 @@ class ProjectsRpcTest(unittest.TestCase):
             "projects/tree",
             "projects/read",
             "projects/create",
+            "projects/migrate",
             "projects/link_novel",
             "projects/brief",
             "projects/write",
@@ -850,6 +1094,8 @@ class ProjectsRpcTest(unittest.TestCase):
             ("projects_create", {"name": "甲", "episodes": 0}),
             ("projects_create", {"name": "甲", "upgrade": "yes"}),
             ("projects_create", {"name": "甲", "novel": 7}),
+            ("projects_migrate", {}),
+            ("projects_migrate", {"name": "甲", "dry": "yes"}),
             ("projects_link_novel", {"name": "甲", "novel": "  "}),
             ("projects_brief", {"name": "  "}),
             ("projects_write", {"name": "甲", "rel": "x.md"}),
@@ -869,3 +1115,121 @@ class ProjectsRpcTest(unittest.TestCase):
             self.host.projects_tree({"name": "查无此剧"}, None)
         self.assertEqual(err.exception.code, INTERNAL_ERROR)
         self.assertIn("没有这个项目", err.exception.message)
+
+    def test_migrate_over_rpc_says_which_spec_cannot_do_it(self) -> None:
+        # FAKE_SPEC 是一份**老**规范（没有 migrate_project）：不知道"两个根"这件事的实现
+        # 硬跑只会把产物格留在资料根下，而它会**报成功**。所以这里宁可不做，把原因说清。
+        self.host.projects_create({"name": "流氓天尊"}, None)
+        with self.assertRaises(RpcError) as err:
+            self.host.projects_migrate({"name": "流氓天尊", "dry": True}, None)
+        self.assertEqual(err.exception.code, INTERNAL_ERROR)
+        self.assertIn("migrate_project", err.exception.message)
+
+
+class ProjectMigrateTest(unittest.TestCase):
+    """``ProjectLibrary.migrate``：面板上那一下「搬家」的落盘与回执（**真规范** + 两个根）。
+
+    为什么这条通道值得单独一组用例：它是唯一一个**移动人已经做好的东西**的动作。
+    预演报错只是白点一下；真搬搬错则是"文件到了另一个目录里，而面板那一格空着" ——
+    两边都不报错，事后没人知道东西去哪了。所以这里钉的四件事是：预演不落盘、
+    真搬搬对且源不留、冲突两边都不动还要报上来、单树布局下原地不动。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="comfy-studio-migrate-lib-")
+        self.repo = Path(self._tmp.name)
+        self.in_root = self.repo / "input"
+        self.out_root = self.repo / "output"
+        self.library = ProjectLibrary(self.in_root, out_directory=self.out_root)
+        self.addCleanup(self._tmp.cleanup)
+
+    def _v2_project(self) -> Path:
+        """搭一部**v2 结构**的老项目：产物格还在资料根里，全剧级设定还在 v1 位置。"""
+        path = self.in_root / "剧甲"
+        (path / "09_SHOTS/EP01").mkdir(parents=True)
+        (path / "09_SHOTS/EP01/EP01_SH001.mp4").write_text("逐镜片子", encoding="utf-8")
+        (path / "00_PROJECT/01_剧本").mkdir(parents=True)
+        (path / "00_PROJECT/01_剧本/分集大纲与三表.md").write_text("大纲", encoding="utf-8")
+        return path
+
+    def _by_rel(self, res: dict) -> dict:
+        return {item["rel"]: item for item in res["actions"]}
+
+    def test_a_dry_run_shows_where_each_thing_would_go(self) -> None:
+        path = self._v2_project()
+
+        res = self.library.migrate("剧甲", dry=True)
+
+        self.assertTrue(res["dry"])
+        self.assertTrue(res["ok"])
+        self.assertFalse(res["single_root"])
+        seen = self._by_rel(res)
+        # 同根内收拢（v1 → v2）：源与目标都在资料根
+        v1 = seen["00_PROJECT/01_剧本/分集大纲与三表.md"]
+        self.assertEqual(v1["state"], "moved")
+        self.assertEqual(v1["root"], "input")
+        self.assertEqual(v1["dst"], str(path / "00_PROJECT/01_剧本/00_总纲/分集大纲与三表.md"))
+        # 跨根（v2 → v3）：**相对路径两边一模一样**，所以回执必须给出绝对路径 + 哪个根 ——
+        # 只给相对路径的话，面板画出来的"从哪搬到哪"是同一句话，等于没说。
+        shot = seen["09_SHOTS/EP01/EP01_SH001.mp4"]
+        self.assertEqual(shot["state"], "moved")
+        self.assertEqual(shot["root"], "output")
+        self.assertEqual(shot["src"], str(path / "09_SHOTS/EP01/EP01_SH001.mp4"))
+        self.assertEqual(shot["dst"], str(self.out_root / "剧甲/09_SHOTS/EP01/EP01_SH001.mp4"))
+        # 预演：盘上一个字节都没动（只报了"会搬两份"）
+        self.assertEqual(res["counts"].get("moved"), 2)
+        self.assertTrue((path / "09_SHOTS/EP01/EP01_SH001.mp4").is_file())
+        self.assertTrue((path / "00_PROJECT/01_剧本/分集大纲与三表.md").is_file())
+        self.assertFalse((self.out_root / "剧甲").exists())
+
+    def test_it_moves_for_real_and_leaves_nothing_behind(self) -> None:
+        path = self._v2_project()
+
+        res = self.library.migrate("剧甲")
+
+        self.assertFalse(res["dry"])
+        self.assertTrue(res["ok"])
+        there = self.out_root / "剧甲/09_SHOTS/EP01/EP01_SH001.mp4"
+        self.assertEqual(there.read_text(encoding="utf-8"), "逐镜片子")
+        # 源**不能留**：留着的话资料根里还是那一格"有东西"，而面板看的是产物根。
+        self.assertFalse((path / "09_SHOTS/EP01/EP01_SH001.mp4").exists())
+        self.assertTrue((path / "00_PROJECT/01_剧本/00_总纲/分集大纲与三表.md").is_file())
+        self.assertFalse((path / "00_PROJECT/01_剧本/分集大纲与三表.md").exists())
+        # 顺手回的体检是**搬之后**的，且两个根一起数（这件东西现在横跨两边）
+        self.assertEqual(res["summary"]["files"], 2)
+
+    def test_a_conflict_is_reported_and_neither_copy_is_touched(self) -> None:
+        path = self._v2_project()
+        mine = path / "09_SHOTS/EP01/EP01_SH001.mp4"
+        theirs = self.out_root / "剧甲/09_SHOTS/EP01/EP01_SH001.mp4"
+        theirs.parent.mkdir(parents=True)
+        theirs.write_text("产物根那份", encoding="utf-8")
+
+        res = self.library.migrate("剧甲")
+
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["conflicts"], ["09_SHOTS/EP01/EP01_SH001.mp4"])
+        self.assertEqual(mine.read_text(encoding="utf-8"), "逐镜片子")
+        self.assertEqual(theirs.read_text(encoding="utf-8"), "产物根那份")
+        # 逐行独立：**没有冲突的那一行照常搬**（冲突只拦住它自己那一份），报告里逐条列着。
+        self.assertEqual(self._by_rel(res)["00_PROJECT/01_剧本/分集大纲与三表.md"]["state"], "moved")
+        self.assertTrue((path / "00_PROJECT/01_剧本/00_总纲/分集大纲与三表.md").is_file())
+
+    def test_a_single_root_library_moves_nothing_between_roots(self) -> None:
+        library = ProjectLibrary(self.in_root)          # 单树：两个根是同一个目录
+        (self.in_root / "剧甲/09_SHOTS").mkdir(parents=True)
+        (self.in_root / "剧甲/09_SHOTS/EP01_SH001.mp4").write_text("逐镜片子", encoding="utf-8")
+
+        res = library.migrate("剧甲")
+
+        self.assertTrue(res["single_root"])
+        self.assertEqual([item for item in res["actions"] if item["root"] == "output"], [])
+        # 产物格**原地不动**：它本来就该在唯一的那个根里 —— 这时候还去"跨根搬"，
+        # 目标就是源自己。
+        self.assertTrue((self.in_root / "剧甲/09_SHOTS/EP01_SH001.mp4").is_file())
+        self.assertEqual(res["moved"], 0)
+
+    def test_a_missing_project_is_a_readable_error(self) -> None:
+        with self.assertRaises(ProjectsError) as err:
+            self.library.migrate("查无此剧")
+        self.assertIn("没有这个项目", str(err.exception))

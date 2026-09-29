@@ -28,7 +28,9 @@
 面板的四个动作 → 四个方法
 --------------------------
 :meth:`ProjectLibrary.list` / :meth:`tree` / :meth:`read` / :meth:`create`；
-另加 :meth:`brief`：把一部剧的现状写成一段能塞进对话输入框的话（与对话系统的联动）。
+另加 :meth:`brief`：把一部剧的现状写成一段能塞进对话输入框的话（与对话系统的联动）；
+另加 :meth:`migrate`：把老结构的项目搬到当前结构（v1 → v2 → v3，**只移动不覆盖**）——
+它原先只有引擎那份 ``main.py`` 能跑，面板上没有入口。
 建项目一律**只补不覆盖**（那份 ``create_project`` 的既定行为，这里不另立规矩）。
 """
 
@@ -36,6 +38,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 import re
@@ -44,12 +47,14 @@ from pathlib import Path
 from typing import Any
 
 from .cancel import CancelToken
+from .layout import (
+    default_project_dir,
+    default_project_out_dir,
+    resolve_layout,
+)
 from .localfiles import is_within
 from .mcp import McpError, McpTool
-from .novels import MANJU_REL, MAX_TEXT_BYTES, NovelsError, decode_text
-
-#: 项目根落在 manju/ 下的哪一级（与 ``manju/novel/`` 同级）。
-PROJECT_SUBDIR = "projects"
+from .novels import MAX_TEXT_BYTES, NovelsError, decode_text
 
 #: 事实源的文件名：与本模块**同一个包**里的 ``projects_spec.py``（``PROJECT_DIRS`` 所在处）。
 #: 从 ``__file__`` 定位，不认工作目录 —— 宿主进程起在哪，跟包放在哪没关系。
@@ -100,7 +105,7 @@ PROJECT_SHELVES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("dialogue", "对白与配音", ("00_PROJECT/06_对白", "00_PROJECT/06_对白/对白稿")),
     ("index", "资产索引与台账", ("00_PROJECT/02_资产索引", "00_PROJECT/03_台账")),
     ("flow", "流程与进度", ("00_PROJECT/05_流程",)),
-    ("delivery", "交付与出图", ("00_PROJECT/04_交付与出图",)),
+    ("delivery", "交付与出图", ("00_PROJECT/04_交付与出图", "12_FILMS")),
     ("archive", "素材归档", ("00_PROJECT/07_素材归档",)),
     ("world", "世界观", ("01_WORLD",)),
     ("cast", "角色 · 服装 · 道具", ("02_CHARACTERS", "03_COSTUMES", "04_PROPS")),
@@ -170,13 +175,14 @@ def scope_order(spec: Any) -> tuple[str, ...]:
 # 定位：目录与事实源都不写死机器路径
 # ─────────────────────────────────────────────────────────────
 
-def default_project_dir(comfyui_dir: str | os.PathLike[str]) -> Path:
-    """默认项目根：``<comfyui-dir>/custom_nodes/comfy_studio/manju/projects``。
+# `default_project_dir` / `default_project_out_dir` 由文件头的 import 从 `.layout` 引进来。
+#
+# 那两个默认值现在**只有一个出处**（``layout.py``），这里刻意不再自己拼一遍。
+# 老实现拼的是 `…/manju/projects` —— 那是**引擎检出目录内部**，而引擎的加载类节点
+# 只认 `input/`（出界直接 ValueError）。落在那儿的后果是每次出图都要先把素材拷进
+# input/、每次合成都要先把成片拷过去，而这两次拷贝**都不会报错**，只是白花时间。
+# 完整缘由写在 `layout.py` 的开头。
 
-    与 :func:`comfy_studio.novels.default_novel_dir` 同一个父目录 —— 原文与项目是
-    同一部剧的两头，摆在一起才知道谁是谁的。
-    """
-    return Path(comfyui_dir).expanduser().resolve() / MANJU_REL / PROJECT_SUBDIR
 
 
 def default_spec_path() -> Path:
@@ -310,6 +316,24 @@ def _rel_path(root: Path, path: Path) -> str:
     return os.path.relpath(str(path), str(root)).replace(os.sep, "/")
 
 
+def _accepts(fn: Any, kw: str) -> bool:
+    """这个函数收不收这个关键字参数。
+
+    `out_root` / `out_path` 是"两个根"这次加进来的。事实源可以换一份
+    （`--spec` / `ProjectLibrary(spec_path=…)`），换来的那一份可能还是老签名 ——
+    直接传过去是 `TypeError`，而它会把"建项目""体检"整条路一起弄坏：
+    面板上什么都建不出来，报的还是一句看不懂的类型错。
+    拿不到签名（C 实现、`functools.partial`）时回 False：宁可不传，也不要试一次再回滚。
+    """
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if kw in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def _scope_title(scope: str) -> str:
     """粒度组的标题。空串只有一个来源：那个落点不在 ``spec.DIR_SCOPES`` 里。
 
@@ -317,6 +341,22 @@ def _scope_title(scope: str) -> str:
     真的属于那一层，而它其实只是两边没对齐（:func:`scope_gaps` 会把它报出来）。
     """
     return scope or "粒度未知"
+
+
+def _root_of(spec: Any, rel: str) -> str:
+    """一个落点挂在哪个根上 —— 问事实源的 ``root_of``；它没有就一律**资料根**。
+
+    与 :meth:`ProjectLibrary._file_path` 里那道 ``getattr`` 守卫同一个理由：事实源可以换一份
+    （``--spec`` / ``ProjectLibrary(spec_path=…)``，见 :func:`_accepts`），换来的那份可能早于
+    "两个根"这件事 —— 它连 ``root_of`` 都没有。直接调就是 `AttributeError`，而它会**整条
+    `projects/tree` 一起弄坏**，面板上前一格都画不出来，报的还是一句看不懂的错。
+
+    回 ``input`` 不是兜底、是**实话**：那份事实源的所有落点本来就都在一个根下
+    （单树布局），而单树那一个根就是资料根。
+    """
+    fn = getattr(spec, "root_of", None)
+    kind = fn(rel) if callable(fn) else ""
+    return "output" if kind == "output" else "input"
 
 
 def _list_files(
@@ -427,8 +467,17 @@ class ProjectLibrary:
         self,
         directory: str | os.PathLike[str],
         spec_path: str | os.PathLike[str] | None = None,
+        *,
+        out_directory: str | os.PathLike[str] | None = None,
     ) -> None:
+        #: **资料根**：一剧一目录的那一层（剧本、设定、素材 —— 都要按名被工作流读）。
         self.directory = Path(directory).expanduser().resolve()
+        #: **产物根**：逐镜片子与成片那一层（工作流产出的，按 ``名[output]`` 注解被引用）。
+        #: 不给就跟着资料根 —— 那是**单树布局**，与"分成两个根"之前的行为逐字一致，
+        #: 老调用方一行都不用改（判据见 :attr:`single_root`）。
+        self.out_directory = (
+            Path(out_directory).expanduser().resolve() if out_directory else self.directory
+        )
         #: ``None`` = 用包内那份（直接 import）；给了就在 :meth:`spec` 里按路径载入。
         self._spec_override = Path(spec_path).expanduser().resolve() if spec_path else None
         #: 给人看/给 ``host/info`` 看的事实源路径（默认那份也在包内）。
@@ -436,6 +485,15 @@ class ProjectLibrary:
         #: 事实源模块（懒载入一次，见 :meth:`spec`）；载不上就把原因留在 ``_spec_error``。
         self._spec: Any = None
         self._spec_error = ""
+
+    @property
+    def single_root(self) -> bool:
+        """资料与产物是不是同一个目录。
+
+        **不是**异常状态：只有一部剧、不跑合成的时候，分成两个根只是多一层要维护的东西。
+        面板靠它决定要不要把"产物"那一栏摆出来 —— 摆了却是空的，比不摆更让人犯疑。
+        """
+        return self.directory == self.out_directory
 
     # ---- 事实源 ---------------------------------------------------------
 
@@ -462,6 +520,10 @@ class ProjectLibrary:
         """
         out: dict[str, Any] = {
             "dir": str(self.directory),
+            "dir_out": str(self.out_directory),
+            # 单树布局是**正常状态**（没配产物根），不是错误：面板照这个决定
+            # 要不要把"产物"那一栏摆出来 —— 摆了却是空的，比不摆更让人犯疑。
+            "single_root": self.single_root,
             "exists": self.directory.is_dir(),
             "spec": str(self.spec_path),
             "spec_ok": False,
@@ -495,28 +557,106 @@ class ProjectLibrary:
 
     # ---- 名字 → 目录 -----------------------------------------------------
 
-    def _path(self, name: Any, *, must_exist: bool = True) -> Path:
-        """项目名对应的目录。名字不许往外跑（``..`` / 绝对路径 / 带分隔符一律拒）。"""
+    def roots(self, name: Any, *, must_exist: bool = True) -> tuple[Path, Path]:
+        """项目名 → ``(资料根下那一份, 产物根下那一份)``。
+
+        给宿主侧用：它拿到了这两个绝对路径，才能把它们**显式**交给流水线
+        （``NovelToVideoPipeline(project, project_out=…)``）。不这么给的话，流水线只能拿
+        项目**名字**去问事实源 ``resolve_project``，而那条路走的是环境变量与工作区探测
+        （``projects_root`` / ``find_workspace``）—— 宿主算出来的根和它算出来的根可以**不是
+        同一个**，而两边都不报错，只是产物落到了另一个地方。
+
+        ``must_exist`` 只管**资料根**那一份：产物根下还没目录是**正常状态**（还没出片），
+        见 :meth:`_out_path`。
+        """
+        return self._path(name, must_exist=must_exist), self._out_path(name)
+
+    def _root_path(self, root: Path, name: Any, *, must_exist: bool, what: str) -> Path:
+        """某个根下的项目目录。名字不许往外跑（``..`` / 绝对路径 / 带分隔符一律拒）。"""
         raw = _as_name(name, "项目名")
         if raw != os.path.basename(raw) or raw in (".", ".."):
             raise ProjectsError(f"项目名只能是目录名，不带路径：{name!r}")
-        target = self.directory / raw
-        if not is_within(self.directory, target):
-            raise ProjectsError(f"项目名跑到项目根外面去了：{name!r}")
+        target = root / raw
+        if not is_within(root, target):
+            raise ProjectsError(f"项目名跑到{what}外面去了：{name!r}")
         if must_exist and not target.is_dir():
-            raise ProjectsError(f"没有这个项目：{raw}（项目根 {self.directory}）")
+            raise ProjectsError(f"没有这个项目：{raw}（{what} {root}）")
         return target
+
+    def _path(self, name: Any, *, must_exist: bool = True) -> Path:
+        """项目名对应的**资料根**目录。"""
+        return self._root_path(self.directory, name, must_exist=must_exist, what="项目根")
+
+    def _out_path(self, name: Any, *, must_exist: bool = False) -> Path:
+        """项目名对应的**产物根**目录（``09_SHOTS`` / ``12_FILMS`` / ``_work`` 在那儿）。
+
+        `must_exist` 默认 **False**：成片还没做出来的项目，产物根下那个目录本来
+        就还没有 —— 那不是"项目不存在"，是"还没出片"。拿 True 去问它，
+        会把一个完全正常的状态报成错误。
+        """
+        return self._root_path(self.out_directory, name, must_exist=must_exist, what="产物根")
+
+    def _file_path(self, name: Any, rel: Any) -> tuple[Path, Path, str]:
+        """一份资料在盘上的位置 → ``(它所在的那个根, 绝对路径, 相对路径)``。
+
+        落点挂在哪个根上由**事实源**说了算（``root_of_path``）：``09_SHOTS/…`` 在产物根、
+        其余在资料根。只认资料根的话，产物那一格点开永远是"项目里没有这个文件" ——
+        而文件明明就在，就在隔壁那个根下。
+
+        事实源没给 ``root_of_path``（换了份老实现）时退回资料根：那不是错误，
+        只是"这份事实源还不知道有两个根"。
+        """
+        root = self._path(name)
+        rel_text = _as_name(rel, "文件相对路径").replace("\\", "/").lstrip("/")
+        base = root
+        if not self.single_root:
+            kind_fn = getattr(self.spec(), "root_of_path", None)
+            if callable(kind_fn) and kind_fn(rel_text) == "output":
+                base = self._out_path(root.name)
+        target = base / Path(rel_text)
+        if not is_within(base, target):
+            raise ProjectsError(f"路径跑到项目外面去了：{rel_text!r}")
+        return base, target, rel_text
+
+    def _rel_any(self, hit: str, res: dict[str, Any]) -> str:
+        """把一个命中路径转成**它自己那个根下**的相对路径。
+
+        两个根各有一套相对路径（`09_SHOTS/EP01_SH001.mp4` 在产物根下就是这么写的），
+        所以不能一律拿资料根去 `relpath` —— 那会算出 `../../output/剧/09_SHOTS/…`
+        这种既长又指不到地方的字符串，而面板会把它当"项目内的相对路径"贴出来。
+        """
+        for root in (res.get("path"), res.get("path_out")):
+            if not root:
+                continue
+            try:
+                rel = os.path.relpath(hit, root)
+            except ValueError:              # Windows 上跨盘
+                continue
+            if not rel.startswith(os.pardir):
+                return rel.replace(os.sep, "/")
+        return str(hit)
 
     # ---- 体检 -----------------------------------------------------------
 
-    def _summary(self, path: Path, spec: Any) -> dict[str, Any]:
+    def _summary(self, path: Path, spec: Any, out_path: Path | None = None) -> dict[str, Any]:
         """一部剧的现状（列表与详情共用）。阶段判据整个交给 ``spec.scan_project``。
 
         ``files`` / ``mtime`` **直接取它那一遍遍历的结果**，不再自己各走一遍全树。
         口径由事实源保证（``projects_spec.PRUNE_DIRS`` / ``_seed_rel_paths``）——
         这里要是再算一遍，两边一旦有出入又是"两处维护"。
+
+        ``out_path`` 是产物根下那个同名目录；不给就跟着 ``path``（单树布局）。
+        一并交给事实源，是因为**"落点齐不齐"要分两个根问** ——
+        只查资料根的话，`09_SHOTS` / `12_FILMS` 永远是"缺"。
         """
-        res = spec.scan_project(str(path))
+        out = out_path if out_path is not None else path
+        # `out_path` 是"两个根"这次加进来的：外部事实源可能还是老签名（只会查一个根），
+        # 那就退回老调用 —— 少查一个根是"结果不全"，传错参数是"整页报错"，后者更糟。
+        res = (
+            spec.scan_project(str(path), out_path=str(out))
+            if _accepts(spec.scan_project, "out_path")
+            else spec.scan_project(str(path))
+        )
         _require_scan_keys(res, self.spec_path)
         stages = []
         done = 0
@@ -529,13 +669,19 @@ class ProjectLibrary:
                     "rel": rel,
                     "files": len(hits),
                     "done": bool(hits),
-                    "sample": [_rel_path(path, Path(hit)) for hit in hits[:3]],
+                    "sample": [self._rel_any(hit, res) for hit in hits[:3]],
                 }
             )
         return {
             "name": path.name,
             "path": str(path),
+            "path_out": str(out),
             "files": res["files"],
+            # 一部剧的体量横跨两个根，只报一个总数说不出"下一步该往哪边看"。
+            # 老事实源没有这两个键（按路径载入的别的实现）→ 给 None，不是 0：
+            # 0 的意思是"那边一个文件都没有"，而"不知道"与"没有"是两句话。
+            "files_in": res.get("files_in"),
+            "files_out": res.get("files_out"),
             "missing": list(res["missing"]),
             "missing_count": len(res["missing"]),
             "stages": stages,
@@ -554,6 +700,8 @@ class ProjectLibrary:
         query = name.strip() if isinstance(name, str) else ""
         out: dict[str, Any] = {
             "dir": str(self.directory),
+            "dir_out": str(self.out_directory),
+            "single_root": self.single_root,
             "exists": self.directory.is_dir(),
             "query": query,
             "matched": 0,
@@ -571,7 +719,7 @@ class ProjectLibrary:
                 continue
             if query and query.lower() not in entry.name.lower():
                 continue
-            rows.append(self._summary(Path(entry.path), spec))
+            rows.append(self._summary(Path(entry.path), spec, self.out_directory / entry.name))
         out["matched"] = len(rows)
         rows.sort(key=lambda row: (-row["mtime"], row["name"]))
         out["projects"] = rows[:cap]
@@ -598,25 +746,44 @@ class ProjectLibrary:
         """
         spec = self.spec()
         root = self._path(name)
+        # 两个根：`09_SHOTS` / `12_FILMS` 在产物根下，其余全在资料根下 ——
+        # 判据只有 `spec.root_of` 一处，这里绝不写第二份名单（写第二份就会两边分家）。
+        out_root = root if self.single_root else self._out_path(root.name)
         scopes: dict[str, str] = dict(getattr(spec, "DIR_SCOPES", {}) or {})
         order = scope_order(spec)
+
+        def _base_of(rel: str) -> Path:
+            """这个落点挂在哪个根下。"""
+            return out_root if _root_of(spec, rel) == "output" else root
+
         # 嵌套落点：`01_剧本/` 里面套着 `00_总纲/`。父格列文件时要把它剪掉，
         # 否则同一份文件在父格与子格里各出现一次（多列一遍，不像 bug，像"文件真多"）。
+        # 只在**同一个根**里找嵌套：跨根的两个落点不可能互相嵌套，按一个根去算
+        # 反而会剪到产物根里毫不相干的那一份。
         nested = {
-            rel: tuple(root / Path(other) for other in spec.PROJECT_DIRS if other.startswith(rel + "/"))
+            rel: tuple(
+                _base_of(other) / Path(other)
+                for other in spec.PROJECT_DIRS
+                if other.startswith(rel + "/") and _root_of(spec, other) == _root_of(spec, rel)
+            )
             for rel in spec.PROJECT_DIRS
         }
         seeds = _seed_predicate(spec)
         buckets: dict[str, dict[str, Any]] = {}
         for rel in spec.PROJECT_DIRS:
-            full = root / Path(rel)
+            base = _base_of(rel)
+            full = base / Path(rel)
             listed = (
-                _list_files(full, base=root, skip=nested[rel], seeds=seeds)
+                # `base=base`：相对路径要**相对它自己那个根**。面板是拿着这个 `rel`
+                # 回来 `read`/`write` 的，拿资料根当起点的话，产物那一格列出来的是
+                # `../../output/剧/09_SHOTS/…` 这种既长又指不到地方的字符串。
+                _list_files(full, base=base, skip=nested[rel], seeds=seeds)
                 if full.is_dir()
                 else []
             )
             buckets[rel] = {
                 "rel": rel,
+                "root": _root_of(spec, rel),
                 "scope": scopes.get(rel, ""),
                 "exists": full.is_dir(),
                 "count": len(listed),
@@ -666,13 +833,15 @@ class ProjectLibrary:
         return {
             "name": root.name,
             "path": str(root),
+            "path_out": str(out_root),
+            "single_root": self.single_root,
             "dirs": list(spec.PROJECT_DIRS),
             "gaps": list(shelf_gaps(spec.PROJECT_DIRS)),
             "unknown": list(shelf_unknown(spec.PROJECT_DIRS)),
             "scope_gaps": list(scope_gaps(spec)),
             "scopes": list(order),
             "shelves": shelves,
-            "summary": self._summary(root, spec),
+            "summary": self._summary(root, spec, out_root),
             "novel": self.linked_novel(root),
         }
 
@@ -710,11 +879,7 @@ class ProjectLibrary:
         """
         if _as_bool(whole, False, where="whole"):
             offset, chars = 0, MAX_READ_CHARS
-        root = self._path(name)
-        rel_text = _as_name(rel, "文件相对路径").replace("\\", "/").lstrip("/")
-        target = root / Path(rel_text)
-        if not is_within(root, target):
-            raise ProjectsError(f"路径跑到项目外面去了：{rel_text!r}")
+        root, target, rel_text = self._file_path(name, rel)
         if not target.is_file():
             raise ProjectsError(f"项目里没有这个文件：{rel_text}")
         suffix = target.suffix.lower()
@@ -785,13 +950,9 @@ class ProjectLibrary:
         写盘走"同目录临时文件 + 原子换名"，行尾与编码**沿用原文件**（读的时候把 ``\\r\\n``
         归一了，写回去不还原的话，一次改一个字会让整份文件在 git 里变成全改）。
         """
-        root = self._path(name)
+        root, target, rel_text = self._file_path(name, rel)
         if not isinstance(text, str):
             raise ProjectsError("正文必须是字符串")
-        rel_text = _as_name(rel, "文件相对路径").replace("\\", "/").lstrip("/")
-        target = root / Path(rel_text)
-        if not is_within(root, target):
-            raise ProjectsError(f"路径跑到项目外面去了：{rel_text!r}")
         suffix = target.suffix.lower()
         if suffix not in PROJECT_SUFFIXES:
             raise ProjectsError(
@@ -973,17 +1134,28 @@ class ProjectLibrary:
         count = _as_int(episodes, DEFAULT_EPISODES, where="集数", low=1, high=9999)
         allow = _as_bool(upgrade, False, where="upgrade")
         try:
-            made = spec.create_project(
-                path.name, episodes=count, root=str(self.directory), upgrade=allow, log=None
-            )
+            kwargs: dict[str, Any] = {
+                "episodes": count,
+                "root": str(self.directory),
+                "upgrade": allow,
+                "log": None,
+            }
+            # `out_root` 同上：老签名的事实源把所有落点建在一个根下，那就照它办。
+            if _accepts(spec.create_project, "out_root"):
+                kwargs["out_root"] = str(self.out_directory)
+            made = spec.create_project(path.name, **kwargs)
         except Exception as err:  # 那份函数用 ProjectError 报"已存在/模板缺失"，原文照传
             raise ProjectsError(str(err)) from err
         out: dict[str, Any] = {
             "name": path.name,
             "path": str(path),
+            "path_out": str(made.get("path_out") or (self.out_directory / path.name)),
             "episodes": count,
             "upgrade": allow,
+            # 资料根与产物根**分开报**：面板要说清"哪几格建在哪儿"，
+            # 合成一份的话，人看见 `12_FILMS` 出现在列表里，就会去资料根下找它。
             "dirs": [rel.rstrip("/") for rel in made["dirs"]],
+            "dirs_out": [rel.rstrip("/") for rel in made.get("dirs_out", ())],
             "files": list(made["files"]),
             "skipped": list(made["skipped"]),
             "pending": list(made["pending"]),
@@ -991,7 +1163,77 @@ class ProjectLibrary:
         }
         if novel is not None:
             out["novel"] = self.link_novel(path.name, novel, novel_dir=novel_dir)
-        out["summary"] = self._summary(path, spec)
+        out["summary"] = self._summary(path, spec, self.out_directory / path.name)
+        return out
+
+    # ---- 把老结构搬到当前结构 -------------------------------------------
+
+    def migrate(self, name: Any, dry: Any = None) -> dict[str, Any]:
+        """把一部**老结构**的项目搬到当前结构（v1 → v2 → v3）—— 只移动、不覆盖、可反复跑。
+
+        落盘的活整个交给事实源的 ``migrate_project``（``MIGRATIONS`` 与 ``DIR_ROOTS`` 是
+        唯一判据），这里只做三件面板需要的事：
+
+        * **两个根显式给**（``root`` / ``out_root``）。不给的话那份函数会拿环境变量与
+          工作区探测去推产物根，推出一个与面板看到的**不是同一个**的目录 —— 而它不报错：
+          文件好好地在另一个目录里，面板那一格却空着，事后没人知道东西去哪了；
+        * ``log=None``：那份函数默认往 stdout 打日志，而本进程的 stdout 是 **JSON-RPC
+          通道**，打一行日志就把协议搅了；
+        * 那串**相对路径**换成"绝对路径 + 落在哪个根"：跨根那几行两边的相对路径长得
+          一模一样（`09_SHOTS/EP01/EP01_SH001.mp4`），面板照着它画不出"从哪搬到哪"。
+
+        ``dry=True`` 只报不落盘 —— 面板要先让人看见"会搬什么"再动手。
+        ``conflict``（两边都有、内容不同）由那份函数**停下来喊人**，这里如实报上去。
+        """
+        spec = self.spec()
+        path, out_path = self.roots(name)
+        allow = _as_bool(dry, False, where="dry")
+        fn = getattr(spec, "migrate_project", None)
+        if not callable(fn):
+            # 换了份老事实源：它不知道"两个根"这件事，硬跑只会把产物格留在资料根下。
+            raise ProjectsError(
+                f"这份事实源不知道老结构该怎么迁（{self.spec_path} 里没有 migrate_project）；"
+                "要迁就用包内那份规范再来。")
+        try:
+            kwargs: dict[str, Any] = {"dry": allow, "log": None}
+            if _accepts(fn, "root"):
+                kwargs["root"] = str(self.directory)
+            if _accepts(fn, "out_root"):
+                kwargs["out_root"] = str(self.out_directory)
+            res = fn(str(path), **kwargs)
+        except Exception as err:  # 那份函数用 ProjectError 报"项目不存在"等，原文照传
+            raise ProjectsError(str(err)) from err
+
+        actions: list[dict[str, Any]] = []
+        for state, src_rel, dst_rel in res.get("actions", ()):
+            # 同一根内的搬迁（v1 → v2）源与目标不同；跨根那几行（v2 → v3）两边字符串
+            # 相同 —— 差别只在"落在哪个根"，所以两边都要补成绝对路径。
+            cross = src_rel == dst_rel
+            actions.append({
+                "state": state,
+                "rel": src_rel,
+                "src": str(path / Path(src_rel)),
+                "dst": str((out_path if cross else path) / Path(dst_rel)),
+                "root": "output" if cross else "input",
+            })
+        counts: dict[str, int] = {}
+        for item in actions:
+            counts[item["state"]] = counts.get(item["state"], 0) + 1
+        out: dict[str, Any] = {
+            "name": path.name,
+            "path": str(path),
+            "path_out": str(out_path),
+            "dry": allow,
+            # `ok=False` 是"有冲突要人看"，不是脚本自己失败（见那份函数的说明）。
+            "ok": bool(res.get("ok")),
+            "single_root": self.single_root,
+            "actions": actions,
+            "counts": counts,
+            "moved": counts.get("moved", 0),
+            "conflicts": [item["rel"] for item in actions if item["state"] == "conflict"],
+        }
+        # 建完顺手回一份体检：面板不用为了"搬完长什么样"再跑一趟。
+        out["summary"] = self._summary(path, spec, out_path)
         return out
 
     # ---- 给对话用的简报 -------------------------------------------------
@@ -1196,7 +1438,6 @@ __all__ = [
     "PROJECTS_SERVER",
     "PROJECTS_TOOLS",
     "PROJECT_SHELVES",
-    "PROJECT_SUBDIR",
     "PROJECT_SUFFIXES",
     "SPEC_NAME",
     "ProjectLibrary",
@@ -1205,6 +1446,7 @@ __all__ = [
     "ProjectsServerConfig",
     "SCAN_KEYS",
     "default_project_dir",
+    "default_project_out_dir",
     "default_spec_path",
     "load_spec",
     "scope_gaps",

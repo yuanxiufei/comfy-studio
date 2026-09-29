@@ -63,6 +63,8 @@ const PROJECT_FILE_FIND_COUNT_ID = 'comfy-desktop-studio-project-file-find-count
 const PROJECT_FILE_FIND_PREV_ID = 'comfy-desktop-studio-project-file-find-prev'
 const PROJECT_FILE_FIND_NEXT_ID = 'comfy-desktop-studio-project-file-find-next'
 const PROJECT_FILE_FIND_CLEAR_ID = 'comfy-desktop-studio-project-file-find-clear'
+const PROJECT_MIGRATE_ID = 'comfy-desktop-studio-project-migrate'
+const PROJECT_MIGRATE_REPORT_ID = 'comfy-desktop-studio-project-migrate-report'
 const SKILL_ID = 'comfy-desktop-studio-chat-skill'
 const SKILL_RUN_ID = 'comfy-desktop-studio-chat-skill-run'
 const RENDER_ID = 'comfy-desktop-studio-chat-render'
@@ -4805,6 +4807,47 @@ describe('getComfyStudioChatContentScript', () => {
     /** 项目根是宿主给的（见 lib/comfy_studio/projects.py）：面板一个路径都不拼，只照着用。 */
     const projectDir = 'D:/comfy/custom_nodes/comfy_studio/manju/projects'
     const projectPath = (name: string): string => `${projectDir}/${name}`
+    /** 产物根：跟资料根是**两个目录**（双根布局，见 lib/comfy_studio/layout.py）。 */
+    const productDir = 'D:/comfy/custom_nodes/comfy_studio/manju/products'
+
+    /**
+     * 宿主 projects/migrate 的回执（两个根分开算，见 lib/comfy_studio/projects.py）。
+     *
+     * 两行正好各是一种：`09_SHOTS/…` 跨根（相对路径两边同名，只有 `root` 与绝对路径分得开），
+     * `分集大纲与三表.md` 同根内归位（收进 `00_总纲/`）。
+     */
+    const migrateResult = (dry: boolean, over: Record<string, unknown> = {}): unknown => ({
+      ok: true,
+      result: {
+        name: '长夜',
+        path: projectPath('长夜'),
+        path_out: `${productDir}/长夜`,
+        dry,
+        ok: true,
+        single_root: false,
+        moved: 2,
+        conflicts: [],
+        counts: { moved: 2, absent: 4 },
+        actions: [
+          {
+            state: 'moved',
+            rel: '09_SHOTS/EP01/EP01_SH001.mp4',
+            src: `${projectPath('长夜')}/09_SHOTS/EP01/EP01_SH001.mp4`,
+            dst: `${productDir}/长夜/09_SHOTS/EP01/EP01_SH001.mp4`,
+            root: 'output'
+          },
+          {
+            state: 'moved',
+            rel: '00_PROJECT/01_剧本/分集大纲与三表.md',
+            src: `${projectPath('长夜')}/00_PROJECT/01_剧本/分集大纲与三表.md`,
+            dst: `${projectPath('长夜')}/00_PROJECT/01_剧本/00_总纲/分集大纲与三表.md`,
+            root: 'input'
+          }
+        ],
+        summary: { files: 4 },
+        ...over
+      }
+    })
 
     /** 宿主 projects/list 里的一行。 */
     const projectRow = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
@@ -4985,6 +5028,11 @@ describe('getComfyStudioChatContentScript', () => {
       document.getElementById(PROJECT_FILE_FIND_ID) as HTMLInputElement
     const reader = (): HTMLElement => view(PROJECT_READER_ID)
     const fileFindCount = (): HTMLElement => view(PROJECT_FILE_FIND_COUNT_ID)
+    const migratePopup = (): HTMLElement => view(PROJECT_MIGRATE_ID)
+    /** 迁移清单那一块：总账一行 + 会动的那几行（见 paintProjectMigrate）。 */
+    const migrateReport = (): HTMLElement => view(PROJECT_MIGRATE_REPORT_ID)
+    const migrateRow = (rel: string): HTMLElement | null =>
+      migrateReport().querySelector<HTMLElement>(`[data-rel="${rel}"]`)
     const hits = (): HTMLElement[] =>
       Array.from(document.querySelectorAll<HTMLElement>(`#${PROJECT_READER_ID} .cs-proj-hit`))
     /** 敲一串字进筛项目那个框，等过防抖那一小会儿。 */
@@ -5502,6 +5550,7 @@ describe('getComfyStudioChatContentScript', () => {
               episodes: 12,
               upgrade: false,
               dirs: ['01_剧本'],
+              dirs_out: ['09_SHOTS', '12_FILMS'],
               files: ['01_剧本/总纲.md'],
               skipped: [],
               pending: [],
@@ -5544,10 +5593,136 @@ describe('getComfyStudioChatContentScript', () => {
         upgrade: true,
         novel: '长夜.txt'
       })
-      expect(hintLine().textContent).toContain('建好了 长夜（新目录 1 个，新文件 1 份）')
+      // 两个根分开报（资料根 `dirs` + 产物根 `dirs_out`），但"一共建了多少格"要把两边都数上：
+      // 只数 `dirs` 会少 09_SHOTS / 12_FILMS，而人是在数自己刚建出来的东西。
+      expect(hintLine().textContent).toContain(
+        '建好了 长夜（新目录 3 个，其中产物根 2 个，新文件 1 份）'
+      )
       expect(hintLine().textContent).toContain('原著登记为「长夜.txt」')
       expect(view(PROJECT_FORM_ID).dataset.open, '建完把表单收起来，接着看它的落点').toBe('0')
       expect(document.getElementById(PROJECT_HEAD_ID)?.textContent).toContain(projectPath('长夜'))
+    })
+
+    it('shows what moving an old project would do before it touches the disk', async () => {
+      const bridge = installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'projects/tree': projectTree(),
+          'projects/migrate': (_method: string, params: unknown) =>
+            migrateResult((params as { dry?: boolean }).dry === true)
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+      await openLine('长夜')
+
+      button('迁移落点…')?.click()
+      await flush()
+
+      // 打开这一趟**只预演**：盘上一个字节都不动，人才敢往下按。
+      expect(projectCalls(bridge, 'projects/migrate')).toEqual([
+        ['projects/migrate', { name: '长夜', dry: true }]
+      ])
+      expect(migratePopup().dataset.open).toBe('1')
+      expect(migrateReport().textContent).toContain('会搬 2 份（其中 1 份进产物根）')
+      expect(migrateReport().textContent).toContain('09_SHOTS/EP01/EP01_SH001.mp4 → 产物根')
+      expect(migrateReport().textContent).toContain(
+        '00_PROJECT/01_剧本/分集大纲与三表.md → 同根内归位'
+      )
+      // 跨根那几行两边的相对路径一模一样，所以"从哪到哪"的准话挂在悬停里。
+      expect(
+        migrateRow('09_SHOTS/EP01/EP01_SH001.mp4')?.getAttribute('title'),
+        '相对路径在两份根下同名，拼不出"从哪到哪"'
+      ).toBe(
+        `${projectPath('长夜')}/09_SHOTS/EP01/EP01_SH001.mp4  →  ${productDir}/长夜/09_SHOTS/EP01/EP01_SH001.mp4`
+      )
+
+      button('搬')?.click()
+      await flush()
+
+      // 真搬那一趟把 dry:false 明说出来（不靠宿主那边的默认值）。
+      expect(projectCalls(bridge, 'projects/migrate').slice(-1)[0]).toEqual([
+        'projects/migrate',
+        { name: '长夜', dry: false }
+      ])
+      expect(migrateReport().textContent).toContain('搬了 2 份（其中 1 份进产物根）')
+      expect(hintLine().textContent).toContain('搬了 2 份')
+      // 搬完重读这一部：东西换了地方，屏幕上还是搬之前那一份就等于给人看旧数据。
+      expect(document.getElementById(PROJECT_HEAD_ID)?.textContent).toContain(projectPath('长夜'))
+    })
+
+    it('says a conflict out loud instead of picking one of the two copies', async () => {
+      const bridge = installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'projects/tree': projectTree(),
+          'projects/migrate': () =>
+            migrateResult(false, {
+              ok: false,
+              moved: 1,
+              conflicts: ['09_SHOTS/EP01/EP01_SH001.mp4'],
+              counts: { moved: 1, conflict: 1 },
+              actions: [
+                {
+                  state: 'conflict',
+                  rel: '09_SHOTS/EP01/EP01_SH001.mp4',
+                  src: `${projectPath('长夜')}/09_SHOTS/EP01/EP01_SH001.mp4`,
+                  dst: `${productDir}/长夜/09_SHOTS/EP01/EP01_SH001.mp4`,
+                  root: 'output'
+                },
+                {
+                  state: 'moved',
+                  rel: '00_PROJECT/01_剧本/分集大纲与三表.md',
+                  src: `${projectPath('长夜')}/00_PROJECT/01_剧本/分集大纲与三表.md`,
+                  dst: `${projectPath('长夜')}/00_PROJECT/01_剧本/00_总纲/分集大纲与三表.md`,
+                  root: 'input'
+                }
+              ]
+            })
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+      await openLine('长夜')
+
+      button('迁移落点…')?.click()
+      await flush()
+
+      // 这一趟**只预演**：冲突摆在眼前更不能替人按下去。搬不搬是人看过清单之后再定的，
+      // 所以这里钉住"确实没往下走"——否则下面那句报平安就成了空话。
+      expect(projectCalls(bridge, 'projects/migrate')).toEqual([
+        ['projects/migrate', { name: '长夜', dry: true }]
+      ])
+      // 冲突不是"搬失败"：脚本**不肯替人挑**（两边都有、内容不同）。这句话得说全 ——
+      // 只说"有 1 份没搬"，人会自己去搬，那一下正好覆盖掉其中一份。
+      expect(migrateReport().textContent).toContain('会搬 1 份')
+      expect(migrateReport().textContent).toContain('另有 1 份两边都有且内容不同，没动它们，得你定')
+      expect(migrateRow('09_SHOTS/EP01/EP01_SH001.mp4')?.dataset.state).toBe('conflict')
+      expect(migrateRow('09_SHOTS/EP01/EP01_SH001.mp4')?.textContent).toContain('没动它')
+      // 已经搬过去的那几份是真的搬了，所以页还得重读一遍（回执才是准的）。
+      expect(document.getElementById(PROJECT_HEAD_ID)?.textContent).toContain(projectPath('长夜'))
+    })
+
+    it('asks which project first when nothing is open', async () => {
+      const bridge = installBridge({
+        request: host({ 'projects/list': listing([projectRow()]), 'projects/tree': projectTree() })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+
+      button('迁移落点…')?.click()
+      await flush()
+
+      // 没开剧就搬，等于替人挑了一部 —— 不挑，先说清往哪儿点。
+      expect(projectCalls(bridge, 'projects/migrate')).toEqual([])
+      expect(hintLine().textContent).toContain('先在左边点一部剧')
+      expect(migratePopup().dataset.open).toBe('0')
     })
 
     it('explains each way the novel link did not happen', async () => {
@@ -6210,9 +6385,7 @@ describe('getComfyStudioChatContentScript', () => {
 
     /** 阶段卡上那排「去出图」（宿主绑了图才有这排，见注入脚本的 pipeRenderRow）。 */
     const renderButtons = (code: string): HTMLButtonElement[] =>
-      Array.from(
-        card(code)?.querySelectorAll<HTMLButtonElement>('.cs-pipe-render button') ?? []
-      )
+      Array.from(card(code)?.querySelectorAll<HTMLButtonElement>('.cs-pipe-render button') ?? [])
 
     const openPipeline = async (): Promise<void> => {
       tab('流水线')?.click()
@@ -6276,7 +6449,10 @@ describe('getComfyStudioChatContentScript', () => {
                 actor: '分镜智能体',
                 render_targets: ['character-sheet', 'scene-card'],
                 // 落点按目标分开给：角色那格与场景那格不是一个目录（见 STAGE_RENDER）。
-                render_lands: { 'character-sheet': '02_CHARACTERS', 'scene-card': '05_ENVIRONMENTS' },
+                render_lands: {
+                  'character-sheet': '02_CHARACTERS',
+                  'scene-card': '05_ENVIRONMENTS'
+                },
                 render_note: '角色/服装/道具走定妆板，场景走设定卡'
               })
             ]
@@ -6313,7 +6489,9 @@ describe('getComfyStudioChatContentScript', () => {
 
       // 按下去 = 把渲染那一行切到这张图（下拉真换过去了），再走用户自己按「跑一遍」那条路。
       expect((document.getElementById(RENDER_ID) as HTMLSelectElement).value).toBe('scene-card')
-      expect(view(CHAT_VIEW_ID).style.display, '跑渲染那张卡片在对话页，切过去才看得见').toBe('flex')
+      expect(view(CHAT_VIEW_ID).style.display, '跑渲染那张卡片在对话页，切过去才看得见').toBe(
+        'flex'
+      )
       expect(asks(bridge, 'renders/run')[0]?.[1]).toMatchObject({
         target_id: 'scene-card',
         // 落点拼上项目根交给渲染：图才会落进这一段体检真看的目录，卡片上「还缺图」当场就消。
@@ -6332,7 +6510,10 @@ describe('getComfyStudioChatContentScript', () => {
               stage('S2', {
                 needs_render: true,
                 render_targets: ['character-sheet', 'scene-card'],
-                render_lands: { 'character-sheet': '02_CHARACTERS', 'scene-card': '05_ENVIRONMENTS' }
+                render_lands: {
+                  'character-sheet': '02_CHARACTERS',
+                  'scene-card': '05_ENVIRONMENTS'
+                }
               })
             ]
           }),
@@ -6372,8 +6553,18 @@ describe('getComfyStudioChatContentScript', () => {
             ]
           }),
           'renders/list': renders([
-            renderTarget({ id: 'video-draft', title: '视频 768p 试片', file: '05_试片.json', tags: ['video'] }),
-            renderTarget({ id: 'video-final', title: '视频 1080p 正片', file: '06_正片.json', tags: ['video'] })
+            renderTarget({
+              id: 'video-draft',
+              title: '视频 768p 试片',
+              file: '05_试片.json',
+              tags: ['video']
+            }),
+            renderTarget({
+              id: 'video-final',
+              title: '视频 1080p 正片',
+              file: '06_正片.json',
+              tags: ['video']
+            })
           ]),
           'renders/run': () => new Promise(() => {})
         })

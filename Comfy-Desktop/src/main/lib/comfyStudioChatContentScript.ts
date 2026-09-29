@@ -180,6 +180,11 @@ var PROJECT_FORM_NOVEL_ID = 'comfy-desktop-studio-project-form-novel';
 var PROJECT_FORM_UPGRADE_ID = 'comfy-desktop-studio-project-form-upgrade';
 // 弹窗里那份提示行：它盖住了页顶那条，所以同一句话要在卡片里再说一遍（见 projectHint）。
 var PROJECT_FORM_HINT_ID = 'comfy-desktop-studio-project-form-hint';
+// 「迁移落点」弹窗（见 toggleProjectMigrate）：把老结构的项目搬到当前结构。
+// 前两个是弹窗本身与它那份提示行，第三个是**清单**那块 —— 搬什么、哪几行冲突，都写在那儿。
+var PROJECT_MIGRATE_ID = 'comfy-desktop-studio-project-migrate';
+var PROJECT_MIGRATE_HINT_ID = 'comfy-desktop-studio-project-migrate-hint';
+var PROJECT_MIGRATE_REPORT_ID = 'comfy-desktop-studio-project-migrate-report';
 var PROJECT_LIST_ID = 'comfy-desktop-studio-project-list';
 var PROJECT_MAIN_ID = 'comfy-desktop-studio-project-main';
 var PROJECT_HEAD_ID = 'comfy-desktop-studio-project-head';
@@ -528,6 +533,14 @@ var CHAT_CSS =
   '#' + DRAWER_ID + ' .cs-popup-hint{color:' + MUTED + ';font-size:11px;line-height:1.4;}' +
   '#' + DRAWER_ID + ' .cs-popup-hint:empty{display:none;}' +
   '#' + DRAWER_ID + ' .cs-popup-hint[data-tone="error"]{color:#ff8080;}' +
+  // 迁移清单那一块：一部戏几百份片子就是几百行，所以让它自己滚，别把卡片顶出屏外。
+  '#' + DRAWER_ID + ' .cs-popup-report{max-height:180px;overflow-y:auto;display:flex;flex-direction:column;' +
+  'gap:2px;padding:6px;border:1px solid ' + BORDER + ';border-radius:4px;color:' + MUTED + ';' +
+  'font-size:11px;line-height:1.35;word-break:break-all;}' +
+  // 空着就（连框带内边距）一起收掉：没东西可搬时留一个空框在那儿，像"还没读完"。
+  '#' + DRAWER_ID + ' .cs-popup-report:empty{display:none;}' +
+  // 冲突那几行是**要人去定**的（脚本不替人挑），所以它们自己一个颜色。
+  '#' + DRAWER_ID + ' .cs-popup-report>div[data-state="conflict"]{color:#ff8080;}' +
   // 换成窄抽屉时按钮折行也别叠在一起（覆盖导入是第三个）。
   '#' + DRAWER_ID + ' .cs-popup-actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:6px;}' +
   // 主按钮只有一个：弹窗里"建"/「导入」才是往下走的那步，「取消」是退路。
@@ -6029,7 +6042,10 @@ function novelToProject(row) {
 // 建项目弹窗盖住了页顶这条，所以同一句话要在卡片里也写一份（弹窗自己那条 hint）——
 // 这是**一个调用写两处**，不是一个来源变两个：文案与语气还是只在这里定。
 function projectHint(text, tone) {
+  // 两个弹窗各有一份提示行：它们都盖住了页顶那条，所以同一句话要在卡片里再说一遍
+  // （没盖着的那份写在收起来的卡片里，不占位子）。漏掉哪一份，那一次的错误就只在背后闪一下。
   hintLine(PROJECT_FORM_HINT_ID, text, tone);
+  hintLine(PROJECT_MIGRATE_HINT_ID, text, tone);
   return hintLine(PROJECT_HINT_ID, text, tone);
 }
 
@@ -7594,6 +7610,11 @@ function buildProjectView() {
     })
   );
   bar.appendChild(
+    projectButton('迁移落点…', '把老结构的项目搬到当前结构：先预演一遍会搬什么，确认了才动手', function () {
+      openProjectMigrate();
+    })
+  );
+  bar.appendChild(
     projectButton('发到对话', '把当前这部戏的现状写成一段话放进输入框（自己改完再发）', function () {
       sendProjectBrief();
     })
@@ -7650,6 +7671,35 @@ function buildProjectView() {
   submit.dataset.primary = '1';
   popup.actions.appendChild(submit);
 
+  // 「迁移落点」弹窗：把**老结构**的项目搬到当前结构（v1 → v2 → v3）。它搬的是已经有
+  // 内容的目录（宿主那边是 move，不是 copy），所以这一趟**先预演、后落盘**：
+  // 打开弹窗先要一份 dry:true 的清单，人按下「搬」才传 dry:false。
+  // 反过来（点了就搬、再报告）最坏的错法是"手指一抖几百份片子换了地方，回执还得往下翻"。
+  var migrate = buildPopup(PROJECT_MIGRATE_ID, PROJECT_MIGRATE_HINT_ID, '迁移落点 / 把老项目搬过来');
+  var migrateNote = document.createElement('div');
+  migrateNote.className = 'cs-popup-label';
+  migrateNote.textContent =
+    '把这一部里该落产物根的格子搬过去：只移动、不覆盖、可反复跑。先看清单，再决定搬不搬。';
+  migrate.body.appendChild(migrateNote);
+  var migrateReport = document.createElement('div');
+  migrateReport.id = PROJECT_MIGRATE_REPORT_ID;
+  migrateReport.className = 'cs-popup-report';
+  migrate.body.appendChild(migrateReport);
+  migrate.actions.appendChild(
+    projectButton('取消', '关掉这个弹窗（什么都不搬）', function () {
+      toggleProjectMigrate(false);
+    })
+  );
+  var migrateGo = projectButton(
+    '搬',
+    '照上面那份清单搬：只移动、不覆盖；两边都有且内容不同的那一行不动，等人定',
+    function () {
+      runProjectMigrate();
+    }
+  );
+  migrateGo.dataset.primary = '1';
+  migrate.actions.appendChild(migrateGo);
+
   var hint = document.createElement('div');
   hint.id = PROJECT_HINT_ID;
   hint.className = 'cs-proj-hint';
@@ -7697,6 +7747,7 @@ function buildProjectView() {
   // 弹窗摆在最后：它是绝对定位、不吃布局（放哪儿都不推别人），摆最后只是为了让它在这一页
   // 所有内容上面。
   view.appendChild(form);
+  view.appendChild(migrate.layer);
   return view;
 }
 
@@ -8607,12 +8658,19 @@ function createProjectFromForm() {
         return null;
       }
       var result = response.result || {};
+      // 宿主把两个根**分开报**（dirs 在资料根、dirs_out 在产物根）：合成一份的话，
+      // 人看见 12_FILMS 在列表里，就会去资料根下找它。这里报的是"一共建了多少格"，
+      // 所以两个都要数 —— 只数 dirs 会说少 09_SHOTS / 12_FILMS 那两格。
+      var dirsIn = (result.dirs || []).length;
+      var dirsOut = (result.dirs_out || []).length;
       var note =
         '建好了 ' +
         result.name +
         '（新目录 ' +
-        (result.dirs || []).length +
-        ' 个，新文件 ' +
+        (dirsIn + dirsOut) +
+        ' 个' +
+        (dirsOut > 0 ? '，其中产物根 ' + dirsOut + ' 个' : '') +
+        '，新文件 ' +
         (result.files || []).length +
         ' 份）' +
         novelNote(result.novel);
@@ -8738,6 +8796,169 @@ function projectToChat(text) {
   }
   input.focus();
   setStatus('已把「' + (STATE.projectOpen ? STATE.projectOpen.name : '') + '」的现状放进对话框：添上要求再发。');
+}
+
+// 「迁移落点」：把这一部**老结构**的项目搬到当前结构（v1 → v2 → v3）。
+//
+// 三件事按这个顺序：① 打开弹窗先**预演**（dry:true，盘上一个字节都不动）；② 人看过清单
+// 按下「搬」，才真搬（dry:false）；③ 搬完重列项目 + 重读这一部，让人立刻看见结果。
+//
+// 为什么非要有预演这一步：宿主那边搬的是**已经有内容的**目录，而且是 move 不是 copy。
+// 走错了（比如把"两边不一样"的那一份当成重复覆盖掉）它不报错，只是人的正本没了。
+function openProjectMigrate() {
+  var open = STATE.projectOpen;
+  if (!open || !open.name) {
+    projectHint('先在左边点一部剧，再看它的落点要不要搬。', 'error');
+    return null;
+  }
+  return toggleProjectMigrate(true);
+}
+
+function toggleProjectMigrate(open) {
+  var opened = togglePopup(PROJECT_MIGRATE_ID, PROJECT_MIGRATE_HINT_ID, null, open);
+  // 每开一次都重新预演：清单跟着"现在开的是哪一部"，留着上一次的会让人照着别部的清单按「搬」。
+  if (opened) migrateDryRun();
+  return opened;
+}
+
+function migrateDryRun() {
+  var open = STATE.projectOpen;
+  if (!open) return null;
+  var name = open.name;
+  var report = document.getElementById(PROJECT_MIGRATE_REPORT_ID);
+  if (report) report.textContent = '正在看 ' + name + ' 里的东西该落在哪…';
+  return Promise.resolve(bridge.request('projects/migrate', { name: name, dry: true })).then(
+    function (response) {
+      // 看的过程中换到别的部戏了：这份清单说的是上一部，丢掉 —— 不然人会照着一份错清单按「搬」。
+      if (!STATE.projectOpen || STATE.projectOpen.name !== name) return null;
+      if (!response || response.ok !== true) {
+        var reason = ((response && response.error) || {}).message || '未知错误';
+        if (report) report.textContent = '看不了 ' + name + ' 要怎么搬：' + reason;
+        projectHint('看不了 ' + name + ' 要怎么搬：' + reason, 'error');
+        return null;
+      }
+      paintProjectMigrate(response.result || {}, true);
+      return response.result;
+    },
+    function (err) {
+      if (!STATE.projectOpen || STATE.projectOpen.name !== name) return null;
+      if (report) report.textContent = '看不了 ' + name + ' 要怎么搬：宿主不在。';
+      projectHint('看不了 ' + name + ' 要怎么搬: ' + message(err), 'error');
+      return null;
+    }
+  );
+}
+
+// 真搬那一下。清单刚才已经给人看过了（见 migrateDryRun），所以这里不重复预演 ——
+// 但 dry:false 是**明说的**：这一下要动盘上的东西，不靠"宿主那边的默认值是什么"。
+function runProjectMigrate() {
+  var open = STATE.projectOpen;
+  if (!open) return null;
+  var name = open.name;
+  var report = document.getElementById(PROJECT_MIGRATE_REPORT_ID);
+  if (report) report.textContent = '正在搬 ' + name + '…';
+  return Promise.resolve(bridge.request('projects/migrate', { name: name, dry: false })).then(
+    function (response) {
+      if (!STATE.projectOpen || STATE.projectOpen.name !== name) return null;
+      if (!response || response.ok !== true) {
+        var reason = ((response && response.error) || {}).message || '未知错误';
+        if (report) report.textContent = '没搬成 ' + name + '：' + reason;
+        projectHint('没搬成 ' + name + '：' + reason, 'error');
+        return null;
+      }
+      var result = response.result || {};
+      paintProjectMigrate(result, false);
+      // 搬完把这一页重读一遍：东西换了地方，不重读的话屏幕上还是搬之前那一份。
+      // 有冲突（ok=false）时也重读 —— 已经搬过去的那几份是真的搬了，报告得跟盘上一致。
+      return loadProjects()
+        .then(function () {
+          return openProject(name);
+        })
+        .then(function () {
+          projectHint(migrateNote(result, false), result.ok === false ? 'error' : 'info');
+          return result;
+        });
+    },
+    function (err) {
+      if (!STATE.projectOpen || STATE.projectOpen.name !== name) return null;
+      if (report) report.textContent = '没搬成 ' + name + '：宿主不在。';
+      projectHint('没搬成 ' + name + ': ' + message(err), 'error');
+      return null;
+    }
+  );
+}
+
+//: 清单最多列这么多行：一部戏几百份片子时列几百行没人看得完，而人要的是
+//: "一共会搬多少、有没有冲突"，具体哪几份抽查几行就够。
+var MIGRATE_REPORT_MAX = 12;
+
+// 一句总账 + 一份清单。总账先说清"会搬/搬了 N 份、其中几份进产物根、几份冲突"。
+function migrateNote(result, dry) {
+  var actions = result.actions || [];
+  var conflicts = result.conflicts || [];
+  var moved = 0;
+  var into = 0;
+  actions.forEach(function (item) {
+    if (item.state !== 'moved') return;
+    moved += 1;
+    if (item.root === 'output') into += 1;
+  });
+  if (moved === 0 && conflicts.length === 0) {
+    return '这一部不用搬：东西已经都在该在的根下了。';
+  }
+  var head = (dry ? '会搬 ' : '搬了 ') + moved + ' 份';
+  if (into > 0) head += '（其中 ' + into + ' 份进产物根）';
+  if (conflicts.length > 0) {
+    // 冲突不是"搬失败"，是脚本**不肯替人挑**（两边都有、内容不同）：不写清这一点，
+    // 人只会看见"有几份没搬"，然后手动去搬 —— 那一下正好覆盖掉其中一份。
+    head += '；另有 ' + conflicts.length + ' 份两边都有且内容不同，没动它们，得你定。';
+  }
+  return head;
+}
+
+function paintProjectMigrate(result, dry) {
+  var report = document.getElementById(PROJECT_MIGRATE_REPORT_ID);
+  if (!report) return;
+  report.textContent = '';
+  var actions = result.actions || [];
+  var note = document.createElement('div');
+  note.textContent = migrateNote(result, dry);
+  report.appendChild(note);
+  var waited = 0;
+  var shown = 0;
+  actions.forEach(function (item) {
+    // absent / skip / duplicate 不占行：前两种没事发生，第三种是"上次搬到一半又跑了一遍"，
+    // 它们摆一行只会把"真会动的"那几行埋掉。
+    if (item.state !== 'moved' && item.state !== 'conflict') return;
+    waited += 1;
+    if (shown >= MIGRATE_REPORT_MAX) return;
+    shown += 1;
+    report.appendChild(migrateRow(item));
+  });
+  if (waited > shown) {
+    var more = document.createElement('div');
+    more.textContent = '…还有 ' + (waited - shown) + ' 份没列出来';
+    report.appendChild(more);
+  }
+}
+
+function migrateRow(item) {
+  var row = document.createElement('div');
+  row.dataset.state = item.state;
+  row.dataset.rel = item.rel;
+  row.textContent =
+    '· ' +
+    item.rel +
+    (item.state === 'conflict'
+      ? '：两边都有且内容不同，没动它'
+      : item.root === 'output'
+        ? ' → 产物根'
+        : ' → 同根内归位');
+  // "从哪到哪"的准话放悬停里：跨根那几行两边的相对路径**长得一模一样**
+  // （「09_SHOTS/EP01/EP01_SH001.mp4」在资料根与产物根下都叫这个），而绝对路径太长，
+  // 摆进这条窄缝会把上面那份总账挤没。
+  row.title = item.src + '  →  ' + item.dst;
+  return row;
 }
 
 // ---- 侧栏按钮 ----------------------------------------------------------
