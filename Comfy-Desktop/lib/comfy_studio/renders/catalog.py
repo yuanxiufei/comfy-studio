@@ -133,10 +133,14 @@ class RenderRun:
     is_error: bool
     text: str
     data: Any = None
+    #: 按 ``file`` 跑时是那份工作流文件名（登记过的目标跑就是 None）。``target_id`` 那边会写成
+    #: ``workflow:<文件名>`` —— 面板照它显示"这次跑的是哪一张"。
+    file: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
             "target_id": self.target_id,
+            "file": self.file,
             "isError": self.is_error,
             "text": self.text,
             "data": self.data,
@@ -213,14 +217,19 @@ class RenderCatalog:
 
     async def run(
         self,
-        target_id: str,
+        target_id: str | None = None,
         params: dict[str, Any] | None = None,
         *,
+        file: str | None = None,
         images: Iterable[str | Path] = (),
         duration_sec: float | None = None,
         output_dir: str | Path | None = None,
     ) -> RenderRun:
-        """跑一个渲染目标。
+        """跑一个登记过的渲染目标，或工作流目录里任意一份图（``file=``）。
+
+        ``file`` 那条是给"用户自己存过、还没登记注入点的图"的：引擎会把它包成一个没有参数的
+        目标，全按图上原值跑。所以那种跑法传什么 ``params`` 都会被引擎按"不认识的参数"拒掉 ——
+        参数的规则只有组装期说得准，这里不预先筛一遍。
 
         ``images`` 是**这台机器上的文件路径**，按顺序对应提示词里的"图片1、图片2…"（只有视频
         目标收），引擎会先搬进它自己的 ``input/``。
@@ -228,8 +237,18 @@ class RenderCatalog:
         参数的**规则**校验（必填、时长要正数）由引擎负责 —— 组装期是唯一说了算的地方，
         这边不重复实现一份（见引擎 ``skills/render.py``）。
         """
-        self.get(target_id)  # 先确认它存在，不存在就显式报错
-        arguments: dict[str, Any] = {"target_id": target_id, "params": dict(params or {})}
+        if (target_id is None) == (file is None):
+            raise RendersError(
+                "target_id 与 file 二选一：登记过的目标用 target_id（见 renders/list），"
+                "工作流目录里任意一张图用 file（见 workflows/list）"
+            )
+        if target_id is not None:
+            self.get(target_id)  # 先确认它存在，不存在就显式报错
+            key = target_id
+            arguments: dict[str, Any] = {"target_id": target_id, "params": dict(params or {})}
+        else:
+            key = f"workflow:{file}"
+            arguments = {"file": file, "params": dict(params or {})}
         names = [str(path) for path in images]
         if names:
             arguments["images"] = names
@@ -240,13 +259,13 @@ class RenderCatalog:
         result = await self._hub.call_tool(self._tool(RENDER_TOOL), arguments)
         message = error_message(result)
         if message is not None:
-            return RenderRun(target_id=target_id, is_error=True, text=message)
+            return RenderRun(target_id=key, is_error=True, text=message, file=file)
         text = result_text(result)
         try:
             data: Any = json.loads(text)
         except json.JSONDecodeError:
             data = None
-        return RenderRun(target_id=target_id, is_error=False, text=text, data=data)
+        return RenderRun(target_id=key, is_error=False, text=text, data=data, file=file)
 
     # ---- 内部 -----------------------------------------------------------
 

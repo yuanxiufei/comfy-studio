@@ -34,7 +34,7 @@ from comfy_studio.memory import (
     MemoryStoreError,
     memory_home,
 )
-from comfy_studio.server import StudioHost
+from comfy_studio.server import DEFAULT_SESSION, StudioHost
 from comfy_studio.skills import SkillCatalog
 
 
@@ -357,13 +357,13 @@ class HostMemoryTests(unittest.TestCase):
         # 比的是**拼出来的结果**，不是形状 —— 形状是个每轮重算的零参函数，换智能体要立刻生效，
         # 所以不能再拿它跟字符串直接比（见 test_agents_tools.py 里人设那几条）。
         host = _make_host(None)
-        source = host._prompt_source()
+        source = host._prompt_source(DEFAULT_SESSION)
         self.assertTrue(callable(source))
         self.assertEqual(source(), DEFAULT_SYSTEM_PROMPT)
 
     def test_with_memory_the_prompt_is_recomputed_every_time(self) -> None:
         host = _make_host(MemoryClient(self.store))
-        source = host._prompt_source()
+        source = host._prompt_source(DEFAULT_SESSION)
         self.assertTrue(callable(source))
         first = source()
         self.assertIn(MEMORY_PROMPT_RULES, first)

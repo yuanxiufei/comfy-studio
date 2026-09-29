@@ -34,6 +34,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -94,8 +95,9 @@ class ProjectsError(RuntimeError):
 #: ⚠️ 这里的字符串**必须**是 ``spec.PROJECT_DIRS`` 里的落点。规范改了落点而这里没跟上，
 #: :func:`shelf_gaps` 会报出来（而不是悄悄少显示一格）；单测对真清单钉住它为空。
 PROJECT_SHELVES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
-    ("script", "剧本与总纲", ("00_PROJECT/01_剧本", "00_PROJECT/01_剧本/00_总纲")),
-    ("dialogue", "对白与配音", ("00_PROJECT/06_对白",)),
+    ("script", "剧本与总纲", ("00_PROJECT/00_原文解析", "00_PROJECT/01_剧本",
+                              "00_PROJECT/01_剧本/00_总纲")),
+    ("dialogue", "对白与配音", ("00_PROJECT/06_对白", "00_PROJECT/06_对白/对白稿")),
     ("index", "资产索引与台账", ("00_PROJECT/02_资产索引", "00_PROJECT/03_台账")),
     ("flow", "流程与进度", ("00_PROJECT/05_流程",)),
     ("delivery", "交付与出图", ("00_PROJECT/04_交付与出图",)),
@@ -320,6 +322,7 @@ def _scope_title(scope: str) -> str:
 def _list_files(
     root: Path,
     *,
+    seeds: Any,
     base: Path | None = None,
     deep: bool = True,
     skip: tuple[Path, ...] = (),
@@ -333,6 +336,10 @@ def _list_files(
     ``skip`` 是**不往里走**的子目录（绝对路径）。用法只有一个：``01_剧本/`` 里面套着
     ``00_总纲/``，两个都是落点 —— 不剪掉的话同一份``角色小传.md``会被列两遍，
     而"列了两遍"看起来只是文件多了一个，没人会当成 bug。
+
+    ``seeds`` 是"这一份算不算预置空表"的谓词（由 :func:`_seed_predicate` 按**载入的那份
+    规范**造）。**必填**而不是给个默认：漏传的失效模式是面板把空模板全说成产物，
+    而界面上一片"已完成"，谁也看不出是漏传了。
     """
     if not root.is_dir():
         return []
@@ -349,19 +356,46 @@ def _list_files(
             for name in sorted(filenames):
                 if name == ".gitkeep":
                     continue
-                out.append(_file_row(origin, Path(dirpath) / name))
+                out.append(_file_row(origin, Path(dirpath) / name, seeds))
     else:
         for name in sorted(os.listdir(root)):
             if name == ".gitkeep":
                 continue
             full = root / name
             if full.is_file():
-                out.append(_file_row(origin, full))
+                out.append(_file_row(origin, full, seeds))
     return sorted(out, key=lambda row: row["rel"])
 
 
-def _file_row(base: Path, path: Path) -> dict[str, Any]:
-    """一个文件的几个事实（相对路径 / 字节 / 改动时间）。读不到大小就报 0，不编。"""
+def _seed_predicate(spec: Any) -> Any:
+    """按**载入的那份规范**造一个"这一份是不是预置空表"的谓词。
+
+    规范自带 ``is_seed_path`` 就用它；没有就退回"照它自己的 ``SEED_FILES`` 判"，
+    而那条规则（``EP01`` 按集号放宽）**借包内那份的** :func:`projects_spec.seed_predicate`，
+    不在这里重写：退回逐字比对的下场是 EP02 的空对白表被算成**产物**，
+    面板上八步工作台里那一步自己"有料"了 —— 用户看见的是空模板，界面说的是有产物。
+    """
+    fn = getattr(spec, "is_seed_path", None)
+    if callable(fn):
+        return lambda rel: bool(fn(rel))
+    pattern_builder = getattr(spec, "seed_predicate", None)
+    if callable(pattern_builder):
+        return pattern_builder(getattr(spec, "SEED_FILES", ()))
+    try:
+        return _packaged_spec().seed_predicate(getattr(spec, "SEED_FILES", ()))
+    except ProjectsError:
+        # 包内那份都载不上（安装不完整）时不该让"列个文件"也炸掉：退到逐字相等，
+        # 至少还认得出建项目时预置的那几份。
+        rels = {str(dst).replace("\\", "/") for _src, dst in getattr(spec, "SEED_FILES", ())}
+        return lambda rel: rel.replace("\\", "/") in rels
+
+
+def _file_row(base: Path, path: Path, seeds: Any) -> dict[str, Any]:
+    """一个文件的几个事实（相对路径 / 字节 / 改动时间 / 是不是预置空表）。读不到大小就报 0，不编。
+
+    面板靠 ``seed`` 把"建项目时预置的空模板"与"真跑出来的产物"分开 ——
+    不分开的话"管理小说"与"阶段工作台"都会把空表说成成果。
+    """
     try:
         stat = path.stat()
         size, mtime = stat.st_size, stat.st_mtime
@@ -374,6 +408,7 @@ def _file_row(base: Path, path: Path) -> dict[str, Any]:
         "bytes": size,
         "mtime": mtime,
         "readable": path.suffix.lower() in PROJECT_SUFFIXES,
+        "seed": bool(seeds(rel)),
     }
 
 
@@ -571,17 +606,21 @@ class ProjectLibrary:
             rel: tuple(root / Path(other) for other in spec.PROJECT_DIRS if other.startswith(rel + "/"))
             for rel in spec.PROJECT_DIRS
         }
+        seeds = _seed_predicate(spec)
         buckets: dict[str, dict[str, Any]] = {}
         for rel in spec.PROJECT_DIRS:
             full = root / Path(rel)
             listed = (
-                _list_files(full, base=root, skip=nested[rel]) if full.is_dir() else []
+                _list_files(full, base=root, skip=nested[rel], seeds=seeds)
+                if full.is_dir()
+                else []
             )
             buckets[rel] = {
                 "rel": rel,
                 "scope": scopes.get(rel, ""),
                 "exists": full.is_dir(),
                 "count": len(listed),
+                "seed_count": sum(1 for row in listed if row["seed"]),
                 "truncated": len(listed) > MAX_TREE_FILES,
                 "files": listed[:MAX_TREE_FILES],
             }
@@ -612,7 +651,7 @@ class ProjectLibrary:
                     "count": sum(item["count"] for item in items),
                 }
             )
-        root_files = _list_files(root, deep=False)
+        root_files = _list_files(root, deep=False, seeds=seeds)
         shelves.append(
             {
                 "key": "root",
@@ -639,17 +678,38 @@ class ProjectLibrary:
 
     # ---- 读一份资料 -----------------------------------------------------
 
-    def read(self, name: Any, rel: Any, offset: Any = None, chars: Any = None) -> dict[str, Any]:
+    def read(
+        self,
+        name: Any,
+        rel: Any,
+        offset: Any = None,
+        chars: Any = None,
+        whole: Any = None,
+    ) -> dict[str, Any]:
         """读项目里的一份文本（面板点开一格里的文件）。
 
         编码走原文那套判定（:func:`comfy_studio.novels.decode_text`）：判不出来就明确报错，
-        不把一屏乱码当剧本交出去。**只读不写** —— 面板是"看与调用"的入口，
-        改剧本请在编辑器里改，避免两处同时改一份文件。
+        不把一屏乱码当剧本交出去。
 
         行尾统一按 ``\\n`` 算（Windows 编辑器写下的 ``\\r\\n`` 归一）。``offset`` / ``chars`` /
         ``total_chars`` 都是**归一之后**的位置：面板照这个翻页，两边口径得一致 ——
         把 ``\\r`` 一起交给面板，页上会多出一堆看不见的字符，翻页也会对不上。
+
+        ``digest`` 是**这一份文件整份**的 sha256（不是这一页的）。面板改完要写回时带着它回来，
+        见 :meth:`write`：那个参数是"我改的是我读到的这一版"这句话的唯一凭据。
+
+        ``whole=True`` 是给**要改完写回**的面板那一趟的（工作台右边那一栏）：整份读来，一次
+        翻页都不分。为什么不让面板自己传 ``chars=40000``：那个上限是**这里**的常量
+        （:data:`MAX_READ_CHARS`），面板抄一份就会两边分家（``novels.py`` 那边为同一个毛病
+        挨过一次，见 ``DEFAULT_READ_CHARS`` 的注释）。所以面板只说"我要整份"，上限由这里给。
+
+        ⚠️ 整份也**可能不够**：比 :data:`MAX_READ_CHARS` 还长的文件，``whole=True`` 回来时
+        ``truncated`` 仍然是真。**别拿这一份写回去** —— :meth:`write` 写的是调用方给的那段
+        全文，把半份当全文交上去，等于把余下的内容删掉，而 :meth:`write` 自己看不出这件事
+        （它拿到的是"一段更短的完整文本"，合法得很）。
         """
+        if _as_bool(whole, False, where="whole"):
+            offset, chars = 0, MAX_READ_CHARS
         root = self._path(name)
         rel_text = _as_name(rel, "文件相对路径").replace("\\", "/").lstrip("/")
         target = root / Path(rel_text)
@@ -665,8 +725,9 @@ class ProjectLibrary:
         size = target.stat().st_size
         if size > MAX_TEXT_BYTES:
             raise ProjectsError(f"{rel_text} 有 {size} 字节，超过 {MAX_TEXT_BYTES}：太大，不整读")
+        raw = target.read_bytes()
         try:
-            text, encoding = decode_text(target.read_bytes(), rel_text)
+            text, encoding = decode_text(raw, rel_text)
         except NovelsError as err:
             raise ProjectsError(str(err)) from err
         text = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -680,12 +741,139 @@ class ProjectLibrary:
             "path": str(target),
             "encoding": encoding,
             "bytes": size,
+            "digest": hashlib.sha256(raw).hexdigest(),
             "total_chars": total,
             "offset": start,
             "requested_chars": want,
             "chars": len(piece),
             "truncated": start + len(piece) < total,
             "text": piece,
+        }
+
+    # ---- 改一份资料 -----------------------------------------------------
+
+    def write(
+        self,
+        name: Any,
+        rel: Any,
+        text: Any,
+        base_digest: Any = None,
+    ) -> dict[str, Any]:
+        """把面板上改过的正文写回原位。**本模块唯一一处改项目资料的地方。**
+
+        为什么开这个口子：面板上"看得见却改不了"的正是最需要当场改一个错别字的东西
+        （分镜表、对白稿、提示词）—— 改一处的代价是切回编辑器里找那份文件，而找不到时
+        人会去改**另一个**同名文件，那才是真的乱。``read`` 从前那句"只读不写"靠的是
+        "改剧本请在编辑器里改"，而在面板里逐格看产物、发现一处不对，就是没法改。
+
+        ``base_digest`` 是**必填**的乐观锁，三个取值各对应一件事实：
+
+        * ``None``（没给）→ **拒写**。"我没读过"与"我读过、它没变"是两件事，
+          把前者当后者，等于用一次盲写盖掉别人（智能体、生成脚本）刚写进去的东西。
+        * ``""``（空串）→ 调用方读到的是"这份文件还不存在"。真不存在才让写（新建产物）；
+          这期间有人建了一份同名文件就**拒写**，绝不覆盖。
+        * 别的字符串 → 必须与当前文件的 sha256（``read`` 回的 ``digest``）逐字相同。
+
+        **不吞、不合并、不备份**：对不上就报错并把两边都摆出来，由人决定。自动合并冲突
+        在 markdown 上做不对，而"做不对还默默做"正是把一份手改过的分镜表毁掉的方式。
+
+        有一件事**这里看不出来**，得由调用方守：交上来的 ``text`` 必须是**整份**。半份也
+        "合法"—— 那只是一段更短的完整文本，摘要对得上、大小也不超，于是这份文件余下的内容
+        被静静删掉。所以拿 :meth:`read` 的 ``whole=True`` 读、并在 ``truncated`` 为真时
+        **不要**写回（那说明这一份比 :data:`MAX_READ_CHARS` 还长，只读不写）。
+
+        写盘走"同目录临时文件 + 原子换名"，行尾与编码**沿用原文件**（读的时候把 ``\\r\\n``
+        归一了，写回去不还原的话，一次改一个字会让整份文件在 git 里变成全改）。
+        """
+        root = self._path(name)
+        if not isinstance(text, str):
+            raise ProjectsError("正文必须是字符串")
+        rel_text = _as_name(rel, "文件相对路径").replace("\\", "/").lstrip("/")
+        target = root / Path(rel_text)
+        if not is_within(root, target):
+            raise ProjectsError(f"路径跑到项目外面去了：{rel_text!r}")
+        suffix = target.suffix.lower()
+        if suffix not in PROJECT_SUFFIXES:
+            raise ProjectsError(
+                f"这一类文件不在这里改：{rel_text}（只有 {'、'.join(PROJECT_SUFFIXES)} 是文本资料）"
+            )
+        if base_digest is not None and not isinstance(base_digest, str):
+            raise ProjectsError("base_digest 必须是字符串（没读过就不传）")
+
+        existed = target.is_file()
+        current = ""
+        encoding = "utf-8"
+        newline = "\n"
+        if existed:
+            try:
+                raw = target.read_bytes()
+            except OSError as err:
+                raise ProjectsError(f"读不了 {rel_text}：{err}") from err
+            if len(raw) > MAX_TEXT_BYTES:
+                raise ProjectsError(
+                    f"{rel_text} 有 {len(raw)} 字节，超过 {MAX_TEXT_BYTES}：太大，不整写"
+                )
+            try:
+                _before, encoding = decode_text(raw, rel_text)
+            except NovelsError as err:
+                raise ProjectsError(str(err)) from err
+            current = hashlib.sha256(raw).hexdigest()
+            # 行尾沿用原文件：`read` 把 \r\n 归一成了 \n，写回不还原的话，
+            # 在 Windows 上改一个字会让整份文件在 git 里"全变了"。
+            newline = "\r\n" if b"\r\n" in raw else "\n"
+
+        if base_digest is None:
+            raise ProjectsError(
+                f"要改 {rel_text} 得先读一遍再改（带着 read 回的 digest 当 base_digest）："
+                "没读过就写，等于把别人刚写进去的东西盖掉 —— 这个目录里同时还有智能体与生成脚本在写。"
+            )
+        if base_digest == "":
+            if existed:
+                raise ProjectsError(
+                    f"{rel_text} 已经存在了（读到的那一版是空的）："
+                    "这边记的是'它还不存在'，先重读一遍再决定怎么改。"
+                )
+        elif not existed:
+            raise ProjectsError(
+                f"{rel_text} 已经不在了（读到的那一版是 {base_digest[:12]}…）："
+                "多半是被删了或挪了位置，先重读一遍。"
+            )
+        elif current != base_digest:
+            raise ProjectsError(
+                f"{rel_text} 在编辑期间被改过了（读到的是 {base_digest[:12]}…，现在是 {current[:12]}…）："
+                "这个目录里同时还有智能体与生成脚本在写。请重读一遍，把改动合进去再存。"
+            )
+        payload = text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", newline)
+        try:
+            data = payload.encode(encoding, errors="strict")
+        except UnicodeEncodeError as err:
+            raise ProjectsError(
+                f"{rel_text} 原来不是 UTF-8（{encoding}），改完的正文里有它写不出的字符：{err}"
+            ) from err
+        if len(data) > MAX_TEXT_BYTES:
+            raise ProjectsError(f"要写进去的有 {len(data)} 字节，超过 {MAX_TEXT_BYTES}：太大，不整写")
+        tmp = target.with_name(target.name + ".cs-tmp")
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_bytes(data)
+            os.replace(tmp, target)
+        except OSError as err:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise ProjectsError(f"写不进 {rel_text}：{err}") from err
+        return {
+            "name": root.name,
+            "rel": rel_text,
+            "path": str(target),
+            "encoding": encoding,
+            "newline": "crlf" if newline == "\r\n" else "lf",
+            "bytes": len(data),
+            "chars": len(payload),
+            "created": not existed,
+            "digest": hashlib.sha256(data).hexdigest(),
+            "base_digest": base_digest,
         }
 
     # ---- 与原文（小说库）的联动 -----------------------------------------
@@ -876,7 +1064,7 @@ PROJECTS_TOOLS: tuple[_Spec, ...] = (
         name="list",
         description=(
             "列出这台机器上已有的漫剧项目（一剧一目录），每部带上：文件数、阶段进度"
-            "（S0 建纲 … S7 合规）、缺哪些落点、最近改动时间。"
+            "（S0a 原文解析 … S7a 短剧合成）、缺哪些落点、最近改动时间。"
             "用户提到某部剧、问“现在做到哪了”“接着往下做”，先查这里再答，别凭印象说。"
             "这也告诉你项目根在哪：路径就在返回值里，读章节文件用文件工具时按它拼。"
             "建项目 / 改名不在工具里：那是人在面板上按的（名字与集数一定下来就要动十几个目录）。"
@@ -897,7 +1085,7 @@ PROJECTS_TOOLS: tuple[_Spec, ...] = (
             "读**一部剧**的现状简报：各方资料各有多少文件（剧本与总纲 / 对白与配音 / 资产索引与台账 / "
             "流程与进度 / 交付与出图 / 素材归档 / 世界观 / 角色服装道具 / 场景表情姿态 / 分镜与镜头 / "
             "一致性与音频）、一格里有两种粒度时**全剧级 / 分集级各多少**、"
-            "八个生产阶段（S0–S7）到哪一步、缺什么落点、原著登记的是哪本书。"
+            "十一个生产阶段（S0a–S7a）到哪一步、缺什么落点、原著登记的是哪本书。"
             "要动一部剧（写剧本、出角色设定、拆分镜）之前先读它，别猜目录里有什么。"
             "**先把全剧级（总纲 / 资产索引 / 台账）读出来再碰分集产物** —— "
             "纲领性设定的权威在 `00_PROJECT/01_剧本/00_总纲/`，不在某一集正文里。"

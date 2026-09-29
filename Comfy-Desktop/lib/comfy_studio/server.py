@@ -34,7 +34,7 @@
 ``novels/search``        ``{name, query, limit?}`` → 这串字在原文里的位置（面板据此跳过去）
 ``novels/import``        ``{path, name?, overwrite?}`` → 把本机一份 txt/md 接进原文目录
 ``novels/delete``        ``{name}`` → 删掉一篇原文（面板先问一次再调它）
-``pipeline/plan``        ``{name, novel?, episodes?}`` → 这一部剧的 S0–S7 计划
+``pipeline/plan``        ``{name, novel?, episodes?}`` → 这一部剧的 S0a–S7a 计划
                          （谁做 · 产出落哪 · 哪几段还要引擎侧渲染；不调模型、不落盘）
 ``pipeline/run``         ``{name, novel?, episodes?, from?, to?, force?}`` → 跑流水线；
                          过程中推 ``pipeline/event`` 通知（与 ``agent/event`` 一个路子）
@@ -100,16 +100,19 @@ from .novels import (
     MAX_SEARCH_LIMIT,
     MAX_TEXT_BYTES,
     NovelLibrary,
+    NovelsClient,
     NovelsError,
     default_novel_dir,
     resolve_novel,
 )
+from .panel import PanelContextError, describe_context, parse_context
 from .pipeline import (
     NovelToVideoPipeline,
     PipelineClient,
     PipelineError,
     plan_payload,
     state_payload,
+    steps_payload,
 )
 from .plan import PlanChannel, PlanClient
 from .projects import (
@@ -142,6 +145,7 @@ from .web import (
     WebFetcher,
     search_config,
 )
+from .workflows import WorkflowLibrary, WorkflowsError
 
 SERVER_NAME = "comfy-studio-desktop"
 SERVER_VERSION = "0.1.0"
@@ -259,6 +263,7 @@ class StudioHost:
         settings: SettingsStore | None = None,
         projects: ProjectLibrary | None = None,
         renders: RenderCatalog | None = None,
+        workflows: WorkflowLibrary | None = None,
         turn_timeout: float | None = DEFAULT_TURN_TIMEOUT,
     ) -> None:
         self.hub = hub
@@ -298,6 +303,10 @@ class StudioHost:
         #: 同一个 hub 去读引擎。None 时 ``renders/*`` 会明确说"宿主没挂渲染目录"，而不是回一张空表
         #: 让人以为"这台机器没配任何目标"。
         self.renders = renders
+        #: 工作流目录（那 12 张之外，用户自己存的、改了一半的图都在同一个目录里）：同样由启动方
+        #: 挂上来。None 时 ``workflows/*`` 会明确说"宿主没挂工作流目录"，而不是回一张空表让人
+        #: 以为"这台机器没有工作流"。
+        self.workflows = workflows
         #: 面板里切过的模型；None = 用当前那条源自己的默认模型（进程内有效，不落盘）。
         self.default_model: str | None = None
         #: 面板里切过的模型**源**；None = 环境变量那条。它与 :attr:`default_model` 一起决定
@@ -313,6 +322,12 @@ class StudioHost:
         #: 正在跑一轮的会话：session_id → 那一轮的取消令牌。
         #: 这些会话不能被换模型打断（换客户端会把在飞的一轮劈了）。
         self._turns: dict[str, CancelToken] = {}
+        #: 本轮面板选中态拼出来的那段话：session_id → 文本（空串 = 面板上什么都没选）。
+        #: **只活一轮**：:meth:`agent_chat` 进来时写下、出去时抹掉。留到下一轮就成了"上一轮
+        #: 的面板"，而用户很可能刚换了一份工作流 —— 那不是坏在崩溃上，是坏在"模型拿着旧信息
+        #: 却以为是最新的"，最难查。它与 :attr:`_turns` 同生共死是有意的：会话也是在
+        #: :meth:`_session` 里第一次建起来时才算一次人设（见 :meth:`_prompt_source`）。
+        self._panel_contexts: dict[str, str] = {}
         self.server = StdioRpcServer({"name": SERVER_NAME, "version": SERVER_VERSION})
         self._register()
 
@@ -327,6 +342,7 @@ class StudioHost:
         self.server.on("skills/run", self.skills_run)
         self.server.on("renders/list", self.renders_list)
         self.server.on("renders/run", self.renders_run)
+        self.server.on("workflows/list", self.workflows_list)
         self.server.on("agent/config", self.agent_config)
         self.server.on("agent/settings", self.agent_settings)
         self.server.on("agent/models", self.agent_models)
@@ -351,12 +367,14 @@ class StudioHost:
         self.server.on("projects/list", self.projects_list)
         self.server.on("projects/tree", self.projects_tree)
         self.server.on("projects/read", self.projects_read)
+        self.server.on("projects/write", self.projects_write)
         self.server.on("projects/create", self.projects_create)
         self.server.on("projects/link_novel", self.projects_link_novel)
         self.server.on("projects/brief", self.projects_brief)
         self.server.on("pipeline/plan", self.pipeline_plan)
         self.server.on("pipeline/run", self.pipeline_run)
         self.server.on("pipeline/state", self.pipeline_state)
+        self.server.on("pipeline/steps", self.pipeline_steps)
 
     # ---- 方法 -----------------------------------------------------------
 
@@ -492,13 +510,26 @@ class StudioHost:
         }
 
     async def renders_run(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
-        """跑一个渲染目标：与 MCP 的 ``comfy_render`` 同一套组装（含参考图与外部组）。
+        """跑一个渲染目标、或工作流目录里任意一张图：与 MCP 的 ``comfy_render`` 同一套组装。
+
+        ``target_id``（登记过的目标）与 ``file``（目录里那张图）二选一 —— 后者是给"用户自己存
+        的、没登记过的图"的一条路，全按图上原值跑。
 
         这里只挡**形状**（参数是不是对象、images 是不是字符串数组）："必填给了没、时长要正数"
         那些规则住在引擎的组装期，不在这里再写一份。
         """
         args = _object(params, "renders/run")
-        target_id = _text(args, "target_id")
+        target_id = args.get("target_id")
+        file = args.get("file")
+        if (target_id is None) == (file is None):
+            raise RpcError(
+                INVALID_PARAMS,
+                "target_id 与 file 二选一：登记过的目标用 target_id（见 renders/list），"
+                "工作流目录里任意一张图用 file（见 workflows/list）",
+            )
+        for label, value in (("target_id", target_id), ("file", file)):
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise RpcError(INVALID_PARAMS, f"{label} 必须是非空字符串")
         run_params = args.get("params") or {}
         if not isinstance(run_params, dict):
             raise RpcError(INVALID_PARAMS, "params 必须是对象")
@@ -519,6 +550,7 @@ class StudioHost:
             run = await self._renders().run(
                 target_id,
                 run_params,
+                file=file,
                 images=images,
                 duration_sec=duration_sec,
                 output_dir=output_dir,
@@ -534,6 +566,32 @@ class StudioHost:
                 "宿主没挂渲染目录：启动方没把 RenderCatalog 传进来（见 __main__ 的启动参数）",
             )
         return self.renders
+
+    async def workflows_list(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
+        """列出工作流目录里的**每一份图**（``renders/list`` 只报登记过的那 12 条）。
+
+        这一条回答的是"这台机器的工作流目录里到底有什么" —— 用户自己存的、改到一半的、另存过的
+        图都在这儿。"没配目录"与"目录是空的"照旧分开说（``note`` / 空数组），别让人对着一张空表猜。
+        """
+        _object(params, "workflows/list")
+        library = self._workflows()
+        try:
+            files = await library.refresh()
+        except WorkflowsError as err:
+            raise RpcError(INTERNAL_ERROR, f"读工作流清单失败: {err}") from err
+        return {
+            "workflowsDir": library.workflows_dir,
+            "note": library.note,
+            "files": [item.to_json() for item in files],
+        }
+
+    def _workflows(self) -> WorkflowLibrary:
+        if self.workflows is None:
+            raise RpcError(
+                INTERNAL_ERROR,
+                "宿主没挂工作流目录：启动方没把 WorkflowLibrary 传进来（见 __main__ 的启动参数）",
+            )
+        return self.workflows
 
     def agent_config(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
         _object(params, "agent/config")
@@ -860,6 +918,15 @@ class StudioHost:
                 INVALID_PARAMS,
                 f"会话 {session_id} 已有一轮在跑；等它结束、agent/cancel 掉它，或换个 session_id",
             )
+        # 面板选中态（哪一份工作流 / 哪部剧 / 哪篇原文）在这一轮的人设里说给模型听 ——
+        # 没有它，"改一下这个"里的"这个"只能靠猜（见 :mod:`comfy_studio.panel`）。
+        # 必须在 :meth:`_session` **之前**写下：会话第一次建起来时会当场算一次人设
+        # （``AgentSession.__init__`` 里的 ``_system_text``），那一次就得读到它。
+        try:
+            context = parse_context(args.get("context"), where="agent/chat 的 context")
+        except PanelContextError as err:
+            raise RpcError(INVALID_PARAMS, str(err)) from err
+        self._panel_contexts[session_id] = describe_context(context)
         session = await self._session(session_id)
 
         async def on_event(event: object) -> None:
@@ -883,6 +950,9 @@ class StudioHost:
         finally:
             unbind_emit(token)
             self._turns.pop(session_id, None)
+            # 面板选中态**不留给下一轮**：用户很可能刚换了一份图，而"模型拿着上一轮的面板
+            # 却以为是最新的"没有任何办法从界面上看出来（见 self._panel_contexts 的注释）。
+            self._panel_contexts.pop(session_id, None)
             # 一轮收尾就落一次盘（被取消的那一轮也落）。放在 finally 里的理由：不管这一轮是
             # 怎么结束的，历史都已经补齐成"完整的一轮"了（见 agent/loop.py 的取消路径），
             # 存进去的存档喂回来不会半截。写失败只记一行 stderr：答案已经算出来交给用户了，
@@ -1331,8 +1401,38 @@ class StudioHost:
         chars = _int_param(
             args, "chars", PROJECT_READ_CHARS, low=1, high=MAX_PROJECT_READ_CHARS, method="projects/read"
         )
+        # ``whole``：工作台右边那一栏"读整份来改"用（见 ProjectLibrary.read）。面板不传
+        # ``chars`` 那份上限过来 —— 上限是宿主这边的常量，面板抄一份就会两边分家。
+        whole = args.get("whole", False)
+        if not isinstance(whole, bool):
+            raise RpcError(INVALID_PARAMS, "projects/read 的 whole 必须是布尔值")
         try:
-            return self._projects().read(name, rel, offset, chars)
+            return self._projects().read(name, rel, offset, chars, whole)
+        except ProjectsError as err:
+            raise RpcError(INTERNAL_ERROR, str(err)) from err
+
+    def projects_write(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
+        """把面板上改过的一份资料写回去（分镜表、对白稿、提示词这类文本产物）。
+
+        ``base_digest`` 从 :meth:`projects_read` 回的 ``digest`` 原样带回来，
+        是"我改的是我读到的那一版"这句话的全部凭据：对不上就**拒写**并把两边摆出来
+        （见 :meth:`comfy_studio.projects.ProjectLibrary.write`）。这里只挡形状，
+        守卫全在那一处 —— 面板与模型走的是同一个方法，规则只有一份。
+
+        与 ``novels/import`` / ``novels/delete`` 的分工：那两条是**只有人**能点的
+        （导入/删除原文），本方法改的是项目里的产物，模型也能改自己的产物。
+        """
+        args = _object(params, "projects/write")
+        name = _text(args, "name")
+        rel = _text(args, "rel")
+        text = args.get("text")
+        if not isinstance(text, str):
+            raise RpcError(INVALID_PARAMS, "projects/write 的 text 必须是字符串")
+        digest = args.get("base_digest")
+        if digest is not None and not isinstance(digest, str):
+            raise RpcError(INVALID_PARAMS, "projects/write 的 base_digest 必须是字符串（没读过就不传）")
+        try:
+            return self._projects().write(name, rel, text, digest)
         except ProjectsError as err:
             raise RpcError(INTERNAL_ERROR, str(err)) from err
 
@@ -1435,7 +1535,7 @@ class StudioHost:
         for key in ("from", "to"):
             value = args.get(key)
             if value is not None and not isinstance(value, str):
-                raise RpcError(INVALID_PARAMS, f"{key} 必须是阶段代码（S0–S7）")
+                raise RpcError(INVALID_PARAMS, f"{key} 必须是阶段代码（S0a–S7a）")
             picked.append(value)
         force = args.get("force")
         if force is not None and not isinstance(force, bool):
@@ -1443,7 +1543,7 @@ class StudioHost:
         return picked[0], picked[1], bool(force)
 
     def pipeline_plan(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
-        """这一部剧的 S0–S7 计划：谁做、产出落哪、哪几段还要引擎侧渲染。
+        """这一部剧的 S0a–S7a 计划：谁做、产出落哪、哪几段还要引擎侧渲染。
 
         **不调模型、不落盘** —— 面板点开就能看，不会因为看一眼就花钱。
         形状由 :func:`comfy_studio.pipeline.plan_payload` 定，**与对话里的 ``pipeline__plan``
@@ -1464,6 +1564,23 @@ class StudioHost:
         pipeline = self._make_pipeline(args, "pipeline/state", config=None)
         try:
             return state_payload(pipeline)
+        except PipelineError as err:
+            raise RpcError(INTERNAL_ERROR, str(err)) from err
+
+    def pipeline_steps(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
+        """八步工作台的整条导航：每一步现在什么状态、那一步的落点里有什么。
+
+        与 :meth:`pipeline_plan` 的分工：``plan`` 是**生产链**（11 段，跑的口径），
+        本方法是**用户的八步**（创作顺序，看与改的口径）——两者的先后**本来就不一样**
+        （见 :data:`comfy_studio.projects_spec.WORKBENCH_STEPS` 的说明）。
+        面板照这一份摆左侧导航，照 ``plan`` 摆"全链路"详情，两个都要。
+
+        **不调模型、不落盘**：打开面板看一眼不会花钱，也不会把项目写动。
+        """
+        args = _object(params, "pipeline/steps")
+        pipeline = self._make_pipeline(args, "pipeline/steps", config=None)
+        try:
+            return steps_payload(pipeline, self._projects())
         except PipelineError as err:
             raise RpcError(INTERNAL_ERROR, str(err)) from err
 
@@ -1689,16 +1806,21 @@ class StudioHost:
         except AgentCatalogError as err:
             raise AgentError(f"选中的智能体 {agent_id!r} 用不了：{err}") from err
 
-    def _prompt_source(self) -> Callable[[], str]:
+    def _prompt_source(self, session_id: str) -> Callable[[], str]:
         """会话的人设来源：一个**每次重算**的零参函数（:meth:`AgentSession.ask` 每轮都会叫它）。
 
         提示词 = 底座规则 + 选中智能体的角色段 + 收尾要求（``compose_system_prompt``），
-        挂了记忆时再插一段"你记得什么"，挂了联网工具时再插一段"你可以联网查"。所以这里有三件事
-        值得每轮重算：用户可能刚换了个智能体、刚被记下一件新事、或者刚把联网关掉（启动参数），
-        都得在下一轮就看见。
+        挂了记忆时再插一段"你记得什么"，挂了联网工具时再插一段"你可以联网查"。所以这里有四件事
+        值得每轮重算：用户可能刚换了个智能体、刚被记下一件新事、刚把联网关掉（启动参数）、
+        或者刚在面板上换了一份工作流 / 换了一部剧 —— 都得在下一轮就看见。
 
-        用的是通用助手（角色段是空串）、又没挂记忆时，拼出来就是 ``DEFAULT_SYSTEM_PROMPT``
-        一个字不差 —— ``compose_system_prompt("")`` 会把空段丢掉，默认行为与从前完全一样。
+        面板那一段按 ``session_id`` 现读（:attr:`_panel_contexts` 里那一格**只活一轮**）：
+        它跟着"哪一段对话"走，而不是跟着宿主走 —— 两个会话各聊各的，谁也不该看见对方
+        面板上的选中项。
+
+        用的是通用助手（角色段是空串）、又没挂记忆、面板上也没选东西时，拼出来就是
+        ``DEFAULT_SYSTEM_PROMPT`` 一个字不差 —— ``compose_system_prompt("")`` 会把空段丢掉，
+        默认行为与从前完全一样。
         """
         store = self.memory.store if self.memory is not None else None
 
@@ -1706,6 +1828,10 @@ class StudioHost:
 
         def current() -> str:
             sections = [self._agent_section()]
+            # 面板选中态紧跟人设之后：它是"你现在面对着什么"，比"你记得什么"更靠前一件。
+            panel = self._panel_contexts.get(session_id, "")
+            if panel:
+                sections.append(panel)
             if store is not None:
                 sections.append(store.digest())
             if web:
@@ -1777,7 +1903,7 @@ class StudioHost:
         try:
             session = create_session(
                 self.hub,
-                system_prompt=self._prompt_source(),
+                system_prompt=self._prompt_source(session_id),
                 history=history,
                 config=self._session_config(),
             )
@@ -1964,6 +2090,11 @@ async def serve_stdio(
     if projects is not None:
         # 两张只读工具（查项目有什么、一部剧到什么程度）：模型据此接话，但不许替人建项目。
         extra.append(ProjectsClient(projects))
+    if novels is not None:
+        # 四张只读工具（书库里有什么、读一页、看章节目录、搜一串字）：流水线每一段提示词里
+        # 那句"先读原文"要靠它才落得下来 —— 否则模型手里没有任何能碰到原文的家伙。
+        # 导入 / 删除**不挂**：那是落盘与删文件，由人在面板上按（见 comfy_studio.novels）。
+        extra.append(NovelsClient(novels))
     # 流水线两张（``pipeline__plan`` 看计划 / ``pipeline__run`` 真去跑）：模型有了它，才能把
     # "一部小说"一路推到"一套可投产的提示词"，而不只是念面板上的结果。``run`` **自己**会先弹
     # 一次确认，只有用户明确点头才开跑（见 ``comfy_studio.pipeline`` 里 ``RUN_AGREE`` 那段），
@@ -1997,6 +2128,7 @@ async def serve_stdio(
             novels=novels,
             projects=projects,
             renders=RenderCatalog(hub),
+            workflows=WorkflowLibrary(hub),
             settings=settings_store,
             turn_timeout=turn_timeout,
         )

@@ -33,7 +33,7 @@
 ================================  ==============================================
 ``PROJECT_DIRS``                  一个项目应有的全部落点（面板格子必须盖住它）
 ``DIR_SCOPES`` / ``SCOPE_ORDER``  每个落点的粒度、以及粒度的显示顺序
-``STAGE_SPECS``                   阶段 S0–S7：谁做 · 落哪 · 怎么跑 · 判据在哪
+``STAGE_SPECS``                   阶段 S0a–S7a：谁做 · 落哪 · 怎么跑 · 判据在哪
 ``SEED_FILES``                    建项目预置的空表（模板在 ``templates/project/``）
 ================================  ==============================================
 
@@ -88,6 +88,7 @@ class ProjectError(Exception):
 #: 注意 `00_PROJECT/01_剧本` 是**分集级**落点（每集一份正文），
 #: 而 `00_PROJECT/01_剧本/00_总纲` 是**全剧级**落点（跨集共享的设定）—— 两者都要建。
 PROJECT_DIRS = (
+    "00_PROJECT/00_原文解析",
     "00_PROJECT/01_剧本",
     "00_PROJECT/01_剧本/00_总纲",
     "00_PROJECT/02_资产索引",
@@ -95,6 +96,7 @@ PROJECT_DIRS = (
     "00_PROJECT/04_交付与出图",
     "00_PROJECT/05_流程",
     "00_PROJECT/06_对白",
+    "00_PROJECT/06_对白/对白稿",
     "00_PROJECT/07_素材归档",
     "01_WORLD",
     "02_CHARACTERS",
@@ -133,6 +135,7 @@ SCOPE_ORDER = (SCOPE_WHOLE, SCOPE_EPISODE, SCOPE_MIXED)
 #: 覆盖性由 `tests/test_projects.py` 守：`DIR_SCOPES` 要给 `PROJECT_DIRS` 每一项都
 #: 有口径，`SCOPE_ORDER` 要收齐用到的粒度 —— 少一个就是面板上一格静默消失。
 DIR_SCOPES = {
+    "00_PROJECT/00_原文解析": SCOPE_WHOLE,
     "00_PROJECT/01_剧本": SCOPE_EPISODE,
     "00_PROJECT/01_剧本/00_总纲": SCOPE_WHOLE,
     "00_PROJECT/02_资产索引": SCOPE_WHOLE,
@@ -140,6 +143,7 @@ DIR_SCOPES = {
     "00_PROJECT/04_交付与出图": SCOPE_MIXED,
     "00_PROJECT/05_流程": SCOPE_MIXED,
     "00_PROJECT/06_对白": SCOPE_EPISODE,
+    "00_PROJECT/06_对白/对白稿": SCOPE_EPISODE,
     "00_PROJECT/07_素材归档": SCOPE_WHOLE,
     "01_WORLD": SCOPE_WHOLE,
     "02_CHARACTERS": SCOPE_WHOLE,
@@ -156,7 +160,7 @@ DIR_SCOPES = {
 
 
 # ─────────────────────────────────────────────────────────────
-# 一·补、生产阶段（S0–S7）—— **阶段 ↔ 工作流配合**的事实源
+# 一·补、生产阶段（S0a–S7a）—— **阶段 ↔ 工作流配合**的事实源
 # ─────────────────────────────────────────────────────────────
 
 #: 图片后缀。引擎侧 `flow_core.PNG_EXTS` 是同一份知识的**第二处** —— 本文件要能被
@@ -204,14 +208,38 @@ class StageSpec:
     gate: str
 
 
-#: S0–S7。`(code, name, owner)` 三项原先由 `tests/test_stages.py` 从
+#: S0–S7（另加 S0a / S4a / S7a，见下）。`(code, name, owner)` 三项原先由 `tests/test_stages.py` 从
 #: `生产流程规范（S0-S7）.md` §一 与 `流程与落点映射.md` §一 抽表对拍 ——
 #: ⚠️ 那两份文档与那个测试目前都不在检出里（见本文件开头「现状」），
 #: 所以这份表是**当前唯一**的阶段口径。
 #:
 #: `landings` 用 `PROJECT_DIRS` 里的相对路径（不另造一套路径写法）；
 #: `check_dirs` / `check_exts` 是**体检**口径。
+#:
+#: 除 S0–S7 外另有三个**补进来的段**（代号带字母后缀，位置就是它在链上的位置）：
+#: `S0a`（原文解析）、`S4a`（对白与旁白）、`S7a`（短剧合成）。
+#: 它们原先在这条链上**没有落点**：原文只能是"整篇塞进提示词"、对白表有目录有种子却
+#: **没有任何一段负责填**、镜头的成片谁也说不清在哪一步合成。补段而不重排 S0–S7 的
+#: 编号：老编号是别处（工作流、进度账、面板文案）已经在用的口径，动它换不来任何东西。
+#:
+#: ⚠️ 新段的 `entries` 指向**宿主侧**的流水线命令（`comfy_studio.pipeline`）——
+#: 那是本检出里真实存在、跑得起来的入口；不照抄 S0–S7 那几条 `main.py flow`，
+#: 因为那几条指向的是引擎侧，而引擎侧当前不在检出里（见本文件开头「现状」）。
+#: 写一个"看起来齐整但根本不存在的入口"，正是 :class:`StageEntry` 要防的那件事。
 STAGE_SPECS = (
+    StageSpec(
+        code="S0a", name="原文解析", owner="01 剧本文本",
+        landings=("00_PROJECT/00_原文解析",),
+        # 只查这一个目录：它是本段**独占**的落点。不把 00_总纲 或 02_资产索引 拿来共用 ——
+        # 那两个目录分别由 S0 / S1 判"完成"，共用之后"原文解析跑过"会被读成"建纲跑过"，
+        # 而这两件事差着十万八千里。
+        check_dirs=("00_PROJECT/00_原文解析",), check_exts=(".md", ".json"),
+        entries=(StageEntry("cli", "pipeline",
+                            "python -m comfy_studio.pipeline --project <项目> "
+                            "--from S0a --to S0a"),),
+        gate="宿主侧流水线的分段报告（comfy_studio.pipeline 的 state）；"
+             "这一段只产文本解析，无引擎侧门禁",
+    ),
     StageSpec(
         code="S0", name="建纲", owner="01 剧本文本",
         landings=("00_PROJECT/01_剧本", "00_PROJECT/01_剧本/00_总纲",
@@ -268,6 +296,21 @@ STAGE_SPECS = (
         gate="生产流程规范（S0-S7）.md §一；门口那条 = python main.py gate storyboard <交付包>",
     ),
     StageSpec(
+        code="S4a", name="对白与旁白", owner="01 剧本文本",
+        landings=("00_PROJECT/06_对白/对白稿",),
+        # 查的是子目录 `对白稿/`，**不是** 06_对白 根：根下放着种子空表
+        # （对白表_EP01.md / 配音单_EP01.md），而体检"这份还算空表吗"只读种子文件
+        # —— 种子一旦落在某段的 check_dirs 里，那条优化就不等价了
+        # （由 tests/test_projects.py 的 test_seed_files_never_land_inside_a_stage_drop_point 钉住）。
+        # 与 S6 不冲突：S6 只查 11_AUDIO（声音产物），理由见那一段的注释 ——
+        # "稿子写完"不等于"声音做完"。
+        check_dirs=("00_PROJECT/06_对白/对白稿",), check_exts=(".md",),
+        entries=(StageEntry("cli", "pipeline",
+                            "python -m comfy_studio.pipeline --project <项目> "
+                            "--from S4a --to S4a"),),
+        gate="宿主侧流水线的分段报告；对白/旁白是否与分镜表逐镜对齐，由 S4 的产物对拍",
+    ),
+    StageSpec(
         code="S5", name="视频", owner="04 视频生成",
         landings=("09_SHOTS",),
         check_dirs=("09_SHOTS",), check_exts=(".mp4", ".mov"),
@@ -295,11 +338,210 @@ STAGE_SPECS = (
         entries=(StageEntry("cli", "gate", "python main.py gate compliance"),),
         gate="生产流程规范（S0-S7）.md §一（所有 BLOCKING 项 CLOSED 才可发布）",
     ),
+    StageSpec(
+        code="S7a", name="短剧合成", owner="04 视频生成",
+        landings=("00_PROJECT/04_交付与出图",),
+        # 查的是**成片**（视频后缀），不是那张合成单：合成单是"要怎么合"的稿，
+        # 它先于成片存在。拿 .md 判"合成完成"就是拿计划当结果。
+        check_dirs=("00_PROJECT/04_交付与出图",), check_exts=(".mp4", ".mov", ".mkv"),
+        entries=(StageEntry("cli", "pipeline",
+                            "python -m comfy_studio.pipeline --project <项目> "
+                            "--from S7a --to S7a"),),
+        gate="生产流程规范（S0-S7）.md §一（逐镜对齐 · 音画同步 · 总时长）；"
+             "宿主侧只出合成单，真正的合成在引擎侧",
+    ),
 )
 
-#: 阶段的顺序（S0 → S7）。面板/报告按它摆，别让每个消费者自己排一遍。
+#: 阶段的顺序（S0a → S7a，即 `STAGE_SPECS` 的排列）。面板/报告按它摆，别让每个消费者自己排一遍。
 STAGE_ORDER = tuple(s.code for s in STAGE_SPECS)
 STAGE_BY_CODE = {s.code: s for s in STAGE_SPECS}
+
+
+# ─────────────────────────────────────────────────────────────
+# 工作台的八个步骤：机器侧 11 段 ≠ 用户要走的 8 步
+# ─────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class WorkStep:
+    """工作台上的一步：**用户视角**的一段活，可以盖住 0～2 个机器阶段。
+
+    ⚠️ 步骤的先后是**创作顺序**，不等于 :data:`STAGE_ORDER` 那条生产链。两处不一致是
+    **故意的**，不是没对齐：用户先想清楚"谁在这、穿什么、这一场怎么拍"再写分镜，
+    而机器侧 S1（资产设计）与 S4（分镜）之间还夹着 S2/S3 两段出图。面板照这里的顺序
+    摆导航，**跑起来仍然按 ``STAGE_ORDER``** —— 见 :func:`step_stages`。
+
+    ``stages`` 允许为空（见 ``style``）：视觉风格是一段**校订**的活，没有独立的机器阶段，
+    它的产物（``01_WORLD``）由智能体写、由这一步的人拍板，不由流水线跑。
+    硬给它挂一个阶段，只会让"跑这一步"这个按钮变成一个不知道会跑出什么的东西。
+    """
+
+    key: str
+    name: str
+    goal: str
+    #: 这一步负责的阶段（``STAGE_ORDER`` 的子集；可能是空元组）。
+    stages: tuple
+    #: 这一步看得见、改得动的落点（``PROJECT_DIRS`` 里的相对路径）。
+    landings: tuple
+    #: 上游步骤的 key：这几步没做完，本步就是缺料。面板照它提示"先跑哪一步"。
+    needs: tuple
+    #: 一句话的注意（面板当提示用，别在这里复述判据）。
+    note: str = ""
+
+
+#: 工作台的八个步骤，**顺序就是用户要走的顺序**。
+#:
+#: 与 :data:`STAGE_SPECS` 的分工：阶段表回答"谁做 · 落哪 · 怎么跑 · 判据在哪"，
+#: 这张表回答"用户在界面上按什么顺序走、每一步该看见哪些格子"。两者**都要**，
+#: 因为它们是两件事：一条生产链分不出"先定风格还是先写分镜"这种**人的**先后。
+#:
+#: 三条不变量由 :func:`step_gaps` 盯着（单测钉住它为空）：
+#: 每个阶段恰好属于一步、每个落点恰好被一步认领、``needs`` 指向的 key 真是一步。
+#: 少盯一条的失效模式都是**静默**的：那一段不在导航里、或者同一段出现两次，
+#: 而界面上什么都不会报错 —— 只会有人以为"这一步本来就没有"。
+WORKBENCH_STEPS = (
+    WorkStep(
+        key="parse", name="小说文本解析",
+        goal="把原著读成机器能用的东西：人物表、场景表、分卷与篇幅，"
+             "并标出书里没写清、要人拍板的地方。",
+        stages=("S0a",),
+        landings=("00_PROJECT/00_原文解析", "00_PROJECT/07_素材归档"),
+        needs=(),
+        note="原文从「资料库 · 书库」导入。这一段只读原文，不改原文。",
+    ),
+    WorkStep(
+        key="cast", name="角色与场景提取",
+        goal="把解析结果定成一份谁能引用的清单：建纲、角色/服装/道具/场景的资产索引，"
+             "以及这些资产各自的 ID 与口径。",
+        stages=("S0", "S1"),
+        landings=("00_PROJECT/01_剧本", "00_PROJECT/01_剧本/00_总纲",
+                  "00_PROJECT/02_资产索引", "00_PROJECT/03_台账"),
+        needs=("parse",),
+        note="资产 ID 一旦定了就是全剧引用它的钥匙；改 ID 等于改所有引用它的地方。",
+    ),
+    WorkStep(
+        key="board", name="分镜脚本",
+        goal="把一集拆成一个个镜头：景别、机位、运镜、时长，每一镜一行。",
+        stages=("S4",),
+        landings=("08_STORYBOARDS",),
+        needs=("cast",),
+        note="分镜表是下游所有产物的**对齐全凭据**：对白要跟它逐镜对齐，出图要按它取镜。",
+    ),
+    WorkStep(
+        key="dialogue", name="对话与旁白",
+        goal="把每一镜的台词、旁白、音效点补齐，并标出谁在说、用什么语气。",
+        stages=("S4a",),
+        landings=("00_PROJECT/06_对白", "00_PROJECT/06_对白/对白稿"),
+        needs=("board",),
+        note="目录里那两张表是**建项目时预置的空表**；成稿落在「对白稿」这一格。",
+    ),
+    WorkStep(
+        key="style", name="视觉风格",
+        goal="定下这一部戏长什么样：世界观与美术基调、色调与材质、"
+             "以及每个人物/场景怎么被画出来。",
+        stages=(),
+        landings=("01_WORLD", "03_COSTUMES"),
+        needs=("cast",),
+        note="这一步没有独立的机器阶段：产物由智能体写、由你拍板，不归流水线跑。"
+             "口径定在这里，下一步的提示词才有地方抄。",
+    ),
+    WorkStep(
+        key="prompts", name="图像与视频提示词",
+        goal="把风格落成一条条能直接喂给模型的提示词，并按提示词把资产图、"
+             "表情集、动作集真的出出来。",
+        stages=("S2", "S3"),
+        landings=("00_PROJECT/04_交付与出图", "02_CHARACTERS", "04_PROPS",
+                  "05_ENVIRONMENTS", "06_EXPRESSIONS", "07_POSES"),
+        needs=("style",),
+        note="提示词里的人物外观**照抄**风格那一步的口径，不要在这里临时发挥。",
+    ),
+    WorkStep(
+        key="video", name="视频生成",
+        goal="逐镜出片：首尾帧接得住、镜间连贯，同时把对白与音效配出来。",
+        stages=("S5", "S6"),
+        landings=("09_SHOTS", "11_AUDIO"),
+        needs=("prompts",),
+        note="耗时最长、最占显卡的一步；一镜不要了就在这一格删，别去动分镜表。",
+    ),
+    WorkStep(
+        key="cut", name="短剧合成",
+        goal="把镜头、声音、字幕合成成片，跑一遍合规项，交出一部能发布的短剧。",
+        stages=("S7", "S7a"),
+        landings=("10_CONSISTENCY", "00_PROJECT/05_流程"),
+        needs=("video", "dialogue"),
+        note="合成单与成片是两件事：写完成合单不等于合成完了，成片才是结果。",
+    ),
+)
+
+#: 步骤 key → 那一步。与 ``STAGE_BY_CODE`` 平行。
+STEP_BY_KEY = {step.key: step for step in WORKBENCH_STEPS}
+
+#: 步骤的先后（= ``WORKBENCH_STEPS`` 的排列）。导航与"下一步"都按它来，别各自排一遍。
+STEP_ORDER = tuple(step.key for step in WORKBENCH_STEPS)
+
+#: 阶段 → 步骤。由 :func:`step_gaps` 保证每个阶段都在里面。
+STEP_BY_STAGE = {code: step.key for step in WORKBENCH_STEPS for code in step.stages}
+
+
+def step_of_stage(code: str) -> str:
+    """这个机器阶段归工作台哪一步。
+
+    不在任何一步里是**配置错误**（"这段在界面上没有家"），显式抛错而不是返回空串 ——
+    返回空串的失效模式是那一段从导航里**静静地**消失，而报告一切正常。
+    """
+    key = STEP_BY_STAGE.get(code)
+    if key is None:
+        raise ProjectError(
+            "阶段 %r 不属于工作台任何一步：WORKBENCH_STEPS 里漏了它" % (code,)
+        )
+    return key
+
+
+def step_stages(key: str) -> tuple:
+    """某一步要跑的阶段，**一律按 ``STAGE_ORDER``**排。
+
+    表里写的先后只当"这一步盖住哪些阶段"用，不当执行顺序 ——
+    执行顺序全仓只有 ``STAGE_ORDER`` 一处说了算（流水线也是照它跑的）。
+    两处各排一遍的失效模式是：面板上写着"先 S3 再 S2"，跑起来正好颠倒。
+    """
+    step = STEP_BY_KEY.get(key)
+    if step is None:
+        raise ProjectError("没有这一步：%r（八步见 WORKBENCH_STEPS）" % (key,))
+    return tuple(code for code in STAGE_ORDER if code in step.stages)
+
+
+def step_gaps() -> tuple:
+    """工作台步骤表与三份事实源对不上时的那几条（空元组 = 一切对齐）。
+
+    与 :func:`shelf_gaps` 同一个道理：**报出来**，不让它悄悄少显示一段。
+    单测对真表钉住它为空 —— 改了 ``PROJECT_DIRS`` / ``STAGE_SPECS`` 而没跟上这张表时，
+    那一条断言会当场炸，而不是等用户在界面上发现"少了一步"。
+    """
+    problems: list = []
+    seen: dict = {}
+    for step in WORKBENCH_STEPS:
+        for code in step.stages:
+            if code not in STAGE_BY_CODE:
+                problems.append("步骤 %s 挂着不存在的阶段 %r" % (step.key, code))
+            elif code in seen:
+                problems.append("阶段 %s 同时挂在 %s 与 %s 两步上" % (code, seen[code], step.key))
+            else:
+                seen[code] = step.key
+        for rel in step.landings:
+            if rel not in PROJECT_DIRS:
+                problems.append("步骤 %s 认领了不存在的落点 %r" % (step.key, rel))
+        for need in step.needs:
+            if need not in STEP_BY_KEY:
+                problems.append("步骤 %s 的上游 %r 不是一步" % (step.key, need))
+    for code in STAGE_ORDER:
+        if code not in seen:
+            problems.append("阶段 %s 不在工作台任何一步里" % code)
+    # 落点也要盖满：没被任何一步认领的格子只在「资料库」里露脸，
+    # 用户在步骤流里永远走不到它 —— 那正是"面板很乱但东西找不到"的那种乱。
+    claimed = {rel for step in WORKBENCH_STEPS for rel in step.landings}
+    for rel in PROJECT_DIRS:
+        if rel not in claimed:
+            problems.append("落点 %s 不属于任何一步" % rel)
+    return tuple(problems)
 
 
 def stage_how(code: str) -> str:
@@ -310,7 +552,7 @@ def stage_how(code: str) -> str:
     """
     spec = STAGE_BY_CODE.get(code)
     if spec is None:
-        raise ProjectError("没有这个阶段：%r（S0–S7 见 STAGE_SPECS）" % (code,))
+        raise ProjectError("没有这个阶段：%r（S0a–S7a 见 STAGE_SPECS）" % (code,))
     if not spec.entries:
         raise ProjectError("阶段 %s 在 STAGE_SPECS 里没有入口：它没人管" % code)
     return spec.entries[0].cmd
@@ -328,6 +570,54 @@ SEED_FILES = (
     ("素材来源登记.md", "00_PROJECT/07_素材归档/素材来源登记.md"),
     ("归档清单.md", "00_PROJECT/07_素材归档/归档清单.md"),
 )
+
+
+def _seed_episode_pattern(dst: str):
+    """把种子表的某个目标路径变成"按集号放宽"的匹配式。
+
+    ``create_project`` 只造 ``EP01`` 那几份，可"第 2 集的空对白表"是同一种东西。
+    逐字相等的失效模式是：EP02 的空表被当成**已完成的产物**，进度自己往前跳一格。
+    """
+    return re.compile("^" + re.escape(dst).replace("EP01", r"EP\d+") + "$")
+
+
+#: 预置空表的路径匹配式（由 :data:`SEED_FILES` 生成，不另抄一份路径）。
+_SEED_PATTERNS = tuple(_seed_episode_pattern(dst) for _src, dst in SEED_FILES)
+
+
+def _matches_seed(patterns, rel) -> bool:
+    """``rel`` 命中 ``patterns`` 里任意一条吗（反斜杠先归正，非字符串一律不算）。"""
+    if not isinstance(rel, str):
+        return False
+    posix = rel.replace("\\", "/")
+    return any(pattern.match(posix) for pattern in patterns)
+
+
+def seed_predicate(seed_files):
+    """按一份 ``SEED_FILES`` 造"这一份是不是预置空表"的谓词（``EP01`` 按集号放宽）。
+
+    **按参数生成**，不只认模块自己那份：``projects`` 载入的规范可能是**替换实现**
+    （``--spec <路径>`` 或测试里那份最小规范），它未必带 :func:`is_seed_path`，那时
+    得退回"照它自己的 ``SEED_FILES`` 判"。放宽规则只写在这一处 —— 两边各抄一份的下场
+    不是报错，是同一张 EP02 空对白表在一边算空表、在另一边算产物，面板上的进度自己跳。
+    """
+    patterns = tuple(_seed_episode_pattern(str(dst)) for _src, dst in seed_files or ())
+
+    def _is_seed(rel) -> bool:
+        return _matches_seed(patterns, rel)
+
+    return _is_seed
+
+
+def is_seed_path(rel: str) -> bool:
+    """这一份是不是**建项目预置的空表**（``EP01`` 那一小段按集号放宽）。
+
+    为什么处处要问这一句：预置空表**不是**"这一段做过了"。不区分的话，刚建完项目
+    八步工作台就有几步自己"有料"了 —— 用户看见的是空模板，界面说的是有产物。
+    这与 ``scan_project`` 里"体检不复读种子文件"是同一个判断（那里用 :func:`_seed_rel_paths`，
+    只认逐字相等；这里多认集号，因为面板会把每一集都列出来）。
+    """
+    return _matches_seed(_SEED_PATTERNS, rel)
 
 #: 阶段产物体检：(阶段名, 落点元组, 匹配后缀)。后缀为空表示"该目录下有任意文件"。
 #: **从 `STAGE_SPECS` 派生，不另抄一份** —— 抄一份的失效模式是"体检表里的 S7 还叫
@@ -488,8 +778,10 @@ def create_project(name: str, *, episodes: int = 12, root: str = None,
         "项目名": name,
         "集数": episodes,
         "日期": date.today().isoformat(),
-        "当前阶段": "S0 建纲",
-        "下一步动作": "把原著放进工作区 novel/，跑 S0 建纲出分集大纲",
+        # 新项目落在链的**最前面**那一段：先把原著导入书库，再跑原文解析。
+        # （这两句是写进 `单元进度台账.md` 的初始值，人第一眼就看它。）
+        "当前阶段": "S0a 原文解析",
+        "下一步动作": "把原著导入书库（面板「管理小说」），跑 S0a 原文解析",
     }
     for src, dst in SEED_FILES:
         src_path = os.path.join(TEMPLATE_DIR, src)

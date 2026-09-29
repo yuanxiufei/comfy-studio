@@ -10,6 +10,7 @@ from pathlib import Path
 from ..skills import WORKFLOWS_DIR, build_prompt, load_skills, merge_params
 from ..skills.loader import load_skill_file, validate_skill
 from ..skills.params import SEED_RANDOM
+from ..skills.runner import SkillExecutionError
 from ..skills.types import SkillParam
 from .support import make_skill
 
@@ -244,6 +245,23 @@ class BuildPromptTest(unittest.TestCase):
         skill = validate_skill(GOOD, "mem")
         with self.assertRaises(ValueError):
             build_prompt(skill, {"ckpt_name": "a.safetensors", "steps": "8"})
+
+    def test_a_param_pointing_at_a_missing_node_names_the_skill_and_the_param(self) -> None:
+        """参数指向图上没有的节点：要报出"谁的哪个参数"，不是一个裸 ``KeyError: '99'``。
+
+        为什么非说清楚不可：漏掉的那个键在引擎那边是**静默**的（``execution.validate_inputs``
+        按节点定义遍历输入，报文里多出来的键既不校验也不执行），所以只有这里能出声。
+        """
+        skill = make_skill(
+            skill_id="指向不存在的节点",
+            params=(SkillParam(name="steps", type="integer", node="99", field="steps"),),
+        )
+        with self.assertRaises(SkillExecutionError) as caught:
+            build_prompt(skill, {"steps": 4})
+        message = str(caught.exception)
+        self.assertIn("steps", message)
+        self.assertIn("#99", message)
+        self.assertIn(skill.id, message, "报错要指向是哪条 skill，而不是只给一个节点号")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 """从小说到视频：把「一剧一目录」的生产阶段串成一条**能跑、能断点续跑**的流水线。
 
-**为什么要有这一层**：``projects_spec.STAGE_SPECS`` 早写清了 S0–S7「谁做 · 落哪 · 怎么跑 ·
+**为什么要有这一层**：``projects_spec.STAGE_SPECS`` 早写清了 S0a–S7a「谁做 · 落哪 · 怎么跑 ·
 判据在哪」，``agent/catalog.py`` 早有七份成品人设，``novels.py`` 读得进原著，``projects.py``
 建得出项目。可这四样**互相不认识** —— 面板上每一件都点得到，却没有一处能把"一部小说"
 一路推到"一套可投产的视频提示词"。原先干这件事的是引擎侧运行时的 ``pipeline`` 模块
@@ -47,18 +47,28 @@ from .agent.types import ChatMessage, system_message, user_message
 from .cancel import CancelToken
 from .mcp import McpError, McpTool
 from .novels import NovelLibrary, NovelsError, resolve_novel
-from .projects import DEFAULT_EPISODES
+from .projects import DEFAULT_EPISODES, ProjectLibrary
 from .projects_spec import (
     PROJECT_DIRS,
     STAGE_BY_CODE,
     STAGE_ORDER,
+    STEP_ORDER,
+    WORKBENCH_STEPS,
     resolve_project,
     scan_project,
+    stage_how,
+    step_gaps,
+    step_stages,
 )
 from .review import ReviewChannel, ReviewError
 
 #: 状态账的版本号。形状变了就加它 —— 老账读不动时**明确报错**，不猜着读。
-STATE_VERSION = 1
+#:
+#: 2：阶段表从八段长成十一段（补了原文解析 / 对白与旁白 / 短剧合成三段，代号 S0a / S4a / S7a）。
+#: 加了段就**必须**加这个号：老账里没有这三段的记录，读成"还没跑"是错的 ——
+#: 那三段里有两段（原文解析、对白）在链的**前面**，老账把它们读成"没跑"的话，
+#: 一次 `--from` 重跑会从半路开始，而报告上写着"已补齐"，人不会去追。
+STATE_VERSION = 2
 
 #: 机器可读的分集大纲。**与 ``projects_spec.MIGRATIONS`` 的目标路径逐字一致**：那份表专门
 #: 警告过，它留在老位置时建纲阶段读不到就会重写一份，静默覆盖人改过的大纲。本文件认同一个
@@ -82,6 +92,21 @@ JSON_BLOCK_RE = re.compile(r"```json\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 STATUS_DONE = "done"
 STATUS_SKIPPED = "skipped"
 STATUS_FAILED = "failed"
+
+#: 工作台里**一段**现在什么样（见 :meth:`NovelToVideoPipeline.stage_mark`）。
+#: 这四个字是回给面板的（``comfyStudioChatContentScript.ts`` 的 ``stepChip`` 按它们出签），
+#: 与上面那三个 ``STATUS_*`` **不是一回事**：那三个是"账上记着跑成什么样"，
+#: 这四个是"这一格该显示什么"。``text`` 与 ``missing`` 在账里都没有对应值 ——
+#: 那两种情形账本身是自洽的，是**盘**跟账对不上。
+MARK_TODO = "todo"
+MARK_TEXT = "text"
+MARK_MISSING = "missing"
+#: 一段成了：账与盘都这么说（与 ``STATUS_DONE`` 同一个字面量，别写成两个字面量）。
+MARK_DONE = STATUS_DONE
+#: 只有**一步**才有的两种：这一步一段都没跑、且落点也空（``empty``）；
+#: 料不齐（``partial``，含"只有文本、实质产物还要引擎侧渲染"那种）。
+MARK_EMPTY = "empty"
+MARK_PARTIAL = "partial"
 
 #: 单段的墙钟上限（秒）。超了就把这一段判失败，并说清是"没在时限内回话"。
 #:
@@ -138,34 +163,116 @@ RUNNING_PROJECTS: set[str] = set()
 #: 资产库、分镜、视频、调音、歌词）。空串 = 这一段不由模型生成，改走机械体检。编一个 id 出来
 #: 才会把事情搞坏：它会静默地拿"剧本创作"的人设去审合规。
 STAGE_AGENT: dict[str, str] = {
+    "S0a": "script",
     "S0": "script",
     "S1": "costume",
     "S2": "costume",
     "S3": "asset",
     "S4": "storyboard",
+    "S4a": "script",
     "S5": "video",
     "S6": "voice",
     "S7": "",
+    "S7a": "video",
 }
 
 #: 阶段 → (文本产物相对路径, 是否还有一半得引擎侧渲染)。
 #: 路径的父目录**必须**是 ``PROJECT_DIRS`` 里的一项（也就是该阶段的 ``landings``），
 #: 由 ``tests/test_pipeline.py`` 机械核对 —— 落点写错的失效模式是产物掉在面板看不见的地方。
 STAGE_ARTIFACT: dict[str, tuple[str, bool]] = {
+    "S0a": ("00_PROJECT/00_原文解析/原文解析.md", False),
     "S0": ("00_PROJECT/01_剧本/00_总纲/分集大纲与三表.md", False),
     "S1": ("00_PROJECT/02_资产索引/资产总表.md", False),
     "S2": ("00_PROJECT/04_交付与出图/出图提示词_S2.md", True),
     "S3": ("06_EXPRESSIONS/表情与动作提示词.md", True),
     "S4": ("08_STORYBOARDS/分镜表.md", False),
+    "S4a": ("00_PROJECT/06_对白/对白稿/对白与旁白表.md", False),
     "S5": ("09_SHOTS/视频提示词.md", True),
     "S6": ("11_AUDIO/声音提示词.md", True),
     "S7": ("10_CONSISTENCY/合规体检.md", False),
+    "S7a": ("00_PROJECT/04_交付与出图/成片合成单.md", True),
+}
+
+#: 阶段 → 引擎侧那 12 张**生产工作流**里，这一段的实质产物该用哪几张出。
+#: id 就是引擎 ``skills/render.py`` 的 ``RENDER_TARGETS`` 里的 id（宿主不 import 引擎，
+#: 只能照抄在这儿）；有序，第一条是首选。
+#:
+#: **为什么要有这张表**：``needs_render`` 只说得出"图还没出"，说不出**用哪张图出**。
+#: 用户看着卡片上那句"跑完还要回引擎侧出图"，手上只有一排 12 个目标要自己认 —— 认错不报错，
+#: 只会出成另一张图（比如把场景卡当角色定妆板）。钉死"这一段 ↔ 这张图"，卡片上才能直接
+#: 摆一个「去出图」。
+#:
+#: **键集必须与 ``needs_render=True`` 的那几段一字不差**，由 :func:`_build_tasks` 与
+#: ``tests/test_pipeline.py`` 机械核对 —— 这张表两种错法都不响：少一条 = 按钮画不出来、
+#: 用户又得自己猜；多一条 = 卡片摆出一个"出图"按钮，而这一步的完成判定压根不看图。
+#:
+#: 前缀 ``character-sheet`` 的那三张是**同一套角色配方**的三个档（质量 / 快档 / Z-Image）：
+#: 这里绑的是配方，档位在图那一行的下拉里换，别把三个档都当成三个用途。
+#:
+#: 每一项是 ``(渲染目标 id, 落点目录)``。落点**必须是这一段 ``check_dirs`` 里的一个**，
+#: 由 :func:`_check_render_bindings` 机械核对 —— 出图时面板把它拼在项目根后面，当
+#: ``renders/run`` 的 ``output_dir`` 交给引擎（引擎那边落盘见 ``renders/catalog.py``）。
+#:
+#: **为什么落点也要钉在这里**：不钉的话，图只会留在引擎自己的 ``output/`` 里，而这一段的体检
+#: 看的是项目目录 —— 卡片上"还缺图"就永远不消，人以为白跑了一趟。这跟 id 绑错一样是**不响**的
+#: 那种错：出了图、也算出了东西，只是没出在该在的地方。
+STAGE_RENDER: dict[str, tuple[tuple[str, str], ...]] = {
+    # 角色的三视图落 02_CHARACTERS、场景的六角度落 05_ENVIRONMENTS（02–05 那四个目录里的 .png）。
+    # 服装与道具走的是同一套角色配方、按内容分落 03_COSTUMES / 04_PROPS —— 见 STAGE_RENDER_NOTE。
+    "S2": (("character-sheet", "02_CHARACTERS"), ("scene-card", "05_ENVIRONMENTS")),
+    # 表情集与动作集：还是那套角色配方，出的是同一个角色的多张变体（动作集那一格的落点见附言）。
+    "S3": (("character-sheet", "06_EXPRESSIONS"),),
+    # 逐镜出片：先试片看提示词对不对，再上正片；多镜连贯那条用在"镜间要保持同一人物"时。
+    # 三张都落 09_SHOTS —— 这一段的体检看的就是它。
+    "S5": (
+        ("video-draft", "09_SHOTS"),
+        ("video-final", "09_SHOTS"),
+        ("video-multishot", "09_SHOTS"),
+    ),
+    # 音频这一类，引擎侧目前**只有主题曲这一张图**（见下面的 STAGE_RENDER_NOTE）。
+    "S6": (("music", "11_AUDIO"),),
+    # 成片母版走放大；补帧是可选的那一步。两张都落交付那一格。
+    "S7a": (
+        ("video-upscale", "00_PROJECT/04_交付与出图"),
+        ("video-interpolate", "00_PROJECT/04_交付与出图"),
+    ),
+}
+
+#: 上面那几条要说清的一句（报告里原样带出去、画在按钮旁边）。没写的段就是不附言。
+#:
+#: 存在的理由：光看 id 会**把话说满**。S6 绑的是主题曲，而这一段要的是配音与环境声 ——
+#: 引擎侧还没有那两张图，不说清的话，用户会以为按下去出来的是配音。这一句就是那层"到哪为止"。
+#:
+#: S2 / S3 后半句说的是**落点那一层**的"到哪为止"：面板一次只填得了一个输出目录，而这两段
+#: 一个目录装不下（服装/道具、表情/动作各自成格）。不写清的话，服装图会静默地躺在角色那一格里。
+STAGE_RENDER_NOTE: dict[str, str] = {
+    "S2": (
+        "角色/服装/道具走定妆板，场景走设定卡；分镜首帧不在这一段（S4 的活，它的完成判定不看图）。"
+        "「去出图」落的是首选那一格（角色 → 02_CHARACTERS、场景 → 05_ENVIRONMENTS）："
+        "服装与道具是同一套配方，出完按内容归到 03_COSTUMES / 04_PROPS"
+    ),
+    "S3": (
+        "表情与动作走的是同一套角色配方：这一段量最大，要快档试提示词的话，"
+        "在渲染那一行把图换成 character-sheet-lightning。"
+        "落点填的是表情那一格（06_EXPRESSIONS），动作集出完归到 07_POSES"
+    ),
+    "S5": "先试片（768p）看提示词对不对，再上正片；首帧/尾帧在渲染那一行的参考图里给（本机图片路径）",
+    "S6": "引擎侧现在只有主题曲这一张音频图；配音、环境声、Foley 都还没有对应的图 —— 这一段出的不是配音",
+    "S7a": "放大出成片母版，补帧是可选的一步；两张的输入片子都要先用 stage_input_file 放进引擎 input/",
 }
 
 #: 阶段 → 交给模型的一句话（"这一段要产出什么"）。
 #: 不写在 ``projects_spec`` 里：那里的 ``gate`` 只写判据**在哪**（见它自己的 ⚠️），
 #: 而这里是**要模型产出什么**，是提示词的一部分，会随人设一起改。
 STAGE_BRIEF: dict[str, str] = {
+    "S0a": (
+        "读原著，产出**原文解析**：① 章节切分（章节号 + 一句话说这一章发生了什么）"
+        "② 场景切分（地点 / 时间 / 在场人物 / 这一场在故事里的作用）"
+        "③ 出场人物清单（姓名、身份、与主角的关系、首次出场的位置）"
+        "④ 关键情节与卡点（可以改编成钩子的地方）"
+        "⑤ 改编取舍建议（哪几条线可以并、哪几条必须留）。"
+        "只做解析：这一段的产物是给后面几段看的底账，不写剧本、不定集数、不出分镜。"
+    ),
     "S0": (
         "读原著（或它的开头），产出三样：① 分集大纲（每集一句话钩子 + 集末卡点）"
         "② 人物三表（人物表 / 关系表 / 势力表）③ 角色小传。"
@@ -174,7 +281,12 @@ STAGE_BRIEF: dict[str, str] = {
         "给不出就别给这个块，不要编一个形状不对的 JSON。"
     ),
     "S1": (
-        "按 S0 的大纲产出资产总表：世界观、角色、服装、道具、场景各自的清单与视觉要点。"
+        "按 S0 的大纲与 S0a 的原文解析产出资产总表，分三块写："
+        "① **角色与场景提取** —— 把原著与剧本里出现过的人物、地点、势力逐个捞出来去重，"
+        "标出他在故事里的作用与首次出场的位置；"
+        "② **视觉风格定义** —— 定下全剧的色彩、材质、光线、时代与镜头质感，"
+        "它是后面出图与出视频的统一口径，先定它再列清单；"
+        "③ 按这份口径列出世界观、角色、服装、道具、场景各自的清单与视觉要点。"
         "每条资产给一个稳定 ID，前缀分别是 WOR_ / CHR_ / CST_ / PRP_ / ENV_，序号三位。"
     ),
     "S2": (
@@ -189,6 +301,12 @@ STAGE_BRIEF: dict[str, str] = {
         "把大纲逐集拆成可拍摄的分镜：镜号、景别、机位、构图、运镜、光影、时长、画面描述，"
         "以及每镜的人物 Identity Lock 与场景 Environment Lock。"
     ),
+    "S4a": (
+        "按 S4 的分镜表逐个镜头写对白与旁白，一镜一行：镜号、说话人（写「旁白」的另起一格）、"
+        "台词、语气、这句大致占多长时间。旁白交代时间跳跃与人物内心，对白推进冲突 —— "
+        "不要把分镜里的画面描述复述成旁白。台词量按镜头时长收着写，宁短勿长。"
+        "正文之后另起一节写**配音单**：哪几句要进录音、按什么顺序、每句的表演提示。"
+    ),
     "S5": (
         "把 S4 的分镜逐镜写成可投产的视频提示词（逐镜五段式 + 时长 + 运动强度），"
         "并给出镜间衔接（上一镜尾帧 → 下一镜首帧）与一致性校验清单。"
@@ -199,6 +317,13 @@ STAGE_BRIEF: dict[str, str] = {
         "逐条给出标准化的声音提示词，并标明它对应哪一集哪一镜。"
     ),
     "S7": "",
+    "S7a": (
+        "把 S5 的逐镜视频与 S6 的声音合成成片，产出**合成单**：每一镜用哪个镜头文件、"
+        "对哪一条音轨、入出点（时间码）、转场方式、字幕，以及全片的总时长与分辨率。"
+        "再单列一节**合成前必须核过的一致性项**：镜间尾帧接得住首帧、音画是否同步、"
+        "音量有没有统一基准、字幕与对白是否逐字一致 —— 每条写清拿什么去核。"
+        "只出合成单与校验清单；真正的合成要回引擎侧跑，这一段在宿主侧到此为止。"
+    ),
 }
 
 #: 流水线自己的底座人设。**刻意不用 ``agent/loop.py`` 的 ``BASE_SYSTEM_PROMPT``**：
@@ -221,7 +346,7 @@ class PipelineError(RuntimeError):
 
 @dataclass(frozen=True)
 class StageTask:
-    """一段活：谁做 · 要产出什么 · 落在哪 · 还差哪一半得引擎侧渲染。"""
+    """一段活：谁做 · 要产出什么 · 落在哪 · 还差哪一半得引擎侧渲染（用哪张图出）。"""
 
     code: str
     name: str
@@ -237,6 +362,16 @@ class StageTask:
     #: 该阶段的实质产物体检口径（取自 ``STAGE_SPECS``），报告里原样带出去。
     check_dirs: tuple[str, ...]
     check_exts: tuple[str, ...]
+    #: 这一段的实质产物该用引擎侧哪几张图出、各自落进哪个目录（``STAGE_RENDER``）。
+    #: 空 = 这一段没有那一半。落点取自这一段的 ``check_dirs``（:func:`_check_render_bindings` 核对）。
+    render_lands: tuple[tuple[str, str], ...] = ()
+    #: 绑这几张图时要说清的一句（``STAGE_RENDER_NOTE``），报告里原样带出去。
+    render_note: str = ""
+
+    @property
+    def render_targets(self) -> tuple[str, ...]:
+        """只要目标 id（面板拿它画按钮）。落点见 :attr:`render_lands`。"""
+        return tuple(target for target, _ in self.render_lands)
 
     @property
     def actor(self) -> str:
@@ -252,6 +387,12 @@ class StageTask:
             "actor": self.actor,
             "artifact": self.artifact,
             "needs_render": self.needs_render,
+            # 面板拿这几条画「去出图」那排按钮（空数组 = 这一步不用出图，见 STAGE_RENDER）；
+            # ``render_lands`` 是"按下去存进哪一格"，面板拼上项目根当 output_dir 交给渲染 ——
+            # 没有它，图只会留在引擎的 output/ 里，这一段的体检永远还是"缺图"。
+            "render_targets": list(self.render_targets),
+            "render_lands": dict(self.render_lands),
+            "render_note": self.render_note,
             "brief": self.brief,
             "check_dirs": list(self.check_dirs),
             "check_exts": list(self.check_exts),
@@ -271,6 +412,15 @@ class StageOutcome:
     seconds: float
     note: str = ""
     error: str = ""
+    #: 同 :attr:`StageTask.render_lands`：还缺的那些图**是哪几张、该落进哪一格**。
+    #: ``render_pending`` 只说"还缺"，说不出"缺的叫什么" —— 卡片上那枚按钮靠这一条才画得出来。
+    render_lands: tuple[tuple[str, str], ...] = ()
+    render_note: str = ""
+
+    @property
+    def render_targets(self) -> tuple[str, ...]:
+        """只要目标 id（面板拿它画按钮）。落点见 :attr:`render_lands`。"""
+        return tuple(target for target, _ in self.render_lands)
 
     @property
     def render_pending(self) -> bool:
@@ -286,6 +436,9 @@ class StageOutcome:
             "artifact": self.artifact,
             "needs_render": self.needs_render,
             "render_pending": self.render_pending,
+            "render_targets": list(self.render_targets),
+            "render_lands": dict(self.render_lands),
+            "render_note": self.render_note,
             "seconds": round(self.seconds, 2),
             "note": self.note,
             "error": self.error,
@@ -342,8 +495,61 @@ def _require_landing(rel: str, *, what: str) -> str:
     return rel
 
 
+#: 渲染目标的 id 长什么样（``STAGE_RENDER`` 里那些）。见引擎 ``skills/render.py``。
+_RENDER_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def _check_render_bindings() -> None:
+    """核对 ``STAGE_RENDER`` 与 ``needs_render`` 是不是**同一批阶段**、落点在不在体检口径里。
+
+    这几张表分家都不响，而且错法各自坏在不同地方：
+
+    * 少绑一条 —— 卡片画不出「去出图」，用户又得自己在 12 张里认，认错只会出成另一张图；
+    * 多绑一条 —— 卡片摆出一个"出图"按钮，而这一步的完成判定压根不看图：按下去跑出来的东西
+      没人验，也没人知道该不该验；
+    * 落点不在 ``check_dirs`` 里 —— 图出得成、也确实落了盘，**只是落在体检不看的地方**：
+      卡片上"还缺图"永远不消，人以为白跑一趟（同 :func:`_require_landing` 那条道理）。
+
+    另外顺手把 id 的形状与"附言挂在空处"这两种也挡掉。
+    """
+    pending = {code for code, (_, needs) in STAGE_ARTIFACT.items() if needs}
+    bound = {code for code, lands in STAGE_RENDER.items() if lands}
+    if bound != pending:
+        raise PipelineError(
+            "STAGE_RENDER 与 STAGE_ARTIFACT 的 needs_render 对不上："
+            f"要出图却没绑图的是 {'、'.join(sorted(pending - bound)) or '（没有）'}；"
+            f"绑了图却不用出图的是 {'、'.join(sorted(bound - pending)) or '（没有）'}。"
+        )
+    for code, lands in STAGE_RENDER.items():
+        spec = STAGE_BY_CODE.get(code)
+        if spec is None:
+            # 这一条本该由 _build_tasks 末尾的 extra 那句拦下（话说得更全），但这里先读到它 ——
+            # 与其抛 KeyError，不如给同一句人话。
+            raise PipelineError(
+                f"STAGE_RENDER 里的 {code} 不是 S0a–S7a 里的阶段（见 projects_spec.STAGE_ORDER）"
+            )
+        for target, land in lands:
+            if not _RENDER_ID_RE.match(target):
+                raise PipelineError(
+                    f"阶段 {code} 绑的渲染目标 {target!r} 不像个 id（小写字母 / 数字 / 连字符，"
+                    "如 character-sheet）；id 见引擎 skills/render.py 的 RENDER_TARGETS。"
+                )
+            if land not in spec.check_dirs:
+                raise PipelineError(
+                    f"阶段 {code} 给 {target} 绑的落点 {land!r} 不在这一段的体检目录里"
+                    f"（{'、'.join(spec.check_dirs)}）；出图会落在体检不看的地方，"
+                    "卡片上「还缺图」就永远不消。"
+                )
+    strays = set(STAGE_RENDER_NOTE) - set(STAGE_RENDER)
+    if strays:
+        raise PipelineError(
+            f"STAGE_RENDER_NOTE 里这几段没绑图，那句话会挂在空处：{'、'.join(sorted(strays))}"
+        )
+
+
 def _build_tasks() -> tuple[StageTask, ...]:
-    """把三张静态表拧成任务清单。**顺序 = ``STAGE_ORDER``**，不另排一遍。"""
+    """把这几张静态表拧成任务清单。**顺序 = ``STAGE_ORDER``**，不另排一遍。"""
+    _check_render_bindings()
     tasks: list[StageTask] = []
     for code in STAGE_ORDER:
         spec = STAGE_BY_CODE[code]
@@ -363,12 +569,20 @@ def _build_tasks() -> tuple[StageTask, ...]:
                 brief=STAGE_BRIEF.get(code, ""),
                 check_dirs=tuple(spec.check_dirs),
                 check_exts=tuple(spec.check_exts),
+                render_lands=STAGE_RENDER.get(code, ()),
+                render_note=STAGE_RENDER_NOTE.get(code, ""),
             )
         )
-    extra = (set(STAGE_AGENT) | set(STAGE_ARTIFACT) | set(STAGE_BRIEF)) - set(STAGE_ORDER)
+    extra = (
+        set(STAGE_AGENT)
+        | set(STAGE_ARTIFACT)
+        | set(STAGE_BRIEF)
+        | set(STAGE_RENDER)
+        | set(STAGE_RENDER_NOTE)
+    ) - set(STAGE_ORDER)
     if extra:
         raise PipelineError(
-            f"这几张表里有不属于 S0–S7 的键：{'、'.join(sorted(extra))}；"
+            f"这几张表里有不属于 S0a–S7a 的键：{'、'.join(sorted(extra))}；"
             "阶段表以 projects_spec.STAGE_ORDER 为准。"
         )
     return tuple(tasks)
@@ -496,16 +710,44 @@ class NovelToVideoPipeline:
         text = json.dumps(state, ensure_ascii=False, indent=2)
         self.state_path.write_text(text + "\n", encoding="utf-8")
 
+    # ---- 一段成没成（断点续跑与工作台共用下面这两个原子）------------------
+
+    def _artifact_ready(self, task: StageTask) -> bool:
+        """这一段该落的**文本产物**在不在盘上。**只看盘**，账的说法交给 :meth:`_recorded_done`。"""
+        return (self.project / task.artifact).is_file()
+
+    @staticmethod
+    def _recorded_done(ledger: dict[str, Any], task: StageTask) -> bool:
+        """账上写着这一段跑完过没有。**只看账**，盘上有没有交给 :meth:`_artifact_ready`。"""
+        record = ledger.get(task.code)
+        return isinstance(record, dict) and record.get("status") == STATUS_DONE
+
+    def stage_mark(self, ledger: dict[str, Any], task: StageTask) -> str:
+        """这一段现在什么样：``todo`` / ``text`` / ``done`` / ``missing``。
+
+        ``text`` 是"文本那半有了、实质产物还要引擎侧渲染"，``missing`` 是"账说跑过、盘上没有"。
+        这两种都必须跟 ``todo`` 分开说：合成一个"完成度百分比"就没人看得出**该去渲染、还是该去重跑**。
+
+        与 :meth:`_done_before` 的关系：两者共用上面那两个原子，但**结论故意不同** ——
+        ``_done_before`` 是"这一回跳过它吗"（要求账上写着 done，因为每段都要花钱、要等），
+        这里是"面板上这一格显示什么"（产物在就算成了，哪怕账上没有记录）。
+        别把两处合成一处：合了以后要么"手写的产物被判成没做"，
+        要么"跑到一半的段被判成跑过了"，两个方向各错一边。
+        """
+        text_ok = self._artifact_ready(task)
+        if text_ok and not task.needs_render:
+            return MARK_DONE
+        if text_ok:
+            return MARK_TEXT
+        return MARK_MISSING if self._recorded_done(ledger, task) else MARK_TODO
+
     def _done_before(self, state: dict[str, Any], task: StageTask) -> bool:
         """这一段上次跑完过、而且产物还在吗。
 
         **两个条件都要**：账上写了 done、盘上却没有产物（被删、被移走、写到一半断电），
         那就得重跑 —— 只看账会把一个空的阶段报成完成，而且此后再也不会补上。
         """
-        record = state["stages"].get(task.code)
-        if not isinstance(record, dict) or record.get("status") != STATUS_DONE:
-            return False
-        return (self.project / task.artifact).is_file()
+        return self._recorded_done(state.get("stages", {}), task) and self._artifact_ready(task)
 
     # ---- 上下文 ---------------------------------------------------------
 
@@ -769,6 +1011,8 @@ class NovelToVideoPipeline:
                 needs_render=task.needs_render,
                 seconds=time.monotonic() - started,
                 note="上次跑过且产物还在（--force 可重跑）",
+                render_lands=task.render_lands,
+                render_note=task.render_note,
             )
             await self._emit({"type": "pipeline", "phase": "stage", **outcome.to_json()})
             return outcome
@@ -822,6 +1066,8 @@ class NovelToVideoPipeline:
                 needs_render=task.needs_render,
                 seconds=time.monotonic() - started,
                 note=note,
+                render_lands=task.render_lands,
+                render_note=task.render_note,
             )
             state["stages"][task.code] = {
                 "status": STATUS_DONE,
@@ -839,6 +1085,8 @@ class NovelToVideoPipeline:
                 needs_render=task.needs_render,
                 seconds=time.monotonic() - started,
                 error=f"{type(err).__name__}: {err}",
+                render_lands=task.render_lands,
+                render_note=task.render_note,
             )
             state["stages"][task.code] = {
                 "status": STATUS_FAILED,
@@ -880,6 +1128,15 @@ def format_report(report: dict[str, Any]) -> str:
             "   它们要引擎侧运行时 + ComfyUI 工作流 + 模型权重。文本提示词已经落盘，"
             "可照它去引擎侧（或可灵 / Seedance / 即梦那类平台）出片。",
         ]
+        # 面板上这几段各带一枚「去出图」；命令行这边没有按钮，就把该装哪张图、出完该落在哪儿
+        # 念出来 —— 认错图不会报错，只会出成另一张（同 STAGE_RENDER 的注释）。
+        for stage in report["stages"]:
+            lands = stage.get("render_lands") if stage.get("render_pending") else None
+            if not lands:
+                continue
+            note = f"（{stage['render_note']}）" if stage.get("render_note") else ""
+            uses = "、".join(f"{target} → {land}" for target, land in lands.items())
+            lines.append(f"   {stage['code']} 用：{uses}{note}")
     lines += ["", f"状态账：{report['state']}"]
     return "\n".join(lines)
 
@@ -891,13 +1148,13 @@ def format_report(report: dict[str, Any]) -> str:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m comfy_studio.pipeline",
-        description="从小说到视频：按 S0–S7 逐段产出。只产提示词与设定文本；"
+        description="从小说到视频：按 S0a–S7a 逐段产出。只产提示词与设定文本；"
                     "图 / 视频 / 音频要引擎侧渲染。",
     )
     parser.add_argument("--project", required=True, help="项目目录，或 projects/ 下的项目名")
     parser.add_argument("--novel", default=None, help="原著文本文件（.txt/.md，UTF-8）")
     parser.add_argument("--episodes", type=int, default=1, help="目标集数（默认 1）")
-    parser.add_argument("--from", dest="from_code", default=None, help="从哪一段起（S0–S7）")
+    parser.add_argument("--from", dest="from_code", default=None, help="从哪一段起（S0a–S7a）")
     parser.add_argument("--to", dest="to_code", default=None, help="到哪一段止（含）")
     parser.add_argument("--force", action="store_true", help="跑过的段也重跑")
     parser.add_argument("--plan", action="store_true", help="只印计划，不碰模型、不落盘")
@@ -988,6 +1245,150 @@ def state_payload(pipeline: NovelToVideoPipeline) -> dict[str, Any]:
     }
 
 
+#: 工作台每一步的落点里，回话里带几个文件名。带全了没用（`08_STORYBOARDS/` 上千个文件），
+#: 带零个又没法"点开最上面那一份"—— 面板要的是"这几份现在长什么样"。
+STEP_FILES_SHOWN = 8
+
+
+def _landing_index(tree: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """``tree`` 里每个落点的读数，按相对路径索引，并捎上它那一格的标题。
+
+    一格里的落点是分成全剧级/分集级两组摆的，这里**摊平**：工作台按步骤取落点，
+    分组是"资料库"那一页的摆法，这里再分一次组只是把同一件事说两遍。
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for shelf in tree.get("shelves", ()):
+        for item in shelf.get("dirs", ()):
+            row = dict(item)
+            row["shelf"] = shelf.get("title", "")
+            out[str(item.get("rel"))] = row
+    return out
+
+
+def steps_payload(
+    pipeline: NovelToVideoPipeline, library: ProjectLibrary
+) -> dict[str, Any]:
+    """八步工作台的一整份读数：**每一步现在什么状态、那一步的落点里有什么**。
+
+    为什么把两个来源合在这一处，而不是让面板各取一次再自己拼：「第几步有料了」这件事
+    只有同时看得见**阶段状态**（状态账 + 产物文件）与**落点文件**（项目目录）才答得出来，
+    而这两样分别在流水线与项目库里。让面板去拼，等于在界面层再写一份"什么算做完"的规则，
+    那份规则迟早与 :meth:`NovelToVideoPipeline._done_before` 分家 —— 而分家时谁都不报错。
+
+    每一步的 ``state`` 是四选一，**不合并成"完成度百分比"**：
+
+    * ``done`` —— 这一步的阶段都成了（没有阶段的一步：落点里有产物就算成）；
+    * ``partial`` —— 有料但不齐（含"只有文本、实质产物还要引擎侧渲染"那种）；
+    * ``empty`` —— 阶段都没跑、落点也是空的；
+    * 加一个阶段级的 ``missing``：账上记着跑过、产物却不在（被删了或被挪了）。
+
+    ``current`` 是**第一个还没做完的步骤** —— 面板拿它当"你现在该看哪一步"，
+    不自己数一遍（数一遍就会与这里的判据分家）。
+
+    ⚠️ **只读**：不碰模型、不落盘，与 :func:`plan_payload` 同一个保证。
+    """
+    tasks = {task.code: task for task in pipeline.plan()}
+    ledger = pipeline.state().get("stages", {})
+    try:
+        tree = library.tree(pipeline.project.name)
+    except Exception as err:  # ProjectsError：项目不在库根下 / 项目根没探测到
+        raise PipelineError(f"读不了项目落点：{err}") from err
+    index = _landing_index(tree)
+    names = {profile.id: profile.name for profile in pipeline.catalog.scan().profiles}
+
+    steps: list[dict[str, Any]] = []
+    for spec in WORKBENCH_STEPS:
+        stages: list[dict[str, Any]] = []
+        for code in step_stages(spec.key):
+            task = tasks.get(code)
+            if task is None:
+                # WORKBENCH_STEPS 与阶段表对不上。step_gaps() 已钉住这条，这里是它
+                # 万一漏了时的第二道：裸 KeyError 只会印出一个 'S4'，看不出是**哪两张表**分家了。
+                raise PipelineError(
+                    f"阶段 {code} 挂在步骤 {spec.key} 上，却不在计划里；"
+                    "WORKBENCH_STEPS 与 STAGE_SPECS/STAGE_TASKS 需要对齐。"
+                )
+            stages.append(
+                {
+                    **task.to_json(),
+                    # 四种归宿由流水线判（账 + 产物，见 stage_mark）；面板只负责照念。
+                    "state": pipeline.stage_mark(ledger, task),
+                    "agent_name": names.get(task.agent_id, ""),
+                    "how": stage_how(code),
+                }
+            )
+        landings: list[dict[str, Any]] = []
+        for rel in spec.landings:
+            item = index.get(rel) or {}
+            files = list(item.get("files") or ())
+            # 预置空表**不算进度**：刚建完项目那几格（06_对白/、07_素材归档/、05_流程/）
+            # 里躺着的是建项目写下的空模板。把它们算进来的失效模式很难看 ——
+            # 用户一步没跑，工作台已经显示"这几步有料了"。
+            seeds = sum(1 for row in files if row.get("seed"))
+            landings.append(
+                {
+                    "rel": rel,
+                    "title": rel.rsplit("/", 1)[-1],
+                    "shelf": item.get("shelf", ""),
+                    "scope": item.get("scope", ""),
+                    "exists": bool(item.get("exists")),
+                    # 预置表排在后面：面板先摆真产物，空模板垫底并标出来。
+                    "files": (
+                        [row for row in files if not row.get("seed")]
+                        + [row for row in files if row.get("seed")]
+                    )[:STEP_FILES_SHOWN],
+                    "count": max(0, int(item.get("count") or 0) - seeds),
+                    "seed_count": seeds,
+                    "truncated": bool(item.get("truncated")),
+                }
+            )
+        count = sum(item["count"] for item in landings)
+        marks = {item["state"] for item in stages}
+        if not stages:
+            # 没有机器阶段的一步（视觉风格）：产物在就算做完 —— 它没有别的判据。
+            step_state = MARK_DONE if count > 0 else MARK_EMPTY
+        elif marks == {MARK_DONE}:
+            step_state = MARK_DONE
+        elif marks == {MARK_TODO} and count == 0:
+            step_state = MARK_EMPTY
+        else:
+            # 有料但不齐：``text``（待引擎侧渲染）、``missing``（产物不见了）、
+            # 一部分阶段成了另一部分没跑 —— 三种都落这一格，面板按各自的签分着说。
+            step_state = MARK_PARTIAL
+        steps.append(
+            {
+                "key": spec.key,
+                "name": spec.name,
+                "goal": spec.goal,
+                "note": spec.note,
+                "needs": list(spec.needs),
+                "stages": stages,
+                "landings": landings,
+                "count": count,
+                "seed_count": sum(item["seed_count"] for item in landings),
+                "state": step_state,
+            }
+        )
+
+    finished = {step["key"] for step in steps if step["state"] == MARK_DONE}
+    for step in steps:
+        # ``needs`` 与 ``blocked_by`` 的差别就是"上游"与"上游里还欠哪几个"：
+        # 面板只显示欠的那几个，否则每一步都挂着四五个上游名，看着像全都堵着。
+        step["blocked_by"] = [key for key in step["needs"] if key not in finished]
+        step["ready"] = not step["blocked_by"]
+    return {
+        "project": str(pipeline.project),
+        "name": pipeline.project.name,
+        "novel": str(pipeline.novel) if pipeline.novel is not None else None,
+        "linked_novel": tree.get("novel", ""),
+        "gaps": list(step_gaps()),
+        "order": list(STEP_ORDER),
+        "current": next((step["key"] for step in steps if step["state"] != MARK_DONE), ""),
+        "steps": steps,
+        "render_required": [task.code for task in tasks.values() if task.needs_render],
+    }
+
+
 def _tool_args(arguments: dict[str, Any]) -> dict[str, Any]:
     """把工具参数挡成一套统一的 kwargs（两张工具回同样的键，少一层分叉）。
 
@@ -1007,7 +1408,7 @@ def _tool_args(arguments: dict[str, Any]) -> dict[str, Any]:
     for key in ("from", "to"):
         value = arguments.get(key)
         if value is not None and not isinstance(value, str):
-            raise PipelineError(f"{key} 必须是阶段代码（S0–S7）")
+            raise PipelineError(f"{key} 必须是阶段代码（S0a–S7a）")
         picked.append(value)
     force = arguments.get("force", False)
     if not isinstance(force, bool):
@@ -1036,7 +1437,7 @@ def _error_result(message: str) -> dict[str, Any]:
 
 #: 两张工具，分工是"看"与"跑"。
 #:
-#: **为什么计划可以随便看、跑之前却要人点头**：S0–S7 是一串会写盘、按段调模型、动辄十几分钟的
+#: **为什么计划可以随便看、跑之前却要人点头**：S0a–S7a 是一串会写盘、按段调模型、动辄十几分钟的
 #: 动作。面板上那是用户自己按的键；对话里模型不能替人按（与 ``projects.py`` 那句"不许替人建
 #: 项目"同一条线）。所以 ``run`` **自己**弹一次确认，且只有用户明确选了 :data:`RUN_AGREE`
 #: 才开跑 —— 不靠提示词里写一句"记得先问用户"。
@@ -1044,7 +1445,7 @@ PIPELINE_TOOLS: tuple[_Spec, ...] = (
     _Spec(
         name="plan",
         description=(
-            "看这部小说「从小说到视频」要走的 S0–S7：每段谁做（哪个智能体）、文本产出落在哪个目录、"
+            "看这部小说「从小说到视频」要走的 S0a–S7a：每段谁做（哪个智能体）、文本产出落在哪个目录、"
             "哪几段跑完文本还要引擎侧渲染（图 / 视频 / 音频本流水线产不出）、以及现在跑到哪一步了。"
             "**不调模型、不写文件**，看一眼不花钱。"
             "用户问“要几步”“现在到哪了”“还差什么”“接着往下做要做什么”时用它；"
@@ -1068,7 +1469,7 @@ PIPELINE_TOOLS: tuple[_Spec, ...] = (
     _Spec(
         name="run",
         description=(
-            "真去跑这部小说的生产流水线：按 S0–S7 顺序推进，每段的文本产物写进项目目录，"
+            "真去跑这部小说的生产流水线：按 S0a–S7a 顺序推进，每段的文本产物写进项目目录，"
             "跑到“要渲染”的那几段就停下并如实说还缺渲染，不假装成片已经出来了。"
             "**这一步会按段调用模型、往项目目录里写文件、可能十几分钟**；"
             "它自己会先弹一次确认（把要跑几段、哪几段要渲染、会跳过哪些列给用户），"
@@ -1089,7 +1490,7 @@ PIPELINE_TOOLS: tuple[_Spec, ...] = (
                 },
                 "from": {
                     "type": "string",
-                    "description": "可选：从哪一段开始（S0–S7），不给就从没跑过的第一段开始",
+                    "description": "可选：从哪一段开始（S0a–S7a），不给就从没跑过的第一段开始",
                 },
                 "to": {"type": "string", "description": "可选：跑到哪一段为止（含这一段）"},
                 "force": {
@@ -1279,6 +1680,7 @@ __all__ = [
     "STATUS_DONE",
     "STATUS_FAILED",
     "STATUS_SKIPPED",
+    "STEP_FILES_SHOWN",
     "NovelToVideoPipeline",
     "StageOutcome",
     "StageRunner",
@@ -1288,4 +1690,5 @@ __all__ = [
     "main",
     "plan_payload",
     "state_payload",
+    "steps_payload",
 ]

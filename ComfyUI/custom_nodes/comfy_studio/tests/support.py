@@ -26,6 +26,38 @@ WORKFLOW: dict[str, dict[str, Any]] = {
 }
 
 
+#: 渲染用例用的"最小视频图"：08 补帧那张真图的**注入点骨架**（参数表指向 #1 与 #8）。
+#: 不整张抄真图（那 12 张在生产机上，真跑一次视频生成占 GPU），但注入点必须跟真图一样在 ——
+#: 少了 #8，``build_render_skill`` 的参数校验会（正确地）拦下来："参数指向图上没有的节点"。
+#: 以前"图与参数表对不上"是**静默**的：引擎只按节点定义取输入，报文里多余的键既不校验也不执行。
+RENDER_DOC: dict[str, Any] = {
+    "nodes": [
+        {"id": 1, "type": "LoadVideo", "mode": 0, "widgets_values": ["in.mp4"]},
+        {"id": 8, "type": "SaveVideo", "mode": 0, "widgets_values": ["comfy-studio/out"]},
+    ],
+    "links": [],
+}
+
+#: 上面那张图的节点定义（字段与真定义同形）：``video`` 是连线口，不吃 widget 值，
+#: 所以 #8 的 ``widgets_values`` 从 ``filename_prefix`` 起对位。
+RENDER_OBJECT_INFO: dict[str, Any] = {
+    "LoadVideo": {
+        "input": {"required": {"file": [["in.mp4"], {"video_upload": True}]}},
+        "output": ["VIDEO"],
+    },
+    "SaveVideo": {
+        "input": {
+            "required": {
+                "video": ["VIDEO"],
+                "filename_prefix": ["STRING", {"default": "video/ComfyUI"}],
+            }
+        },
+        "output": ["VIDEO"],
+        "output_node": True,
+    },
+}
+
+
 def make_skill(
     skill_id: str = "demo",
     params: tuple[SkillParam, ...] = (),

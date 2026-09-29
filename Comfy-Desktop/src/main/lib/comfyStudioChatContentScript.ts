@@ -60,6 +60,23 @@ let cachedScript: string | null = null
  * use, so resuming looks exactly like never having left. Only an empty drawer is
  * filled: anything already painted came from this screen's own turn.
  *
+ * Workflows: the render row only reaches the twelve registered targets, so under it sits a
+ * second row over the whole workflow directory (`workflows/list`, see
+ * `lib/comfy_studio/workflows.py`). Picking one and pressing `改这个` writes a line naming that
+ * file into the composer — nothing is sent, and nothing is written from here: the write path
+ * belongs to the model (`comfy_read_workflow` / `comfy_write_workflow`), because the optimistic
+ * lock, the write-time conversion check and the name guard all need node definitions the panel
+ * does not have. A second write channel here would be one more way to overwrite the file the
+ * user just saved in the frontend. `新建` is the same sentence without a file.
+ *
+ * That row also answers a question the model used to have to guess: *what the panel currently
+ * has selected*. Every turn carries a `context` (the picked workflow and its directory, the
+ * open project, the open novel — see `chatContext`), and the host folds it into the persona
+ * for that turn only (`lib/comfy_studio/panel.py`). It is deliberately not part of the user's
+ * text: the selection is scenery, not something he typed, so it never shows up in a bubble —
+ * and by the same token it never reaches the transcript, which keeps the persona byte-identical
+ * (and the local prefix cache warm) until he actually picks something else.
+ *
  * Where it keeps things: opening the drawer also asks `host/info` for one line under
  * the status — the memory file and the archive directory, spelled out in its tooltip.
  * It is also where the states that look like bugs but are not get said out loud: a
@@ -116,6 +133,14 @@ var RENDER_ARGS_ID = 'comfy-desktop-studio-chat-render-args';
 // 每个必填参数一个输入框，id 是前缀 + 参数名：取回来时按同一套名字找（见 renderArgValues）。
 var RENDER_ARG_PREFIX = 'comfy-desktop-studio-chat-render-arg-';
 var RENDER_IMAGES_ID = 'comfy-desktop-studio-chat-render-images';
+// 工作流那一行（见 buildWorkflowRow）：工作流目录里**所有** .json 都在这儿，不只是登记成渲染
+// 目标的那 12 张 —— 用户自己存的、改了一半的图也要能选出来。清单来自宿主 workflows/list
+// （后端 lib/comfy_studio/workflows.py）。**写不在这儿**：改图 / 建图是对话里模型手上那几把
+// MCP 工具的事（见引擎 mcp/tools.py 的 comfy_read_workflow / comfy_write_workflow），
+// 这一行只负责把人送到对话框前面（见 workflowToChat）。
+var WORKFLOW_ID = 'comfy-desktop-studio-chat-workflow';
+var WORKFLOW_EDIT_ID = 'comfy-desktop-studio-chat-workflow-edit';
+var WORKFLOW_NEW_ID = 'comfy-desktop-studio-chat-workflow-new';
 var SESSION_ID = 'comfy-desktop-studio-chat-session';
 var SESSION_NEW_ID = 'comfy-desktop-studio-chat-session-new';
 var SESSION_CLOSE_ID = 'comfy-desktop-studio-chat-session-close';
@@ -191,6 +216,24 @@ var NOVEL_BATCH_DELETE_ID = 'comfy-desktop-studio-novel-batch-delete';
 var VIEWS_ID = 'comfy-desktop-studio-views';
 var VIEWS_TITLE_ID = 'comfy-desktop-studio-views-title';
 var VIEWS_BACK_ID = 'comfy-desktop-studio-views-back';
+// 「工作台」那一页（见 buildWorkbenchView）：**人这一侧**的八步 —— 解析原文 → 角色与场景 →
+// 分镜 → 对白与旁白 → 视觉风格 → 提示词 → 生成视频 → 合成短剧。它与「流水线」看的是同一部戏，
+// 但顺序**故意不一样**：那边是机器跑的顺序（S0…S9），这边是人做事的顺序（先原文，后成片）。
+// 八步、每步的状态、它欠哪个上游、落点里有什么，全部来自宿主 pipeline/steps
+// （形状见 lib/comfy_studio/pipeline.py 的 steps_payload）—— 面板不自己排一次序、不自己判一次
+// "做完"，否则就成了"面板说还差第三步、模型说早跑完了"，两边都不报错。
+var WORKBENCH_VIEW_ID = 'comfy-desktop-studio-workbench-view';
+var WORKBENCH_HINT_ID = 'comfy-desktop-studio-workbench-hint';
+var WORKBENCH_OVERVIEW_ID = 'comfy-desktop-studio-workbench-overview';
+var WORKBENCH_PROJECT_ID = 'comfy-desktop-studio-workbench-project';
+var WORKBENCH_STEPS_ID = 'comfy-desktop-studio-workbench-steps';
+var WORKBENCH_DETAIL_ID = 'comfy-desktop-studio-workbench-detail';
+var WORKBENCH_READER_ID = 'comfy-desktop-studio-workbench-reader';
+// 右边那一栏里正在编辑的正文（见 paintStepFile / saveStepFile）：工作台上**唯一**的写入口。
+var WORKBENCH_EDIT_ID = 'comfy-desktop-studio-workbench-edit';
+var WORKBENCH_SAVE_ID = 'comfy-desktop-studio-workbench-save';
+var WORKBENCH_SAVE_HINT_ID = 'comfy-desktop-studio-workbench-save-hint';
+
 // 「流水线」那一页（见 buildPipelineView）：把 S0–S7 接到随包那七位智能体上，一段一段跑。
 // 这一页**一条规则都不抄**：阶段、谁做、落点、要不要引擎侧渲染，全来自宿主 pipeline/plan
 // 那一趟回话（形状由 lib/comfy_studio/pipeline.py 的 plan_payload 定，与对话里
@@ -549,6 +592,9 @@ var CHAT_CSS =
   'word-break:break-word;}' +
   '#' + DRAWER_ID + ' .cs-pipe-note[data-tone="warn"]{color:#e0b400;}' +
   '#' + DRAWER_ID + ' .cs-pipe-note[data-tone="error"]{color:#ff8080;}' +
+  // 阶段卡上那排「去出图」（见 pipeRenderRow）：宿主绑了图才画。按钮借用抽屉里那个通用小按钮
+  // （projectButton / .cs-proj-btn），这里只管把它排成一行，不另起一套配色。
+  '#' + DRAWER_ID + ' .cs-pipe-render{display:flex;align-items:center;gap:6px;flex-wrap:wrap;}' +
   '#' + DRAWER_ID + ' .cs-proj-meter-note{color:' + MUTED + ';}' +
   '#' + DRAWER_ID + ' .cs-proj-shelves{flex:1;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:4px;}' +
   '#' + DRAWER_ID + ' .cs-proj-shelf{flex:0 0 auto;border:1px solid ' + BORDER + ';border-radius:4px;' +
@@ -718,6 +764,68 @@ var CHAT_CSS =
   '#' + DRAWER_ID + ' .cs-pipe-note{color:' + MUTED + ';font-size:11px;line-height:1.4;' +
   'word-break:break-word;}' +
   '#' + DRAWER_ID + ' .cs-pipe-note[data-tone="warn"]{color:#e0b400;}' +
+  // 工作台那页：左边一条八步的轨、右边那一栏（阶段 + 落点 + 正文）。
+  // 这一页是**铺在整扇窗口上**的（见 switchView 里 layer.dataset.open），所以敢分两栏；
+  // 抽屉那条窄缝进不来这一页 —— 非 chat 的页一律铺满。
+  // 阶段卡与总览那一行直接套流水线/项目页那几套类（.cs-pipe-* / .cs-proj-overview）：
+  // 同一个东西在三个地方长三个样，是这面板以前最费眼的一件事。
+  '#' + DRAWER_ID + ' .cs-wb-body{flex:1;min-height:0;display:flex;border-top:1px solid ' + BORDER + ';}' +
+  '#' + DRAWER_ID + ' .cs-wb-rail{width:196px;flex:none;overflow:auto;padding:10px 8px;' +
+  'display:flex;flex-direction:column;gap:4px;border-right:1px solid ' + BORDER + ';}' +
+  '#' + DRAWER_ID + ' .cs-wb-step{display:flex;align-items:center;gap:6px;text-align:left;' +
+  'border:1px solid transparent;border-radius:var(--cs-radius);background:transparent;' +
+  'color:' + FG + ';padding:5px 6px;font:inherit;font-size:12px;cursor:pointer;}' +
+  '#' + DRAWER_ID + ' .cs-wb-step:hover{border-color:' + BORDER + ';}' +
+  // 选中的那一格：左沿一道实线 + 加粗。不靠底色深浅 —— 深色主题里那点差别在弱屏上看不出来。
+  '#' + DRAWER_ID + ' .cs-wb-step[aria-current="true"]{border-left:3px solid #4a90d9;' +
+  'background:' + INPUT_BG + ';font-weight:600;}' +
+  // 宿主说的"该看这一步"：名字后面缀一个记号，与"人自己点着的那一步"分开表达 ——
+  // 这两个常常不是同一格（人回头去看第二步，而系统说第四步齐了）。
+  '#' + DRAWER_ID + ' .cs-wb-step[data-current="1"] .cs-wb-step-name::after{content:"·现在";' +
+  'color:' + MUTED + ';font-weight:400;}' +
+  '#' + DRAWER_ID + ' .cs-wb-step-no{font-family:var(--cs-mono);color:' + MUTED + ';' +
+  'font-size:11px;width:14px;flex:none;}' +
+  '#' + DRAWER_ID + ' .cs-wb-step-name{flex:1;min-width:0;white-space:nowrap;overflow:hidden;' +
+  'text-overflow:ellipsis;}' +
+  '#' + DRAWER_ID + ' .cs-wb-step-count{font-family:var(--cs-mono);color:' + MUTED + ';font-size:11px;}' +
+  // 已经成了的那几步：名字淡下去 —— 从上往下扫一眼就知道"上面这几步不用管了"。
+  '#' + DRAWER_ID + ' .cs-wb-step[data-state="done"] .cs-wb-step-name{color:' + MUTED + ';}' +
+  '#' + DRAWER_ID + ' .cs-wb-detail{flex:1;min-width:0;overflow:auto;padding:10px 12px 16px;' +
+  'display:flex;flex-direction:column;gap:8px;}' +
+  '#' + DRAWER_ID + ' .cs-wb-detail-head{display:flex;align-items:center;gap:6px;}' +
+  '#' + DRAWER_ID + ' .cs-wb-detail-title{font-size:13px;font-weight:600;}' +
+  '#' + DRAWER_ID + ' .cs-wb-stages{display:flex;flex-direction:column;gap:6px;}' +
+  '#' + DRAWER_ID + ' .cs-wb-stage{border:1px solid ' + BORDER + ';border-left-width:3px;' +
+  'border-radius:var(--cs-radius);padding:6px 8px;display:flex;flex-direction:column;gap:4px;}' +
+  '#' + DRAWER_ID + ' .cs-wb-stage[data-state="done"]{border-left-color:#3fa34d;}' +
+  '#' + DRAWER_ID + ' .cs-wb-stage[data-state="text"]{border-left-color:#e0b400;}' +
+  '#' + DRAWER_ID + ' .cs-wb-stage[data-state="missing"]{border-left-color:#d9534f;}' +
+  '#' + DRAWER_ID + ' .cs-wb-stage[data-state="todo"]{border-left-color:' + BORDER + ';}' +
+  '#' + DRAWER_ID + ' .cs-wb-landing{border:1px solid ' + BORDER + ';border-radius:var(--cs-radius);' +
+  'padding:6px 8px;display:flex;flex-direction:column;gap:2px;}' +
+  '#' + DRAWER_ID + ' .cs-wb-landing-head{display:flex;align-items:center;gap:6px;}' +
+  '#' + DRAWER_ID + ' .cs-wb-landing-title{flex:1;min-width:0;font-size:11px;color:' + MUTED + ';' +
+  'font-family:var(--cs-mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}' +
+  // 预置空表淡下去：它是"该往这儿写"的格子，不是这一步的产物（签上还写着字，不靠浓淡说话）。
+  '#' + DRAWER_ID + ' .cs-wb-file[data-seed="1"]{opacity:.6;}' +
+  '#' + DRAWER_ID + ' .cs-wb-file:disabled{cursor:default;opacity:.5;}' +
+  '#' + DRAWER_ID + ' .cs-wb-links{display:flex;flex-wrap:wrap;gap:6px;padding-top:2px;}' +
+  '#' + DRAWER_ID + ' .cs-wb-reader{display:flex;flex-direction:column;gap:6px;padding-top:8px;' +
+  'border-top:1px solid ' + BORDER + ';}' +
+  '#' + DRAWER_ID + ' .cs-wb-reader-head{display:flex;align-items:center;gap:6px;}' +
+  '#' + DRAWER_ID + ' .cs-wb-reader-title{font-family:var(--cs-mono);font-size:11px;color:' + MUTED + ';' +
+  'word-break:break-all;}' +
+  // 编辑框：等宽、跟着这一栏长、自己滚、下沿能拖。**不给它定死高度** —— 定高之后长文只能
+  // 挤在一小格里，而这一栏本来就是"在这儿改一段"，改得舒服比"整页高度稳定"重要。
+  '#' + DRAWER_ID + ' .cs-wb-edit{width:100%;box-sizing:border-box;min-height:220px;' +
+  'resize:vertical;background:' + INPUT_BG + ';color:' + FG + ';border:1px solid ' + BORDER + ';' +
+  'border-radius:var(--cs-radius);padding:6px 8px;font-family:var(--cs-mono);font-size:12px;' +
+  'line-height:1.5;white-space:pre-wrap;}' +
+  '#' + DRAWER_ID + ' .cs-wb-edit:focus{outline:1px solid #4a90d9;}' +
+  '#' + DRAWER_ID + ' .cs-wb-edit[data-readonly="1"]{opacity:.85;}' +
+  '#' + DRAWER_ID + ' .cs-wb-save-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap;}' +
+  '#' + DRAWER_ID + ' .cs-wb-save-hint{font-size:11px;color:' + MUTED + ';}' +
+  '#' + DRAWER_ID + ' .cs-wb-save-hint[data-tone="error"]{color:#ff8080;}' +
   '#' + DRAWER_ID + ' .cs-pipe-note[data-tone="error"]{color:#ff8080;}';
 
 function ensureStyle() {
@@ -1192,6 +1300,10 @@ function buildDrawer() {
   // 替它编（理由见下面「一键跑渲染目标」那一节）。下拉样式走与技能同一个来源，不各写一份。
   var renders = buildRenderRow(model.style.cssText);
 
+  // 工作流那一行：渲染下拉只覆盖登记过的那 12 张渲染目标，这一行是**整个工作流目录** ——
+  // 用户自己存的、改了一半的图也要能选出来交给对话里的模型改（见 buildWorkflowRow）。
+  var workflows = buildWorkflowRow(model.style.cssText);
+
   var status = document.createElement('div');
   status.id = STATUS_ID;
   status.textContent = '正在查询宿主状态…';
@@ -1281,6 +1393,7 @@ function buildDrawer() {
   chatView.appendChild(sessions);
   chatView.appendChild(skills);
   chatView.appendChild(renders);
+  chatView.appendChild(workflows);
   chatView.appendChild(status);
   chatView.appendChild(storage);
   // 找字那一行钉在消息区上面（它管的就是下面这一块）：平时不占地方 —— 它一直躺着，
@@ -3139,6 +3252,233 @@ function loadRenders() {
   );
 }
 
+// ---- 工作流目录（选中 + 交给对话） -------------------------------------
+//
+// 与渲染那一行同一个形状，管的是另一件事：渲染下拉只覆盖**登记过**的那 12 张（引擎侧
+// RENDER_TARGETS 量过注入点的图），而目录里随时躺着用户自己存的、改到一半的图。这一行把整个
+// 目录列出来，让"选一份、交给对话里的模型去改"成为面板上做得了的事。
+//
+// 面板在这一层**只读不写**：清单走宿主 workflows/list（见 lib/comfy_studio/workflows.py），
+// 而改图 / 建图走对话里模型手上那几把 MCP 工具（comfy_read_workflow / comfy_write_workflow）。
+// 这样做是有意的 —— 那几把工具带着乐观锁（必须把读回来的 digest 交回去）、写前试转、越界拦截，
+// 都在**能拿到节点定义**的那一侧判（见引擎 skills/workflows.py）。面板另开一条写通道，就是多
+// 一处能绕过乐观锁的地方：用户在前端按保存的同时，模型从面板这条路把文件盖掉。
+//
+// 所以这一行的"接进对话"就是一句话：把选中的文件名写进输入框（见 workflowToChat），剩下的
+// 交给模型手上的工具。
+
+// 选中的那一份；清单还没读回来、或它已经不在目录里了，就是 null。
+function workflowOf(file) {
+  var list = STATE.workflows || [];
+  var wanted = String(file || '');
+  for (var i = 0; i < list.length; i++) {
+    if (String((list[i] || {}).file || '') === wanted) return list[i];
+  }
+  return null;
+}
+
+// 下拉里那条 tooltip：多大、什么时候改的、被哪条用途用着。数字与名单都是宿主原样转回来的
+// （见 workflows.py 的 WorkflowFile），面板只排版不猜。
+function workflowHint(entry) {
+  if (!entry) return '';
+  var parts = [];
+  if (typeof entry.bytes === 'number') parts.push(formatBytes(entry.bytes));
+  if (entry.modified) parts.push('改于 ' + String(entry.modified));
+  var used = entry.usedBy || [];
+  // "还没登记成渲染目标"是个事实、不是缺点：这张图照样能用 renders/run 的 file 跑（全按图上原值）。
+  parts.push(used.length ? '被用着: ' + used.join('、') : '还没登记成渲染目标（一样能跑）');
+  return parts.join('；');
+}
+
+function setWorkflowHint(text) {
+  var select = document.getElementById(WORKFLOW_ID);
+  if (!select) return;
+  if (text) {
+    select.title = String(text);
+    return;
+  }
+  // 与渲染那一份同一个口径：目录这一句是引擎如实报出来的（note 只在目录不在时才有），
+  // 面板照原样说，不替它编一句"目录是空的"。
+  var parts = ['选一份工作流，按「改这个」把它交给对话里的模型去改'];
+  if (STATE.workflowsDir) parts.push('工作流目录: ' + STATE.workflowsDir);
+  if (STATE.workflowsNote) parts.push(String(STATE.workflowsNote));
+  select.title = parts.join('；');
+}
+
+// "有东西可点"看 STATE.workflows，不看 option 条数（空目录时下拉里那条是占位文案）。
+// 「改这个」还要多一条：选中了才算数 —— 没选中时按下去只能写出一句没有主语的话。
+function refreshWorkflowEnabled() {
+  var select = document.getElementById(WORKFLOW_ID);
+  var edit = document.getElementById(WORKFLOW_EDIT_ID);
+  var create = document.getElementById(WORKFLOW_NEW_ID);
+  var ready = (STATE.workflows || []).length > 0;
+  if (select) {
+    select.disabled = !ready;
+    select.style.opacity = ready ? '1' : '0.5';
+  }
+  if (edit) {
+    var canEdit = ready && !!workflowOf(select ? select.value : STATE.workflow);
+    edit.disabled = !canEdit;
+    edit.style.opacity = canEdit ? '1' : '0.5';
+  }
+  if (create) {
+    create.disabled = !ready;
+    create.style.opacity = ready ? '1' : '0.5';
+  }
+}
+
+function workflowButtonCss() {
+  return (
+    'border:1px solid ' + BORDER + ';border-radius:4px;background:transparent;color:' + MUTED + ';' +
+    'cursor:pointer;font-size:11px;padding:2px 6px;white-space:nowrap;'
+  );
+}
+
+// 工作流那一行：一个下拉 + 两个动作。两个动作都只**写进输入框**，不替人按发送（理由见
+// workflowToChat），所以这里没有任何"跑"的行为 —— 这一行的产物是一句话，不是一张图。
+function buildWorkflowRow(selectCss) {
+  var row = document.createElement('div');
+  row.style.cssText = 'display:flex;align-items:center;gap:6px;padding:0 12px 8px;';
+
+  var label = document.createElement('label');
+  label.textContent = '工作流';
+  label.setAttribute('for', WORKFLOW_ID);
+  label.style.cssText = 'color:' + MUTED + ';font-size:11px;white-space:nowrap;';
+
+  var select = document.createElement('select');
+  select.id = WORKFLOW_ID;
+  select.disabled = true;
+  select.title = '正在读引擎的工作流目录…';
+  select.style.cssText = selectCss;
+  select.addEventListener('change', function () {
+    // 选谁不影响任何在途的事（真做事是按下按钮那一刻），所以只把选择记下来 ——
+    // 不记的话，下一轮对话后重读清单会把下拉悄悄拨回上一个，等于替用户改了选择
+    // （与技能、渲染那两份同一个理由）。
+    STATE.workflow = select.value;
+    refreshWorkflowEnabled();
+  });
+
+  var edit = document.createElement('button');
+  edit.id = WORKFLOW_EDIT_ID;
+  edit.type = 'button';
+  edit.textContent = '改这个';
+  edit.disabled = true;
+  edit.title = '把选中的这份工作流交给对话：写进输入框，补上要改哪儿再发';
+  edit.style.cssText = workflowButtonCss();
+  edit.addEventListener('click', function () {
+    workflowToChat(select.value, false);
+  });
+
+  var create = document.createElement('button');
+  create.id = WORKFLOW_NEW_ID;
+  create.type = 'button';
+  create.textContent = '新建';
+  create.disabled = true;
+  create.title = '让对话里的模型新建一份工作流：写进输入框，补上要什么样的再发';
+  create.style.cssText = workflowButtonCss();
+  create.addEventListener('click', function () {
+    workflowToChat(select.value, true);
+  });
+
+  row.appendChild(label);
+  row.appendChild(select);
+  row.appendChild(edit);
+  row.appendChild(create);
+  return row;
+}
+
+function fillWorkflows(payload) {
+  var select = document.getElementById(WORKFLOW_ID);
+  if (!select) return;
+  var data = payload || {};
+  var list = data.files || [];
+  var wanted = STATE.workflow;
+  select.textContent = '';
+  for (var i = 0; i < list.length; i++) {
+    var entry = list[i] || {};
+    var option = document.createElement('option');
+    option.value = String(entry.file || '');
+    option.textContent = String(entry.file || '');
+    option.title = workflowHint(entry);
+    select.appendChild(option);
+  }
+  if (select.options.length === 0) {
+    // 空着不解释，用户只会以为面板坏了：目录是引擎报的，引擎没起来 / 目录还没建就是空的。
+    var none = document.createElement('option');
+    none.value = '';
+    none.textContent = '（工作流目录里没有 .json）';
+    none.disabled = true;
+    select.appendChild(none);
+  } else if (wanted && workflowOf(wanted)) {
+    // 上一次选的那一份还在目录里就接着选中（别替用户改选择）。
+    select.value = String(wanted);
+  }
+  STATE.workflows = list;
+  STATE.workflow = select.value || '';
+  // 键名与 renders/list 不一样（那边是 snake_case 的 workflows_dir）：这里是 workflowsDir，
+  // 照 server.py 的 workflows_list 原样取，别照抄渲染那一份。
+  STATE.workflowsDir = String(data.workflowsDir || '');
+  STATE.workflowsNote = data.note ? String(data.note) : '';
+  refreshWorkflowEnabled();
+}
+
+function loadWorkflows() {
+  return Promise.resolve(bridge.request('workflows/list')).then(
+    function (response) {
+      if (!response || response.ok !== true) {
+        var error = (response && response.error) || {};
+        fillWorkflows({ files: [] });
+        setWorkflowHint('读工作流清单失败: ' + (error.message || '未知错误'));
+        return null;
+      }
+      fillWorkflows(response.result || {});
+      setWorkflowHint('');
+      return response.result;
+    },
+    function (err) {
+      fillWorkflows({ files: [] });
+      setWorkflowHint('读工作流清单失败: ' + message(err));
+      return null;
+    }
+  );
+}
+
+// "接进对话"这件事的全部：把一句话写进输入框，然后**停手**。面板不替人按发送 —— 要改哪几个
+// 字段、要不要新建、新建成什么样，都是用户的事；替他发出去等于替他下了这个决定，而图是会被
+// 覆盖的（写坏了撤不回来，宿主只在覆盖前留一份备份）。
+//
+// 这一句是写给**模型**的：它手上有 comfy_list_workflows / comfy_read_workflow /
+// comfy_write_workflow，会照文件名去读那份图、拿到 digest、按字段改完再写回去。
+// 面板不把"改哪个字段"也写死在这儿：那正是用户要补的那半句。
+function workflowToChat(file, create) {
+  switchView('chat');
+  var input = document.getElementById(INPUT_ID);
+  if (!input) return;
+  var line;
+  if (create) {
+    // 新建时选中的那一份只当参照：模型该建一份新的，不是改它。
+    var ref = String(file || '');
+    line = ref === '' ? '新建一份工作流' : '新建一份工作流，参照「' + ref + '」';
+  } else {
+    var entry = workflowOf(file);
+    if (!entry) {
+      setStatus('先在上面选一份工作流再按「改这个」', 'error');
+      return;
+    }
+    line = '改一下工作流「' + String(entry.file) + '」';
+  }
+  if ((input.value || '').trim() === '') {
+    input.value = line;
+  } else {
+    // 人家可能正打着半句话：接着往下写一行，别覆盖掉（与 novelToChat 同一个理由）。
+    // 这一段 JS 住在 TS 模板字符串里，反斜杠要写两遍：只写一遍的话，转义会被模板那层先吃掉
+    // （正则变成 s，换行变成一个真换行、把字符串截断）。
+    input.value = input.value.replace(/\\s+$/, '') + '\\n' + line;
+  }
+  input.focus();
+  setStatus('已把「' + line + '」写进对话框：补上要改哪儿再发。');
+}
+
 // 跑渲染的那张卡：与技能卡同一个形状（同一批 class 与 CSS），这样"正在跑"和"跑完了"是同一张卡的
 // 前后两态，而不是两行。
 function renderCard(entry) {
@@ -3265,7 +3605,7 @@ function paintRenderRun(card, id, run) {
   }
 }
 
-function runRender(id) {
+function runRender(id, options) {
   var targetId = String(id || '');
   if (STATE.renderRunning !== '') {
     // 一次只跑一个（与技能同一个理由）：渲染要占满显存好些分钟，叠着跑两边都慢。
@@ -3311,6 +3651,11 @@ function runRender(id) {
     return null;
   };
   var payload = { target_id: targetId, params: args.values };
+  // 落点：从阶段卡按下去时带（见 pipeRunRender）。给了它，引擎跑完会把产物**另存**一份进这个
+  // 目录（它自己的 output/ 里照样留一份）—— 那一段的体检看的就是项目目录，不给的话，
+  // 卡片上「还缺图」永远不消，人以为白跑一趟。手动按「跑一遍」的人不给落点，行为不变。
+  var outputDir = String((options && options.outputDir) || '');
+  if (outputDir) payload.output_dir = outputDir;
   var images = renderImages();
   // 没给参考图就**不带这一项**：带一个空数组过去，读的人会以为"打算给图但没给"。
   if (images.length > 0) payload.images = images;
@@ -3978,6 +4323,26 @@ function onEvent(payload) {
   // final 不画：最终文本由请求结果给，画两遍就重复了。
 }
 
+// 面板上"此刻选中的是什么" → agent/chat 的 context。模型手里因此有了"这个 / 这一份"的落点：
+// 光靠用户打的那句话，他不知道工作流下拉里选的是哪一张图（宿主把这段拼进人设，见
+// lib/comfy_studio/panel.py）。四样都取"此刻真开着的"那一份，没开就不带。
+function chatContext() {
+  var context = {};
+  // 只认**清单里真有的那一份**（同 workflowOf 的口径）：目录空着时下拉里那条占位项、
+  // 或者刚被模型删掉的那一份，都不该当成"用户选中的工作流"说给模型听。
+  // 目录跟着文件名一起走：光有个文件名，模型不知道去哪儿读它。
+  var picked = workflowOf(STATE.workflow);
+  if (picked) {
+    context.workflow = String(picked.file);
+    if (STATE.workflowsDir) context.workflows_dir = String(STATE.workflowsDir);
+  }
+  if (STATE.projectOpen && STATE.projectOpen.name) {
+    context.project = String(STATE.projectOpen.name);
+  }
+  if (STATE.novelOpen && STATE.novelOpen.name) context.novel = String(STATE.novelOpen.name);
+  return context;
+}
+
 function sendTurn() {
   if (STATE.busy) return;
   var input = document.getElementById(INPUT_ID);
@@ -4040,6 +4405,9 @@ function sendTurn() {
     loadSkills();
     // 渲染目标也一起重读：这一轮里 agent 可能刚往工作流目录里放过文件（那样"文件没找到"就该消失）。
     loadRenders();
+    // 工作流清单同理，而且是这一行最要紧的一条：这一轮里模型刚**改过或新建过**一份图，
+    // 不重读的话下拉里就少了它 —— 而它正是用户下一步要接着改的那份。
+    loadWorkflows();
     // 这一轮过后这段对话的样子也变了（第一句话成了它的标题、条数加了）：
     // 清单跟着刷新，用户才看得见"它现在叫什么"。
     loadSessions();
@@ -4063,7 +4431,12 @@ function sendTurn() {
 
   // 宿主挡下"同一个会话的第二轮"时，这一轮压根没起来：收尾要照 detached 走（见 settle）。
   var rejectedBusy = false;
-  bridge.request('agent/chat', { text: composed, session_id: STATE.session }).then(
+  var payload = { text: composed, session_id: STATE.session };
+  // 选中态跟着这一轮走（chatContext）：**不带**的话，"改一下这个"里的"这个"全靠模型猜。
+  // 什么都没选时整个键都不带 —— 老形状一字不变，宿主那边"缺这个键"与"空对象"是同一个意思。
+  var context = chatContext();
+  if (Object.keys(context).length > 0) payload.context = context;
+  bridge.request('agent/chat', payload).then(
     function (response) {
       if (!response || response.ok !== true) {
         var error = (response && response.error) || {};
@@ -4206,6 +4579,9 @@ function openDrawer() {
   // 一套，这里就该跟上（跟智能体清单一个道理）。渲染目标同理（它连工作流文件在不在都是现读的）。
   loadSkills();
   loadRenders();
+  // 工作流目录也在引擎侧：每次开抽屉现读一遍（跟渲染目标、技能一个道理 —— 目录里的文件
+  // 是用户随时会自己另存一份的那种东西，缓存一份只会让下拉停在旧世界上）。
+  loadWorkflows();
   loadHistory();
   loadSessions();
   loadStorage();
@@ -4233,15 +4609,25 @@ function closeDrawer() {
 // 曾在这里手抄过一份 4000 —— 两份数对不上时是**静默**的：翻页会跳字或原地打转，
 // 而面板和宿主谁都不会报错，正是最该避开的那类错。
 
-//: 四页的名字与先后（tablist 的顺序、方向键绕圈、Home/End 都照它来）。
-var VIEW_ORDER = ['chat', 'novel', 'project', 'pipeline'];
+//: 五页的名字与先后（tablist 的顺序、方向键绕圈、Home/End 都照它来）。
+//: 「工作台」排在最前：那是这条链的**入口**（先看这部戏走到第几步、这一步的资料在哪儿），
+//: 对话页仍旧是开面板时的默认页（见 window.__comfyStudioChat 的 view）—— 输入框那一侧
+//: 才是这个抽屉每天被打开的原因，把默认页换成工作台等于每回都多按一次「对话」。
+var VIEW_ORDER = ['workbench', 'chat', 'novel', 'project', 'pipeline'];
 
 //: 页名 → 给人看的页名。标签栏、占满窗口那一层的标题栏都读它 ——
 //: 抄成两份的话，标签上写着「管理小说」、铺开那一层的标题却写着别的，而没人会报错。
-var VIEW_LABELS = { chat: '对话', novel: '管理小说', project: '项目管理', pipeline: '流水线' };
+var VIEW_LABELS = {
+  workbench: '工作台',
+  chat: '对话',
+  novel: '管理小说',
+  project: '项目管理',
+  pipeline: '流水线'
+};
 
 //: 页名 → 那一页容器的 id（tab 的 aria-controls 用它，见 buildTabs）。
 function viewIdOf(view) {
+  if (view === 'workbench') return WORKBENCH_VIEW_ID;
   if (view === 'novel') return NOVEL_VIEW_ID;
   if (view === 'project') return PROJECT_VIEW_ID;
   if (view === 'pipeline') return PIPELINE_VIEW_ID;
@@ -4268,7 +4654,10 @@ function focusTab(view) {
 
 //: 当前这一页的检索框：对话页是消息区上面那个，小说页是左边目录栏里的搜索框，
 //: 项目页是筛项目那个（页内找字那个框就摆在正文上头，不用快捷键也看得见）。
+//: 工作台那页**没有**检索框（它要按步骤看的是"这一步欠什么"，不是找一个字），
+//: 所以这里如实回 null —— 调用处会把 Ctrl+F 让给浏览器；抢了键又不给东西最烦人。
 function findTargetForView() {
+  if (STATE.view === 'workbench') return null;
   if (STATE.view === 'novel') {
     // 搜索框在目录栏里，栏收起来了就先展开再聚焦：对一个 display:none 的输入框 focus 是没用的。
     if (STATE.novelSideOpen !== true) toggleNovelToc();
@@ -4377,11 +4766,15 @@ function buildTabs() {
 
 function switchView(view) {
   STATE.view =
-    view === 'novel' || view === 'project' || view === 'pipeline' ? view : 'chat';
+    view === 'workbench' || view === 'novel' || view === 'project' || view === 'pipeline'
+      ? view
+      : 'chat';
+  var workbench = document.getElementById(WORKBENCH_VIEW_ID);
   var chat = document.getElementById(CHAT_VIEW_ID);
   var novel = document.getElementById(NOVEL_VIEW_ID);
   var project = document.getElementById(PROJECT_VIEW_ID);
   var pipeline = document.getElementById(PIPELINE_VIEW_ID);
+  if (workbench) workbench.style.display = STATE.view === 'workbench' ? 'flex' : 'none';
   if (chat) chat.style.display = STATE.view === 'chat' ? 'flex' : 'none';
   if (novel) novel.style.display = STATE.view === 'novel' ? 'flex' : 'none';
   if (project) project.style.display = STATE.view === 'project' ? 'flex' : 'none';
@@ -4413,6 +4806,10 @@ function switchView(view) {
   // 流水线那页同理：项目目录、原文库、进度账全是别的程序（编辑器、生成脚本、别的智能体）
   // 也会动的东西，拿上回那份当准数，就会出现"计划上写着还差 S4、其实早跑过了"。
   if (STATE.view === 'pipeline') loadPipeline();
+  // 工作台那页最甚：它把"八步走到哪儿"与"每一步的落点里躺着什么"摆在一屏上，而这两样
+  // 全是别的程序（编辑器、生成脚本、别的智能体、别的窗口里的这个面板）也会动的东西 ——
+  // 切回来不重读，人对着的就是上一次的那份读数。
+  if (STATE.view === 'workbench') loadWorkbench();
 }
 
 // 「管理小说」与「项目管理」共用的那一层：**占满窗口**。
@@ -4455,6 +4852,8 @@ function buildViewsOverlay() {
   head.appendChild(back);
 
   layer.appendChild(head);
+  // 工作台排在最前：左边一条八步的轨、右边那一步的资料与正文，是窄缝里放不下的两栏。
+  layer.appendChild(buildWorkbenchView());
   layer.appendChild(buildNovelView());
   layer.appendChild(buildProjectView());
   // 流水线也是"翻资料 + 按键"的地方：一张八段的表加上每段的落点，窄缝里放不下。
@@ -5657,6 +6056,842 @@ function projectEmpty(text) {
   return empty;
 }
 
+// ---- 工作台（八步：人这一侧的顺序）-----------------------------------------
+//
+// 这一页的先后是**人做事的顺序**：① 解析原文 → ② 角色与场景 → ③ 分镜脚本 → ④ 对白与旁白 →
+// ⑤ 视觉风格 → ⑥ 图像与视频提示词 → ⑦ 生成视频 → ⑧ 合成短剧。它跟「流水线」看的是同一部戏，
+// 但两个顺序**故意不一样**：那边是机器跑的顺序（S0…S9，模型一段接一段），这边是人推进的顺序
+// （手上先有原文，最后才有成片）。"哪一步该等哪一步"由宿主在每一步的 needs / blocked_by 里说，
+// 这里只负责念。
+//
+// 八步的名字、每一步要干什么、它欠哪个上游、落点里躺着什么 —— **一条都不在面板里写**：
+// 整份读数来自宿主 pipeline/steps（形状见 lib/comfy_studio/pipeline.py 的 steps_payload，
+// 与对话里 pipeline__steps 是同一份）。面板自己排一次序、自己判一次"这一步做完没有"，
+// 就会跟宿主那份判据分家；分家的表现是"面板说还差第三步、模型说早跑完了"，两边都不报错，
+// 只有人白等一场。
+//
+// 每一步都能**就地看、就地改**它落点里的资料（projects/read + projects/write）：
+// "在工作台上看到的正文就是最终产物"是这一页唯一值得保证的事 —— 另开一个窗口去看文件，
+// 看到的往往不是同一时刻的那一份。保存走宿主那道乐观锁：读进来时那份文件的摘要（digest）
+// 在手上，保存时原样交回去；中间被别的程序（编辑器、生成脚本、别的智能体）改过就拒写。
+// 被拒不是失败，是"你手上这份已经不是最新的"：这一页要把这句话说出来，并给一个「重新读」。
+//
+// 这一页自己只记四样：剧目下拉、八步读数那一趟的票、正看着哪一步、正改的那一份。
+
+function workbenchHint(text, tone) {
+  return hintLine(WORKBENCH_HINT_ID, text, tone);
+}
+
+// 一步、或者它底下的一段 → 那枚状态签。文案跟着宿主报的那几个码走（steps_payload 里的
+// done / partial / empty，加上阶段级的 text / missing / todo），**不合并成完成度百分比**：
+// "完成了 60%" 既不能告诉人下一步做什么，也不能告诉人去哪儿补。
+// 归宿不只靠颜色：签本身就写着字，色盲与黑白打印都分得出来。
+function stepChip(state) {
+  if (state === 'done') return projectChip('成了', '');
+  if (state === 'partial') return projectChip('做了一半', 'action');
+  if (state === 'empty') return projectChip('还没动', 'zero');
+  if (state === 'text') return projectChip('只出了文本', 'warn');
+  if (state === 'missing') return projectChip('产物不见了', 'warn');
+  if (state === 'todo') return projectChip('没跑', 'zero');
+  return projectChip(String(state || '不知道'), 'warn');
+}
+
+// 步 key → 给人看的名字。blocked_by 里存的是 key（宿主那边本来就是一套 key），
+// 把 key 原样摆到界面上（"还等：board"）等于让人去猜。
+function stepNameOf(key) {
+  var steps = (STATE.steps && STATE.steps.steps) || [];
+  for (var i = 0; i < steps.length; i += 1) {
+    if (steps[i].key === key) return String(steps[i].name || key);
+  }
+  return String(key || '');
+}
+
+// 右边那一栏画哪一步：先看人点过的那一步，再退回宿主说的"你现在该看的一步"（payload.current）。
+// 人点过的那一步已经不在读数里（宿主改了步骤表，或者换了一部戏）时**必须**退回 ——
+// 留着上一次那个空壳，上面的名字与下面的阶段就会是两回事。
+function resolveStep(payload) {
+  var steps = (payload && payload.steps) || [];
+  var found = null;
+  var i;
+  for (i = 0; i < steps.length; i += 1) {
+    if (steps[i].key === String(STATE.stepAt || '')) found = steps[i];
+  }
+  if (!found) {
+    var current = String((payload && payload.current) || '');
+    for (i = 0; i < steps.length; i += 1) {
+      if (steps[i].key === current) found = steps[i];
+    }
+  }
+  if (!found && steps.length) found = steps[0];
+  STATE.stepAt = found ? String(found.key || '') : '';
+  // 换了一步，手上那份资料就不是这一步的了：清掉 —— 留着的话编辑框里是上一步的正文，
+  // 按「保存」会写到**另一个**文件上去（这边名字对不上，宿主的乐观锁也拦不住：它看的只是摘要）。
+  if (STATE.stepFile && STATE.stepFile.step !== STATE.stepAt) STATE.stepFile = null;
+  return found;
+}
+
+// 这一步的读数里那一步（按 key 找）。找不到就回 null —— 画的时候按"没得看"处理。
+function findStepIn(payload, key) {
+  var steps = (payload && payload.steps) || [];
+  for (var i = 0; i < steps.length; i += 1) {
+    if (steps[i].key === key) return steps[i];
+  }
+  return null;
+}
+
+// 一格轨的 tooltip：这一步要干什么、它欠谁。数不出来就不编 —— 空着就是空着。
+function stepTitle(step) {
+  var bits = [];
+  if (step.goal) bits.push(String(step.goal));
+  if (step.note) bits.push(String(step.note));
+  var blocked = step.blocked_by || [];
+  var names = blocked.map(function (key) {
+    return stepNameOf(key);
+  });
+  bits.push(names.length ? '还等：' + names.join('、') : '上游齐了');
+  return bits.join('；');
+}
+
+// 左边那条轨：八格竖着排。为什么竖着 —— 这八步是有先后的，横排读不出"走到第几步了"；
+// 竖排还能顺手把"哪几步成了"从上到下一眼扫完。
+// 按一格只挪右边那一栏，不重问宿主：读数刚拿回来，接着问一遍只是让人白等一轮。
+function workbenchRail(payload) {
+  var rail = document.createElement('div');
+  rail.id = WORKBENCH_STEPS_ID;
+  rail.className = 'cs-wb-rail';
+  var steps = (payload && payload.steps) || [];
+  var order = (payload && payload.order) || [];
+  var current = String((payload && payload.current) || '');
+  steps.forEach(function (step, index) {
+    var key = String(step.key || '');
+    var at = order.indexOf(key);
+    var button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'cs-wb-step';
+    button.dataset.step = key;
+    button.dataset.state = String(step.state || 'empty');
+    button.setAttribute('aria-current', key === STATE.stepAt ? 'true' : 'false');
+    if (key === current) button.dataset.current = '1';
+    button.title = stepTitle(step);
+    var no = document.createElement('span');
+    no.className = 'cs-wb-step-no';
+    no.textContent = String((at >= 0 ? at : index) + 1);
+    var name = document.createElement('span');
+    name.className = 'cs-wb-step-name';
+    name.textContent = String(step.name || '');
+    var count = document.createElement('span');
+    count.className = 'cs-wb-step-count';
+    // 数是"落点里真产物有几份"，预置空表不算（宿主已经把种子剔掉了，见 steps_payload）。
+    count.textContent = String(step.count || 0);
+    button.appendChild(no);
+    button.appendChild(name);
+    button.appendChild(count);
+    button.appendChild(stepChip(step.state));
+    button.addEventListener('click', function () {
+      if (STATE.stepAt === key) return;
+      if (!leaveStepFile('')) return;
+      STATE.stepAt = key;
+      STATE.stepFile = null;
+      paintWorkbench(STATE.steps);
+    });
+    rail.appendChild(button);
+  });
+  return rail;
+}
+
+// 总览那一行：八步走到哪儿、现在该看谁、有几段的产物不见了。
+// 这几件事都从同一份读数里数出来 —— 不另问一趟宿主：那是同一个答案的第二次回话，
+// 而且两次回话之间文件可能就变了，两行数字会对不上。
+function paintWorkbenchOverview(payload) {
+  var line = document.getElementById(WORKBENCH_OVERVIEW_ID);
+  if (!line) return;
+  line.textContent = '';
+  var steps = (payload && payload.steps) || [];
+  if (!payload || steps.length === 0) return;
+  var done = 0;
+  var missing = 0;
+  var seeds = 0;
+  steps.forEach(function (step) {
+    if (step.state === 'done') done += 1;
+    var stages = step.stages || [];
+    stages.forEach(function (stage) {
+      if (stage.state === 'missing') missing += 1;
+    });
+    seeds += Number(step.seed_count) || 0;
+  });
+  var add = function (chip) {
+    if (line.childNodes.length > 0) line.appendChild(document.createTextNode(' '));
+    line.appendChild(chip);
+  };
+  add(projectChip('八步走了 ' + done + '/' + steps.length + ' 步'));
+  var current = stepNameOf(String(payload.current || ''));
+  if (current) {
+    add(projectChip('现在该看：' + current, 'action'));
+  } else {
+    // 八步都成了**不等于整部戏做完了**：这只是说每一步都不欠上游了。
+    add(projectChip('八步都不欠上游了（不等于整部戏做完了）'));
+  }
+  if (missing > 0) add(projectChip('有 ' + missing + ' 段的产物不见了', 'warn'));
+  if (payload.novel) add(projectChip('原文：' + payload.novel));
+  else if (payload.linked_novel) add(projectChip('登记的原著：' + payload.linked_novel, 'warn'));
+  if (seeds > 0) add(projectChip('另有 ' + seeds + ' 份预置空表（不算进度）', 'zero'));
+  // gaps 非空是**规范自己**的毛病（某一段没归属、某个落点没被认领）：那是宿主那边的代码错，
+  // 不该静默 —— 它会让工作台少一步或者多一步，而少掉的那一步没有任何别的迹象。
+  var gaps = (payload.gaps || []).length;
+  if (gaps > 0) add(projectChip('步骤表对不上（' + gaps + ' 处）', 'warn'));
+}
+
+// 一步底下一段一行：阶段号、名字、状态、谁做、产出落哪儿、要不要回引擎侧渲染，全照宿主念
+// （都出自 pipeline/steps 里那几栏：actor / artifact / needs_render / how）。
+function workbenchStageCard(stage, root) {
+  var card = document.createElement('div');
+  card.className = 'cs-wb-stage';
+  card.dataset.code = String(stage.code || '');
+  card.dataset.state = String(stage.state || 'todo');
+
+  var head = document.createElement('div');
+  head.className = 'cs-pipe-head';
+  var codeEl = document.createElement('span');
+  codeEl.className = 'cs-pipe-code';
+  codeEl.textContent = String(stage.code || '');
+  var nameEl = document.createElement('span');
+  nameEl.className = 'cs-pipe-name';
+  nameEl.textContent = String(stage.name || '');
+  head.appendChild(codeEl);
+  head.appendChild(nameEl);
+  head.appendChild(stepChip(stage.state));
+  card.appendChild(head);
+
+  var bits = ['谁做：' + String(stage.actor || stage.agent || stage.owner || '—')];
+  bits.push('落点：' + String(stage.artifact || '—'));
+  if (stage.needs_render === true) bits.push('跑完还要回引擎侧出图/视频/音频');
+  var meta = document.createElement('div');
+  meta.className = 'cs-pipe-meta';
+  meta.textContent = bits.join(' · ');
+  card.appendChild(meta);
+
+  // how：宿主给的那句话（这一段是怎么做的）。它比面板自己写一句"点这里开始"有用得多，
+  // 因为看的人常常正是在判断"这一步到底会不会动我的文件"。
+  if (stage.how) {
+    var how = document.createElement('div');
+    how.className = 'cs-pipe-note';
+    how.textContent = String(stage.how);
+    card.appendChild(how);
+  }
+
+  // 谁做这一段，就能把对话那边的智能体换成那一位 —— 这是这一页**唯一**动到对话状态的地方，
+  // 而且是明说的：点完切回对话页，下一句话就按这位的人设来。
+  if (stage.agent) {
+    var label = String(stage.agent_name || stage.agent);
+    card.appendChild(
+      projectButton('用「' + label + '」', '把对话那边的智能体换成这一段那位，并切到对话页（下一次提问就按这个人设来）', function () {
+        useStepAgent(String(stage.agent), String(stage.agent_name || ''));
+      })
+    );
+  }
+
+  // 这一步的实质产物该用哪张图出 —— 与「流水线」那一页同一枚按钮、同一张表（宿主 STAGE_RENDER）。
+  // 这一页没有"这一趟跑出来"的读数（它看的是落点里有没有东西），所以只带 stage 那一份。
+  var renders = pipeRenderRow(stage, null, root);
+  if (renders) card.appendChild(renders);
+  return card;
+}
+
+// 一份资料那一行。读不了的那些（图、音频、视频）照样列出来、但点不动：这一页不播它们，
+// 读成文本只会是一片乱码 —— "点得动却给出乱码"比灰着更让人恼火。
+// 预置空表也照样列（它就是这一步该往里写的那张表），只是标出来。
+function workbenchFile(file, landing, projectName) {
+  var row = document.createElement('button');
+  row.type = 'button';
+  row.className = 'cs-proj-file cs-wb-file';
+  row.dataset.rel = String(file.rel || '');
+  row.dataset.seed = file.seed === true ? '1' : '0';
+  var title =
+    String(file.rel || '') + '（' + formatBytes(file.bytes) + '，' + formatTime(file.mtime) + '）';
+  var nameEl = document.createElement('span');
+  nameEl.textContent = String(file.name || '');
+  var size = document.createElement('span');
+  size.className = 'cs-proj-file-size';
+  size.textContent = file.seed === true ? '预置空表' : formatBytes(file.bytes);
+  row.appendChild(nameEl);
+  row.appendChild(size);
+  if (file.readable !== true) {
+    row.disabled = true;
+    row.title = title + '：这一份不是文本，面板读不了（请用系统里的程序打开它）';
+    return row;
+  }
+  row.title = title + '：点开看，改完按「保存」写回';
+  row.addEventListener('click', function () {
+    readStepFile(projectName, String(file.rel || ''), String(landing.rel || ''), 0);
+  });
+  return row;
+}
+
+// 一步的落点：一格一格摆出来。格标题与文件名都由宿主给（rel / title 都是顺着 projects/tree
+// 那条路带上来的），面板不自己拼路径 —— 拼一份就会跟规范那张目录表分家。
+function workbenchLanding(landing, projectName) {
+  var box = document.createElement('div');
+  box.className = 'cs-wb-landing';
+  box.dataset.rel = String(landing.rel || '');
+
+  var head = document.createElement('div');
+  head.className = 'cs-wb-landing-head';
+  var title = document.createElement('span');
+  title.className = 'cs-wb-landing-title';
+  title.textContent = String(landing.title || landing.rel || '');
+  title.title = String(landing.rel || '') + (landing.shelf ? '（' + landing.shelf + '）' : '');
+  var count = document.createElement('span');
+  count.className = 'cs-proj-group-count';
+  count.textContent = landing.count > 0 ? String(landing.count) + ' 份' : '空';
+  head.appendChild(title);
+  head.appendChild(count);
+  box.appendChild(head);
+
+  var files = landing.files || [];
+  if (files.length === 0) {
+    box.appendChild(
+      projectNote(landing.exists === true ? '这一格还空着。' : '这一格还没有这个目录。', 'plain')
+    );
+  }
+  files.forEach(function (file) {
+    box.appendChild(workbenchFile(file, landing, projectName));
+  });
+  // 截断是宿主说的（STEP_FILES_SHOWN）：这一格里还有没列出来的。不说的话，人按数出来的几份
+  // 判断"这一步做得怎么样"，而他看到的只是前面几份。
+  if (landing.truncated === true || files.length < (landing.count || 0)) {
+    box.appendChild(projectNote('这一格只列了前 ' + files.length + ' 份，还有没列出来的。', 'plain'));
+  }
+  return box;
+}
+
+// 一步里能按的几处衔接：去管理小说（原文那一步）、去流水线跑。
+// 为什么要有这几个键：工作台看的是"这一刻什么样"，而"下一步往哪儿走"是另一件事；
+// 让人自己去找那一页，等于把这条路藏起来。
+function workbenchLinks(step, payload) {
+  var row = document.createElement('div');
+  row.className = 'cs-wb-links';
+  if (step.key === 'parse') {
+    row.appendChild(
+      projectButton('去管理小说', '读原文、切片、看原文库那一页', function () {
+        switchView('novel');
+      })
+    );
+  }
+  row.appendChild(
+    projectButton('去流水线跑…', '换到流水线那一页按键跑（那页看的是机器跑的顺序）', function () {
+      // 两页看的是同一部戏：把挑好的这一部带过去，免得那边又从头挑一遍。
+      STATE.pipelineProject = String((payload && payload.name) || STATE.pipelineProject || '');
+      switchView('pipeline');
+    })
+  );
+  return row;
+}
+
+// 从工作台把对话那边的智能体换成这一步那位。动的是对话的状态（宿主 agent/agent），
+// 所以按完就切回对话页：留人在这页看着一个已经变了的"人设"，下一步点哪儿都是猜。
+function useStepAgent(id, name) {
+  if (!id) return null;
+  if (STATE.busy) {
+    workbenchHint('这一轮还在飞，等它答完再换智能体。', 'error');
+    return null;
+  }
+  return Promise.resolve(bridge.request('agent/agent', { agent: id })).then(
+    function (response) {
+      if (!response || response.ok !== true) {
+        var error = (response && response.error) || {};
+        workbenchHint('换不了智能体：' + (error.message || '未知错误'), 'error');
+        return null;
+      }
+      var result = response.result || {};
+      var picked = String(result.agent || id);
+      STATE.agent = picked;
+      var select = document.getElementById(AGENT_ID);
+      if (select) select.value = picked;
+      refreshAgentEnabled();
+      setStatus('智能体：' + String(result.name || name || picked) + '（下一次提问按这个来）');
+      switchView('chat');
+      return result;
+    },
+    function (err) {
+      workbenchHint('换不了智能体：' + message(err), 'error');
+      return null;
+    }
+  );
+}
+
+// 离开手上这份资料之前的一道拦：改过没保存就问一句，别让人点一下别处就把字丢了。
+// 丢字这种事**不会报错**，人只会过一会儿发现刚才写的那段没了，从此不再相信这个编辑框。
+function leaveStepFile(nextRel) {
+  var open = STATE.stepFile;
+  if (!open || !open.rel || open.rel === nextRel) return true;
+  if (open.text !== open.saved) {
+    workbenchHint(
+      '「' + open.rel + '」改过还没保存：先按「保存」，或者按「扔掉改动重读」把它舍掉。',
+      'error'
+    );
+    return false;
+  }
+  return true;
+}
+
+function setStepFileError(text) {
+  if (!STATE.stepFile) return;
+  STATE.stepFile.pending = false;
+  STATE.stepFile.error = text;
+  paintStepDetail(STATE.steps, findStepIn(STATE.steps, STATE.stepAt));
+  workbenchHint(text, 'error');
+}
+
+// 读一份落点里的资料。**整份读**（whole）：这一栏的目的就是改完写回去，只读一页的话，
+// 写回时会把没读到的那半截删掉，而宿主看不出这件事（交上去的是一段"更短的完整文本"）。
+// whole 那个上限由宿主给（见 ProjectLibrary.read），面板不抄一份 —— 抄了就会两边分家。
+function readStepFile(projectName, rel, landing, offset) {
+  if (!projectName || !rel) return null;
+  if (!leaveStepFile(rel)) return null;
+  var token = (STATE.stepsToken || 0) + 1;
+  STATE.stepsToken = token;
+  STATE.stepFile = {
+    project: projectName,
+    rel: rel,
+    landing: landing,
+    step: STATE.stepAt,
+    digest: '',
+    text: '',
+    saved: '',
+    offset: Number(offset) || 0,
+    editable: false,
+    pending: true,
+    error: ''
+  };
+  // 先把"正在读"画出来，再等宿主：读大文件要一会儿，空白一栏看起来像点坏了。
+  paintStepDetail(STATE.steps, findStepIn(STATE.steps, STATE.stepAt));
+  return Promise.resolve(bridge.request('projects/read', { name: projectName, rel: rel, whole: true })).then(
+    function (response) {
+      if (STATE.stepsToken !== token) return null;
+      if (!response || response.ok !== true) {
+        var error = (response && response.error) || {};
+        setStepFileError('读不了这一份：' + (error.message || '未知错误'));
+        return null;
+      }
+      paintStepFile(response.result || {});
+      return STATE.stepFile;
+    },
+    function (err) {
+      if (STATE.stepsToken !== token) return null;
+      setStepFileError('读不了这一份：' + message(err));
+      return null;
+    }
+  );
+}
+
+// 读到的那一份落进手上的状态：正文、摘要、能不能改。
+// **truncated 为真就不能改**：那说明这一份比宿主肯一次读完的还长，手上只有前面一段；
+// 拿它写回去等于把余下的内容删掉（见 ProjectLibrary.write 里那段说明）。
+function paintStepFile(page) {
+  var open = STATE.stepFile;
+  if (!open) return;
+  open.pending = false;
+  open.error = '';
+  open.text = String(page.text || '');
+  open.saved = open.text;
+  open.digest = String(page.digest || '');
+  open.total = Number(page.total_chars) || 0;
+  open.encoding = String(page.encoding || '');
+  open.truncated = page.truncated === true;
+  open.editable = open.truncated !== true;
+  paintStepDetail(STATE.steps, findStepIn(STATE.steps, STATE.stepAt));
+}
+
+// 保存那一行右边那句话：手上这份跟盘上那份一样不一样。
+function paintStepFileSave(text, tone) {
+  var line = document.getElementById(WORKBENCH_SAVE_HINT_ID);
+  if (!line) return;
+  line.textContent = text;
+  if (tone) line.dataset.tone = tone;
+  else line.removeAttribute('data-tone');
+}
+
+// 按「保存」：把这一份写回项目。带的是读进来那一刻的摘要（digest）—— 宿主拿它核对
+// "我改的是我读到的这一版"；中间被别人改过就拒写。那时人手上这份已经旧了，所以这一页
+// 要把宿主那句话原样说出来、并指向「重新读」，**不**自作主张地覆盖。
+function saveStepFile() {
+  var open = STATE.stepFile;
+  if (!open || !open.rel || open.pending === true) return null;
+  if (open.editable !== true) {
+    workbenchHint('这一份太长，面板只看了前面一段：不拿半份写回去（那会删掉余下的内容）。', 'error');
+    return null;
+  }
+  var edit = document.getElementById(WORKBENCH_EDIT_ID);
+  if (edit) open.text = edit.value;
+  if (open.text === open.saved) {
+    paintStepFileSave('和盘上那份一样，不用写。');
+    return null;
+  }
+  var button = document.getElementById(WORKBENCH_SAVE_ID);
+  if (button) button.disabled = true;
+  paintStepFileSave('正在写回…');
+  var params = { name: open.project, rel: open.rel, text: open.text, base_digest: open.digest };
+  return Promise.resolve(bridge.request('projects/write', params)).then(
+    function (response) {
+      if (button) button.disabled = false;
+      if (!response || response.ok !== true) {
+        var error = (response && response.error) || {};
+        var reason = error.message || '未知错误';
+        paintStepFileSave('没写成：' + reason, 'error');
+        workbenchHint('没写成「' + open.rel + '」：' + reason, 'error');
+        return null;
+      }
+      var result = response.result || {};
+      open.digest = String(result.digest || '');
+      open.saved = open.text;
+      paintStepFileSave(result.created === true ? '新建并写好了。' : '写好了。');
+      workbenchHint((result.created === true ? '在 ' : '写回了 ') + open.rel + '。', 'info');
+      // 落点里"这一份有多新"跟着变了：把八步那一趟重看一遍（只读，不动文件）。
+      // keepDetail 那一趟只重画总览与左边那条轨，右边正在编辑的那一栏留着 ——
+      // 刚保存完就把人的光标顶回第一行，是让人下次不敢按保存的那种细节。
+      return planWorkbench(true);
+    },
+    function (err) {
+      if (button) button.disabled = false;
+      paintStepFileSave('没写成：' + message(err), 'error');
+      return null;
+    }
+  );
+}
+
+// 右边最下面那一块：正看着的那一份资料 —— 一份能读也能改的正文。
+function paintStepReader(projectName) {
+  var box = document.getElementById(WORKBENCH_READER_ID);
+  if (!box) return;
+  box.textContent = '';
+  var open = STATE.stepFile;
+  if (!open) {
+    box.appendChild(projectNote('点上面任何一份资料，在这里看；改完按「保存」写回项目。', 'plain'));
+    return;
+  }
+
+  var head = document.createElement('div');
+  head.className = 'cs-wb-reader-head';
+  var title = document.createElement('div');
+  title.className = 'cs-wb-reader-title';
+  title.textContent = String(open.rel || '');
+  title.title = '落在：' + String(open.landing || '') + '（' + String(projectName || '') + '）';
+  head.appendChild(title);
+  box.appendChild(head);
+
+  if (open.pending === true) {
+    box.appendChild(projectNote('正在读…', 'plain'));
+    return;
+  }
+  if (open.error) {
+    box.appendChild(projectNote(String(open.error), 'plain'));
+    box.appendChild(
+      projectButton('再读一次', '重新读这一份', function () {
+        readStepFile(open.project, open.rel, open.landing, 0);
+      })
+    );
+    return;
+  }
+
+  var edit = document.createElement('textarea');
+  edit.id = WORKBENCH_EDIT_ID;
+  edit.className = 'cs-wb-edit';
+  edit.spellcheck = false;
+  edit.value = String(open.text || '');
+  edit.setAttribute('aria-label', '编辑 ' + String(open.rel || ''));
+  if (open.editable !== true) {
+    // 太长的那一份只给看。这里用 readOnly 而不是 disabled：disabled 会连滚动一起冻住，
+    // 而"看得见却翻不动"比不给看更气人。
+    edit.readOnly = true;
+    edit.dataset.readonly = '1';
+  }
+  // 每敲一下就把草稿存回手上的那一份：这一栏会因为"换一步、重看一遍"被整个重画，
+  // 不留草稿的话，人正打着的字会被自己的按键抹掉。
+  edit.addEventListener('input', function () {
+    if (STATE.stepFile !== open) return;
+    open.text = edit.value;
+    paintStepFileSave(open.text === open.saved ? '和盘上那份一样。' : '改过了，按「保存」写回。');
+  });
+  box.appendChild(edit);
+
+  var row = document.createElement('div');
+  row.className = 'cs-wb-save-row';
+  var save = projectButton(
+    '保存',
+    '把这一份写回项目（宿主会核对这份文件在这期间没被别人改过）',
+    function () {
+      saveStepFile();
+    }
+  );
+  save.id = WORKBENCH_SAVE_ID;
+  if (open.editable !== true) {
+    save.disabled = true;
+    save.title = '这一份太长，只读了前面一段：面板不拿半份写回去';
+  }
+  row.appendChild(save);
+  row.appendChild(
+    projectButton(
+      open.text !== open.saved ? '扔掉改动重读' : '重新读',
+      '从盘上重读这一份（手上没保存的改动会丢掉）',
+      function () {
+        readStepFile(open.project, open.rel, open.landing, 0);
+      }
+    )
+  );
+  var hint = document.createElement('span');
+  hint.id = WORKBENCH_SAVE_HINT_ID;
+  hint.className = 'cs-wb-save-hint';
+  row.appendChild(hint);
+  box.appendChild(row);
+
+  if (open.editable !== true) {
+    box.appendChild(
+      projectNote(
+        '这一份有 ' + open.total + ' 字，比宿主一次肯读完的还长：这里只读。改它请用你自己的编辑器 —— ' +
+          '面板不拿半份写回去（那会把没读到的部分删掉，而宿主看不出这件事）。',
+        'plain'
+      )
+    );
+  } else {
+    var facts = [];
+    if (open.encoding) facts.push('编码 ' + open.encoding);
+    if (open.total) facts.push(open.total + ' 字');
+    if (facts.length) box.appendChild(projectNote(facts.join(' · '), 'plain'));
+  }
+  paintStepFileSave(open.text === open.saved ? '和盘上那份一样。' : '改过了，按「保存」写回。');
+}
+
+// 右边那一栏：这一步要干什么、它底下的机器阶段各是什么状态、落点里有什么、以及一份能读能改的正文。
+function paintStepDetail(payload, step) {
+  var detail = document.getElementById(WORKBENCH_DETAIL_ID);
+  if (!detail) return;
+  detail.textContent = '';
+  if (!step) {
+    detail.appendChild(projectEmpty('先挑一部戏：左边那条轨就是它的八步。'));
+    return;
+  }
+  var projectName = String((payload && payload.name) || '');
+
+  var head = document.createElement('div');
+  head.className = 'cs-wb-detail-head';
+  var title = document.createElement('div');
+  title.className = 'cs-wb-detail-title';
+  title.textContent = String(step.name || '');
+  head.appendChild(title);
+  head.appendChild(stepChip(step.state));
+  detail.appendChild(head);
+
+  var facts = [];
+  if (step.goal) facts.push(String(step.goal));
+  if (step.note) facts.push(String(step.note));
+  if (facts.length) detail.appendChild(projectNote(facts.join('；'), 'next'));
+
+  var blocked = step.blocked_by || [];
+  if (blocked.length) {
+    var names = blocked.map(function (key) {
+      return stepNameOf(key);
+    });
+    detail.appendChild(
+      projectNote('还等：' + names.join('、') + '（那边做完才好接着往下）。', 'action')
+    );
+  }
+
+  var stages = step.stages || [];
+  if (stages.length) {
+    var stageBox = document.createElement('div');
+    stageBox.className = 'cs-wb-stages';
+    // 项目根（绝对路径）由这一份载荷给（pipeline/steps 的 project）：出图时要把产物落进
+    // 这一段的落点，拼的就是它。这一页与「流水线」那一页各有各的载荷，所以各传各的。
+    var stageRoot = String((payload && payload.project) || '');
+    stages.forEach(function (stage) {
+      stageBox.appendChild(workbenchStageCard(stage, stageRoot));
+    });
+    detail.appendChild(stageBox);
+  } else {
+    // 没有机器阶段的一步（视觉风格）：它靠落点里的资料算成没成，没有阶段可跑 —— 如实说。
+    detail.appendChild(
+      projectNote('这一步没有对应的机器阶段：它的产物是一份份资料，落在下面几格里。', 'plain')
+    );
+  }
+
+  var landings = step.landings || [];
+  landings.forEach(function (landing) {
+    detail.appendChild(workbenchLanding(landing, projectName));
+  });
+
+  detail.appendChild(workbenchLinks(step, payload));
+
+  var reader = document.createElement('div');
+  reader.id = WORKBENCH_READER_ID;
+  reader.className = 'cs-wb-reader';
+  detail.appendChild(reader);
+  paintStepReader(projectName);
+}
+
+// 画这一整页。keepDetail 为真时只重画总览与左边那条轨，右边那一栏（含正在编辑的正文）留着 ——
+// 保存完那一趟就是这么调的（见 saveStepFile）。
+function paintWorkbench(payload, keepDetail) {
+  STATE.steps = payload || null;
+  var step = resolveStep(payload);
+  paintWorkbenchOverview(payload);
+  var host = document.getElementById(WORKBENCH_STEPS_ID);
+  if (host && host.parentNode) host.parentNode.replaceChild(workbenchRail(payload), host);
+  if (keepDetail === true) return;
+  paintStepDetail(payload, step);
+}
+
+function buildWorkbenchView() {
+  var view = document.createElement('div');
+  view.id = WORKBENCH_VIEW_ID;
+  view.style.cssText = 'flex:1;min-height:0;display:none;flex-direction:column;';
+  view.setAttribute('role', 'tabpanel');
+
+  var bar = document.createElement('div');
+  bar.className = 'cs-proj-bar';
+  var project = document.createElement('select');
+  project.id = WORKBENCH_PROJECT_ID;
+  project.className = 'cs-proj-input';
+  project.title = '看哪一部戏的这八步';
+  project.addEventListener('change', function () {
+    if (!leaveStepFile('')) {
+      // 手里那份改过没保存：拦下来，并把下拉拨回原来那一部 —— 不拨回去的话，
+      // 屏幕上的剧目跟下面那一栏是两部戏，而人以为自己只是换了个下拉。
+      project.value = STATE.stepsProject || '';
+      return;
+    }
+    STATE.stepsProject = project.value || '';
+    STATE.stepAt = '';
+    STATE.stepFile = null;
+    planWorkbench();
+  });
+  bar.appendChild(project);
+  bar.appendChild(
+    projectButton('重看一遍', '重问一遍宿主：这八步现在走到哪儿、落点里各有什么', function () {
+      planWorkbench();
+    })
+  );
+  view.appendChild(bar);
+
+  var hint = document.createElement('div');
+  hint.id = WORKBENCH_HINT_ID;
+  hint.className = 'cs-proj-hint';
+  view.appendChild(hint);
+
+  var overview = document.createElement('div');
+  overview.id = WORKBENCH_OVERVIEW_ID;
+  // 与项目页那条总览同一个类：同一件事（一排小签报一次数）在三个页面上得长一个样。
+  overview.className = 'cs-proj-overview';
+  view.appendChild(overview);
+
+  var body = document.createElement('div');
+  body.className = 'cs-wb-body';
+  body.appendChild(workbenchRail(null));
+  var detail = document.createElement('div');
+  detail.id = WORKBENCH_DETAIL_ID;
+  detail.className = 'cs-wb-detail';
+  body.appendChild(detail);
+  view.appendChild(body);
+  return view;
+}
+
+// 剧目下拉里的选项：只列得出项目名字（工作台要的是"哪一部戏"，别的栏位在这儿没用）。
+function loadWorkbenchOptions() {
+  var select = document.getElementById(WORKBENCH_PROJECT_ID);
+  if (!select) return Promise.resolve();
+  select.disabled = true;
+  return Promise.resolve(bridge.request('projects/list', {})).then(
+    function (response) {
+      select.disabled = false;
+      if (!response || response.ok !== true) {
+        var error = (response && response.error) || {};
+        workbenchHint('列不出有哪些项目：' + (error.message || '未知错误'), 'error');
+        return null;
+      }
+      var projects = ((response.result || {}).projects) || [];
+      select.textContent = '';
+      if (projects.length === 0) {
+        var none = document.createElement('option');
+        none.value = '';
+        none.textContent = '还没有项目';
+        select.appendChild(none);
+        select.disabled = true;
+        workbenchHint('还没有项目：先去「项目管理」建一部，这条八步链才有得看。', 'plain');
+        return null;
+      }
+      var known = false;
+      projects.forEach(function (project) {
+        var option = document.createElement('option');
+        option.value = String(project.name || '');
+        option.textContent = String(project.name || '');
+        if (option.value === STATE.stepsProject) known = true;
+        select.appendChild(option);
+      });
+      if (!known) STATE.stepsProject = String(projects[0].name || '');
+      select.value = STATE.stepsProject;
+      return planWorkbench();
+    },
+    function (err) {
+      select.disabled = false;
+      workbenchHint('列不出有哪些项目：' + message(err), 'error');
+      return null;
+    }
+  );
+}
+
+// 问宿主要八步的读数（pipeline/steps）。
+// 票（stepsToken）跟流水线那页是一个道理：慢的那一趟回来得比快的那一趟还晚时，
+// 不认票就会把旧的一次画上去，而那一下"咔"地把人刚才看到的正确状态换掉了。
+function planWorkbench(keepDetail) {
+  if (!STATE.stepsProject) {
+    paintWorkbench(null);
+    return Promise.resolve(null);
+  }
+  var token = (STATE.stepsToken || 0) + 1;
+  STATE.stepsToken = token;
+  workbenchHint('正在问「' + STATE.stepsProject + '」走到哪儿了…', 'plain');
+  var params = { name: STATE.stepsProject };
+  return Promise.resolve(bridge.request('pipeline/steps', params)).then(
+    function (response) {
+      if (STATE.stepsToken !== token) return null;
+      if (!response || response.ok !== true) {
+        var error = (response && response.error) || {};
+        workbenchHint('拿不到这八步的读数：' + (error.message || '未知错误'), 'error');
+        paintWorkbench(null);
+        return null;
+      }
+      var payload = response.result || {};
+      workbenchHint(hintForSteps(payload), 'plain');
+      paintWorkbench(payload, keepDetail);
+      return payload;
+    },
+    function (err) {
+      if (STATE.stepsToken !== token) return null;
+      workbenchHint('拿不到这八步的读数：' + message(err), 'error');
+      paintWorkbench(null);
+      return null;
+    }
+  );
+}
+
+// 那一行提示：宿主把"这一步欠谁"算好了，那就念出来 —— 不念的话，人得自己一格一格去比。
+function hintForSteps(payload) {
+  var steps = (payload && payload.steps) || [];
+  if (steps.length === 0) return '这一部戏还没有八步的读数。';
+  var current = stepNameOf(String(payload.current || ''));
+  var done = 0;
+  steps.forEach(function (step) {
+    if (step.state === 'done') done += 1;
+  });
+  var head = '「' + String(payload.name || '') + '」：八步成了 ' + done + ' 步';
+  if (current) return head + '，现在该看「' + current + '」。点左边那一格。';
+  return head + '，都不欠上游了。';
+}
+
+// 进这一页 / 切回来时的入口。
+function loadWorkbench() {
+  return loadWorkbenchOptions();
+}
+
 // ---- 流水线（S0–S7 接到随包那七位智能体上）-------------------------------
 //
 // 这一页是"从小说到成片"那条链的**按键处**。阶段表、每段谁做、产出落哪儿、要不要回引擎侧渲染
@@ -5689,10 +6924,109 @@ function pipeChip(status) {
   return projectChip('还没跑', 'zero');
 }
 
+// 阶段卡上"这一步还得回引擎侧出图"那半句，接成真能按的东西。
+//
+// 宿主的 STAGE_RENDER 表给的是"这一段的实质产物该用哪张图出"，图就是渲染那一行里的那 12 张。
+// 只说"要出图"不说"用哪张图"的话，用户手上只有一排目标得自己认 —— 认错不报错，只会出成
+// 另一张图（把场景卡当角色定妆板这类）。绑定的 id 由宿主给，而宿主核对不了引擎那份清单
+// （两边分开装），所以**画按钮之前先在本机清单里找一遍**：id 漂了的失效模式在这里兜住 ——
+// 少一枚按钮、并说清为什么，而不是点下去才报"没这个目标"。
+function pipeRenderText(text, tone) {
+  var line = document.createElement('div');
+  line.className = 'cs-pipe-note';
+  if (tone) line.dataset.tone = tone;
+  line.textContent = text;
+  return line;
+}
+
+// 落点：宿主给的是**相对项目根**的目录（STAGE_RENDER 每一项的第二项），面板把项目根拼上去，
+// 当 output_dir 交给渲染 —— 引擎收到它会把产物另存一份进去（见 renders/catalog.py 的 run）。
+//
+// 拼不出绝对路径就**不拼**：相对路径会相对于**引擎那边的当前目录**，图落进一个谁也没打算的
+// 地方，而且不报错 —— 与"落点绑错"是同一种错法。宁可按老样子落引擎自己的 output/。
+// （反斜杠要写两遍，见这一段 JS 开头那处同一个坑：只写一遍会被模板那层先吃掉。）
+function pipeLandDir(land, root) {
+  var dir = String(land || '');
+  var base = String(root || '').replace(/[\\\\/]+$/, '');
+  var absolute = /^[a-zA-Z]:[\\\\/]/.test(base) || /^[\\\\/]/.test(base);
+  if (!dir || !absolute) return '';
+  return base + '/' + dir;
+}
+
+// id 与落点都当参数递进来：不抓循环里那个 var（它只有一份，几个按钮会一起指向最后一个）。
+function pipeRenderEntry(id, entry, land, root) {
+  var dir = pipeLandDir(land, root);
+  var title = '把渲染那一行切到这张图，再按「跑一遍」：' + renderHint(entry);
+  // "跑完存哪"按之前就该看得见：不然要等跑完那张卡才晓得图落在哪儿。
+  if (dir) title += '；跑完把产物另存进 ' + dir + '（这一段体检查的就是这个目录）';
+  return projectButton('去出图（' + String(entry.title || id) + '）', title, function () {
+    pipeRunRender(id, dir);
+  });
+}
+
+function pipeRenderRow(stage, live, root) {
+  var targets = (live && live.render_targets) || stage.render_targets || [];
+  if (!targets.length) return null;
+  // 落点按目标分开给（S2 就是两种：角色那一格、场景那一格），所以这里查表，不拿一个用到底。
+  var lands = (live && live.render_lands) || stage.render_lands || {};
+
+  var row = document.createElement('div');
+  row.className = 'cs-pipe-render';
+  var missing = [];
+  for (var index = 0; index < targets.length; index += 1) {
+    var id = String(targets[index]);
+    var entry = renderOf(id);
+    if (!entry) {
+      missing.push(id);
+      continue;
+    }
+    row.appendChild(pipeRenderEntry(id, entry, lands[id], root));
+  }
+  if (missing.length) {
+    // 一张都没画出来时这句就是全部内容：留着它，别把整行丢掉 —— "该有按钮的地方空着"
+    // 比"少一枚按钮"更让人摸不着头脑。
+    row.appendChild(
+      pipeRenderText(
+        '宿主绑的这几张图，引擎那份清单里没有：' +
+          missing.join('、') +
+          '（引擎没起来，或者图改名了）',
+        'warn'
+      )
+    );
+  }
+  // 几张图都落同一格时顺口说一句；一格装不下的那两段（S2 / S3），落点由宿主那句附言分别说清。
+  var same = String(lands[String(targets[0])] || '');
+  for (var other = 1; other < targets.length; other += 1) {
+    if (String(lands[String(targets[other])] || '') !== same) same = '';
+  }
+  if (same) row.appendChild(pipeRenderText('出完存进 ' + same));
+
+  // 宿主那句附言（"引擎侧只有主题曲这一张音频图"那类）是事实、不是报警，所以不带语气。
+  var note = String((live && live.render_note) || stage.render_note || '');
+  if (note) row.appendChild(pipeRenderText(note));
+  return row;
+}
+
+// 按下去 = "把渲染那一行切到这张图，再走用户自己按「跑一遍」那条路"。
+// 不另起一套跑法：必填参数由 runRender 自己挡（它那句话就是"填完再按「跑一遍」"），
+// 所以这里先把下拉切过去 —— 被挡下来的时候，人已经站在那张图的参数表跟前了。
+//
+// dir 是这一格在盘上的绝对路径（见 pipeLandDir）：带上它，产物才落得进这一段的落点，
+// 而不是只留在引擎自己的 output/ 里。
+function pipeRunRender(id, dir) {
+  var select = document.getElementById(RENDER_ID);
+  if (!select || !renderOf(id)) return;
+  select.value = String(id);
+  // 用 change 走它自己那条路（换 STATE.render + 换参数表），不把那段逻辑再抄一遍。
+  select.dispatchEvent(new Event('change'));
+  switchView('chat');
+  runRender(id, dir ? { outputDir: dir } : null);
+}
+
 // 一段一张卡：阶段号、名字、归宿、谁做、产出落哪儿。
 // 归宿先看这一趟跑出来的（run），没有再退回进度账（past）—— 跑的时候进度账还没落盘，
 // 只看进度账的话，正在跑的那一段永远写着"还没跑"。
-function pipeStageCard(stage, run, past) {
+function pipeStageCard(stage, run, past, root) {
   var code = String(stage.code || '');
   var live = run && run[code] ? run[code] : null;
   var done = past && past[code] ? past[code] : null;
@@ -5754,6 +7088,10 @@ function pipeStageCard(stage, run, past) {
     if (tone) line.dataset.tone = tone;
     card.appendChild(line);
   }
+
+  // 这一步的实质产物该用哪张图出（宿主 STAGE_RENDER 绑的）、出完存哪一格，接成一枚能按的按钮。
+  var renders = pipeRenderRow(stage, live, root);
+  if (renders) card.appendChild(renders);
   return card;
 }
 
@@ -6036,8 +7374,11 @@ function paintPipeline(payload) {
       overview.appendChild(projectChip('原文：' + payload.novel));
     }
   }
+  // 项目根（绝对路径）：pipeline/plan 那份里的 project。出图时拼落点要用它，
+  // 而这一页与工作台那一页各有各的载荷，所以各传各的，不共用一个"当前项目"。
+  var root = String((payload && payload.project) || '');
   stages.forEach(function (stage) {
-    list.appendChild(pipeStageCard(stage, run, past));
+    list.appendChild(pipeStageCard(stage, run, past, root));
   });
 }
 
@@ -6184,7 +7525,13 @@ function setPipelineStage(code, outcome) {
     paintPipeline(STATE.pipeline);
     return;
   }
-  var card = pipeStageCard(stage, STATE.pipelineStages, (STATE.pipeline && STATE.pipeline.state) || {});
+  // 跑着的时候这一条会重画单张卡：项目根照旧从 pipeline/plan 那份载荷拿（同一个来源，不另存）。
+  var card = pipeStageCard(
+    stage,
+    STATE.pipelineStages,
+    (STATE.pipeline && STATE.pipeline.state) || {},
+    String((STATE.pipeline && STATE.pipeline.project) || '')
+  );
   var old = list.querySelector('[data-code="' + key + '"]');
   if (old) list.replaceChild(card, old);
   else list.appendChild(card);
@@ -7914,7 +9261,7 @@ export function getComfyStudioChatContentScript(): string {
     // 界面已经放手、宿主那一轮却还占着这个会话（强行复位之后就是这个局面，见 forceResetTurn）。
     // 它决定"停止"键以哪种身份露面（见 setStopVisible），也决定那颗键还能不能按。
     `detached: false, ` +
-    // 抽屉里的四页（'chat' / 'novel' / 'project' / 'pipeline'）与小说那一页的当前状态：
+    // 抽屉里的五页（'workbench' / 'chat' / 'novel' / 'project' / 'pipeline'）与小说那一页的当前状态：
     // 列表那一趟的票、正开着的是哪一篇（含它自己那趟读的票）、删除按到第二步的是哪一行。
     `view: 'chat', novels: null, novelOpen: null, novelDeleteArmed: null, novelListToken: 0, ` +
     // 项目那一页的当前状态：项目列表那一趟的票、正开着的是哪一部（含它那趟 tree 的票、
@@ -7925,6 +9272,11 @@ export function getComfyStudioChatContentScript(): string {
     // 以及"现在跑着没有"。跑的时候这一页不接受第二次按键 —— 宿主那边同项目第二条本来也会拒。
     `pipeline: null, pipelineToken: 0, pipelineProject: '', pipelineStages: null, ` +
     `pipelineBusy: false, ` +
+    // 工作台那一页（见 buildWorkbenchView）：八步那一趟的票、那一趟的读数、下拉里选中的剧目、
+    // 正看着的是哪一步，以及右边正在看/正在改的那份资料 —— 它带**读回来那一刻的摘要**
+    // （digest），保存时原样交回宿主做乐观锁（见 projects.py 的 write）；不带摘要就是盲写，
+    // 宿主会拒。
+    `steps: null, stepsToken: 0, stepsProject: '', stepAt: '', stepFile: null, ` +
     // 项目正文里的"页内找字"（见 paintProjectReader）：找的是哪串字、命中在哪几处、现在停在第几处。
     `projectFileFind: '', projectFileFindHits: [], projectFileFindAt: -1, ` +
     // 左栏（目录树 / 搜索结果）：开着没有，以及里面是哪一篇的哪一趟（含它自己那趟的票）。
@@ -7937,6 +9289,10 @@ export function getComfyStudioChatContentScript(): string {
     // 引擎报回来的渲染目标（那 12 张生产工作流 + 工作流目录在哪），以及"现在正跑着哪一个"。
     // 与 skill 那一份同一个道理：一次只跑一个（渲染一次要占满显存好些分钟）。
     `renders: null, render: '', renderRunning: '', rendersDir: '', rendersNote: '', ` +
+    // 引擎那侧工作流目录里的每一份图（见 loadWorkflows），以及"现在选中的是哪一份"——
+    // 「改这个」按的是它。两个目录名分开存：渲染目标在 workflows_dir 里，工作流清单是
+    // workflowsDir，两边都不是面板算出来的。
+    `workflows: null, workflow: '', workflowsDir: '', workflowsNote: '', ` +
     // 抽屉宽度（像素，0 = 占满整屏）与"窗口变窄要收回来"的监听装没装。
     `width: 0, widthWatcher: false, shortcuts: false, ` +
     // 这一份实例建的那面抽屉（见 buildDrawer）。宿主刷新网页后旧实例还在监听按键，

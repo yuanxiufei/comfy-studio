@@ -62,7 +62,17 @@ def _server():
 
 
 def build_prompt(skill: Skill, params: dict[str, Any] | None) -> PromptWorkflow:
-    """合并参数并注入工作流（深拷贝，不改动 skill 自带的模板）。"""
+    """合并参数并注入工作流（深拷贝，不改动 skill 自带的模板）。
+
+    注入前先核**节点在不在**：``prompt[param.node]`` 的裸 KeyError 只会印出一个 ``'5'``，
+    看不出是哪条 skill 的哪个参数；而漏掉的键在引擎那边是**静默**的 —— 校验是按节点定义遍历的
+    （``execution.validate_inputs``），报文里多出来的键既不校验也不执行，参数就这么没了。
+    所以这里自己说清楚，别让调用方对着一个数字猜。
+
+    ``field`` 那一侧**不在**这里判：判它要的是节点定义（``/object_info``），手里这份是已经
+    转换过的图；而"定义里可选、图上又没值"的字段会被转换跳过（见 ``skills/graph.py``），
+    拿图去判会误伤那种**本来生效**的注入。那一侧的校验在拿得到定义的组装期（``render.py``）。
+    """
     merged = merge_params(skill, params)
     prompt = copy.deepcopy(skill.workflow)
     for param in skill.params:
@@ -71,7 +81,14 @@ def build_prompt(skill: Skill, params: dict[str, Any] | None) -> PromptWorkflow:
         value = merged[param.name]
         if param.name == "seed" and value == SEED_RANDOM:
             value = random.randrange(_SEED_RANGE)
-        prompt[param.node]["inputs"][param.field] = value
+        node = prompt.get(param.node)
+        if node is None or not isinstance(node.get("inputs"), dict):
+            raise SkillExecutionError(
+                f"参数 {param.name!r} 要注入节点 #{param.node}，但 skill {skill.id}"
+                f"（来源：{skill.source or '未记'}）的工作流里没有这个可注入的节点；"
+                f"真有的节点是 {sorted(prompt) or '（无）'} —— 图被改过？参数表要跟着改"
+            )
+        node["inputs"][param.field] = value
     return prompt
 
 

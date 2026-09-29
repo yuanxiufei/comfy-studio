@@ -1,7 +1,7 @@
 """MCP 工具集。
 
 工具名字与语义对齐最初的 TS 实现（``packages/comfy-mcp/src/tools.ts``）：
-9 把通用工具，外加「每个 skill 各暴露一把 ``skill__<id>``」，
+14 把通用工具，外加「每个 skill 各暴露一把 ``skill__<id>``」，
 让 agent 不必先查一遍参数表再拼哈希，直接按 schema 填参即可。
 
 第 8 把是 ``comfy_save_skill``（"方法复用"那条路的入口）：把对话里打磨好的工作流当场
@@ -12,6 +12,13 @@
 第 9 把是 ``comfy_list_model_folders``：模型类别是**引擎那边**决定的（``folder_paths``
 的键，第三方节点还能自己注册），写死在工具描述里必然落后，所以单独开一把工具让模型
 先问类别、再拿类别去 ``comfy_list_models`` 取文件。
+
+紧挨着 ``comfy_render`` 的三把是**工作流库**（``comfy_list_workflows`` / ``comfy_read_workflow`` /
+``comfy_write_workflow``）：对着工作流目录里那些**存成文件的 UI 图**做增删改查。开着它们是因为
+``comfy_list_renders`` 那 12 条只是"已登记过注入点"的图，而用户手里还有他自己存的、改到一半的、
+另存过的 —— 那些图以前只有"拖进编辑器手改"一条路。读写都过 :mod:`comfy_studio.skills.workflows`，
+所以越界、盲写、写出转不动的图这三件事在那一层就被挡住了（不在这一层各判一次）。
+顺带把 ``comfy_render`` 也放开成"可以按 ``file`` 跑目录里任意一张"：看得到却跑不了，等于没看到。
 
 再往后是联网那三把（``web__search`` / ``web__fetch`` / ``web__crawl``）：本地模型的知识停在
 训练那天，而"这个插件现在怎么装""这个报错什么意思"本机查不到。它们在
@@ -30,7 +37,8 @@ from typing import Any, Awaitable, Callable
 
 from ..engine import EngineClient, EngineError
 from ..skills import PARAM_TYPES, Skill, SkillRegistry, param_entry, save_media_batch
-from ..skills.render import prepare_render, render_listing, workflows_dir
+from ..skills.render import prepare_render, prepare_render_target, render_listing, workflows_dir
+from ..skills.workflows import as_target, list_workflows, read_workflow, write_workflow
 from ..web import (
     SEARCH_BACKEND_BING,
     SEARCH_BACKEND_SEARXNG,
@@ -307,7 +315,13 @@ def build_tools(
         return text_result(render_listing(workflows_dir()))
 
     async def render_target(args: dict[str, Any]) -> Any:
-        target_id = _require_str(args, "target_id")
+        target_id = args.get("target_id")
+        file = args.get("file")
+        if (target_id is None) == (file is None):
+            raise ValueError(
+                "target_id 与 file 二选一：登记过的渲染目标用 target_id（见 comfy_list_renders），"
+                "工作流目录里任意一张图用 file（见 comfy_list_workflows）"
+            )
         params = args.get("params") or {}
         if not isinstance(params, dict):
             raise ValueError("params 必须是对象")
@@ -317,7 +331,15 @@ def build_tools(
         if output_dir is not None and (not isinstance(output_dir, str) or not output_dir.strip()):
             raise ValueError("output_dir 必须是目录路径（不给就只回引擎里那些产物的地址）")
 
-        plan = await prepare_render(engine, target_id, images=images, duration_sec=duration_sec)
+        if target_id is not None:
+            if not isinstance(target_id, str) or not target_id:
+                raise ValueError("target_id 必须是非空字符串")
+            plan = await prepare_render(engine, target_id, images=images, duration_sec=duration_sec)
+        else:
+            # 目录里没登记过注入点的图：包成"没有参数"的目标来跑（全按图上原值）。
+            plan = await prepare_render_target(
+                engine, as_target(file, workflows_dir()), images=images, duration_sec=duration_sec
+            )
         result = await engine.run_skill(plan.skill, params)
         payload: dict[str, Any] = {**result.to_json(engine.base_url), "target": plan.target.id}
         # 组装期的让步（时长是按帧数折的、接的是外部组）必须带给模型：它可能据此改提示词或改接法。
@@ -327,6 +349,54 @@ def build_tools(
             saved = await save_media_batch(result.media, output_dir, base_url=engine.base_url)
             payload["saved"] = [str(path) for path in saved]
         return text_result(payload)
+
+    async def list_workflow_files(_args: dict[str, Any]) -> Any:
+        return text_result(list_workflows(workflows_dir()))
+
+    async def read_workflow_file(args: dict[str, Any]) -> Any:
+        file = _require_str(args, "file")
+        raw = args.get("raw", False)
+        if not isinstance(raw, bool):
+            raise ValueError("raw 必须是布尔值")
+        unknown = sorted(set(args) - {"file", "raw"})
+        if unknown:
+            raise ValueError(f"不认识的字段: {', '.join(unknown)}；只认 file / raw")
+        payload = read_workflow(
+            file, workflows_dir(), object_info=await engine.object_info(), raw=raw
+        )
+        return text_result(payload)
+
+    async def write_workflow_file(args: dict[str, Any]) -> Any:
+        file = _require_str(args, "file")
+        unknown = sorted(set(args) - {"file", "base_digest", "workflow", "edits"})
+        if unknown:
+            raise ValueError(
+                f"不认识的字段: {', '.join(unknown)}；只认 file / base_digest / workflow / edits"
+            )
+        if args.get("base_digest") is None:
+            # 库里也拦这一条，但那儿的报错面向调用方；这里先说清楚该做什么。
+            raise ValueError(
+                "缺 base_digest：先 comfy_read_workflow 读一遍，把它回的 digest 原样带过来（防止盖掉"
+                "用户刚在前端保存的版本）；新建一份整图时给空字符串"
+            )
+        workflow = args.get("workflow")
+        edits = args.get("edits")
+        if (workflow is None) == (edits is None):
+            raise ValueError("workflow（整份图）与 edits（按字段改值）要给且只给一个")
+        if workflow is not None and not isinstance(workflow, dict):
+            raise ValueError("workflow 必须是对象（UI 图，含 nodes 数组）；API 格式的图走 comfy_submit_workflow")
+        if edits is not None and not isinstance(edits, list):
+            raise ValueError("edits 必须是数组，每项 {node, field, value}")
+        return text_result(
+            write_workflow(
+                file,
+                workflows_dir(),
+                base_digest=args["base_digest"],
+                workflow=workflow,
+                edits=edits,
+                object_info=await engine.object_info(),
+            )
+        )
 
     tools = [
         Tool(
@@ -458,7 +528,9 @@ def build_tools(
             description=(
                 "列出这台机器上配好的**渲染目标**（角色定妆板 / 场景卡 / 视频试片 / 音乐 / 补帧 …）："
                 "每个目标对应一张现成的生产工作流 + 一列可填参数，用 comfy_render 跑它。"
-                "先看这里再动手 —— 目标 id 与参数名不要猜；file_exists=false 表示那张图不在"
+                "先看这里再动手 —— 目标 id 与参数名不要猜；file_exists=false 表示那张图不在。"
+                "这里只有**登记过**的目标：工作流目录里其余的图（用户自己存的、另存过的）"
+                "用 comfy_list_workflows 看，那些没有参数表，comfy_render 带 file 按图上原值跑"
             ),
             input_schema={"type": "object", "properties": {}},
             handler=list_renders,
@@ -467,7 +539,8 @@ def build_tools(
             name="comfy_render",
             description=(
                 "跑一个渲染目标并等待完成，返回产物地址（给了 output_dir 就落盘并回文件路径）。"
-                "参数定义与目标 id 由 comfy_list_renders 给出。"
+                "参数定义与目标 id 由 comfy_list_renders 给出；工作流目录里没登记过的图改用 file 跑"
+                "（那种图没有参数可填，全按图上原值）。"
                 "images 只在视频目标上有用：按顺序对应提示词里的「图片1、图片2…」"
                 "（试片/母版是首帧、尾帧；多镜连贯是参考素材），是**这台机器上的文件路径**，"
                 "内部会先搬进引擎 input/。这种时候 duration_sec 最好显式给（不给按图上帧数折算）"
@@ -475,7 +548,17 @@ def build_tools(
             input_schema={
                 "type": "object",
                 "properties": {
-                    "target_id": {"type": "string", "description": "渲染目标 id，见 comfy_list_renders"},
+                    "target_id": {
+                        "type": "string",
+                        "description": "渲染目标 id，见 comfy_list_renders（与 file 二选一）",
+                    },
+                    "file": {
+                        "type": "string",
+                        "description": (
+                            "工作流文件名，见 comfy_list_workflows（与 target_id 二选一）："
+                            "没登记过注入点的图用这条按图上原值跑，params 就没得填"
+                        ),
+                    },
                     "params": {"type": "object", "description": "该目标的参数（名字见 comfy_list_renders）"},
                     "images": {
                         "type": "array",
@@ -488,9 +571,73 @@ def build_tools(
                     },
                     "output_dir": {"type": "string", "description": "给就把产物落进这个目录并按顺序回路径"},
                 },
-                "required": ["target_id"],
             },
             handler=render_target,
+        ),
+        Tool(
+            name="comfy_list_workflows",
+            description=(
+                "列出工作流目录里的**每一份工作流文件**（不只是 comfy_list_renders 登记过的那 12 条）："
+                "用户自己存的、改到一半的、另存过的图都在这儿。used_by 为空的那批是还没登记成渲染目标的"
+                "图 —— 它们照样能用 comfy_render 的 file 参数跑（按图上原值）。"
+                "要改一张图或新建一张，先 comfy_read_workflow 读、再 comfy_write_workflow 写回"
+            ),
+            input_schema={"type": "object", "properties": {}},
+            handler=list_workflow_files,
+        ),
+        Tool(
+            name="comfy_read_workflow",
+            description=(
+                "读工作流目录里的一份 UI 图，返回**按字段名摊开的节点清单**：每个节点的 widgets 就是它的"
+                "可改字段（steps / seed / text / fps …，动态下拉的子字段是 selection.tau 这种点号名），"
+                "wired_in 是走连线的口（改图上那种值没用）。同时回 digest —— 改完写回时原样当 base_digest。"
+                "要动结构（加节点、接线）才加 raw=true 拿整份原始图；平时别要，位置数组又大又难改"
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string", "description": "工作流文件名，见 comfy_list_workflows"},
+                    "raw": {"type": "boolean", "description": "是否附带整份原始 UI 图，默认 false"},
+                },
+                "required": ["file"],
+            },
+            handler=read_workflow_file,
+        ),
+        Tool(
+            name="comfy_write_workflow",
+            description=(
+                "把工作流写回磁盘，两种改法二选一。edits 按字段改值（每项 {node, field, value}，field 取"
+                "comfy_read_workflow 摊出来的 widgets 键名）：写完先试转成 API 格式，转不动就不落盘。"
+                "workflow 整份替换（要动结构时用）：会逐条报出新增/删除/改了哪些节点。"
+                "base_digest 必填 —— 先读一遍把它回的 digest 带过来，免得盖掉用户刚在前端保存的版本；"
+                "新建一份整图时给空字符串。覆盖前的旧版会留在 _backups/ 里，改错了可以退回去"
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string", "description": "工作流文件名，见 comfy_list_workflows"},
+                    "base_digest": {
+                        "type": "string",
+                        "description": "comfy_read_workflow 回的 digest（乐观锁）；新建整图时给空字符串",
+                    },
+                    "edits": {
+                        "type": "array",
+                        "description": "按字段改值，每项 {node, field, value}",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "node": {"type": "string", "description": "节点 id（清单里那个 id 字符串）"},
+                                "field": {"type": "string", "description": "字段名，见该节点的 widgets"},
+                                "value": {"description": "新值，类型照节点定义（整数 / 浮点 / 字符串 / 布尔）"},
+                            },
+                            "required": ["node", "field", "value"],
+                        },
+                    },
+                    "workflow": {"type": "object", "description": "整份 UI 图对象（含 nodes 数组）"},
+                },
+                "required": ["file", "base_digest"],
+            },
+            handler=write_workflow_file,
         ),
     ]
 

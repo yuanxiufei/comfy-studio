@@ -17,7 +17,9 @@ import tempfile
 import unittest
 import urllib.error
 import urllib.request
+from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 from ..skills.render import (
     COMBINE_AUTOGROW,
@@ -29,6 +31,8 @@ from ..skills.render import (
     MAX_REFERENCE_IMAGES,
     RENDER_TARGETS,
     RenderError,
+    RenderTarget,
+    _check_injection_points,
     _group_slots,
     _input_keys,
     build_render_skill,
@@ -37,9 +41,44 @@ from ..skills.render import (
     target_path,
     workflows_dir,
 )
+from ..skills.types import SkillParam
 
 #: 引擎要真在跑才拿得到节点定义（与 test_skills_graph.py 同一套口径）。
 BASE = "http://127.0.0.1:8188"
+
+
+class InjectionPointTest(unittest.TestCase):
+    """注入点校验本身，**不需要引擎**：喂一张假定义表就够。
+
+    对真图逐条核的那条在下面需要引擎的类里；这里管的是"判据与报错" ——
+    表指向节点定义里没有的键时，必须当场报错，而不是注进去被引擎静默丢掉
+    （``execution.validate_inputs`` 只按节点定义遍历，报文里多出来的键既不校验也不执行）。
+    """
+
+    #: ``CLIPTextEncode`` 只认 ``text`` 一个键。
+    OBJECT_INFO: dict[str, Any] = {"CLIPTextEncode": {"input": {"required": {"text": ["STRING", {}]}}}}
+    WORKFLOW: dict[str, Any] = {"5": {"class_type": "CLIPTextEncode", "inputs": {"text": ""}}}
+
+    def _target(self, *params: SkillParam) -> RenderTarget:
+        return replace(find_target("scene-card"), params=params)
+
+    def test_a_matching_param_passes(self) -> None:
+        target = self._target(SkillParam(name="prompt", type="string", node="5", field="text"))
+        _check_injection_points(target, self.WORKFLOW, self.OBJECT_INFO, target.params)
+
+    def test_a_field_the_node_does_not_have_is_refused(self) -> None:
+        target = self._target(SkillParam(name="prompt", type="string", node="5", field="positiv"))
+        with self.assertRaises(RenderError) as caught:
+            _check_injection_points(target, self.WORKFLOW, self.OBJECT_INFO, target.params)
+        message = str(caught.exception)
+        self.assertIn("positiv", message)
+        self.assertIn("text", message, "要说清这个节点真有哪些键，好直接去改表或改图")
+
+    def test_a_node_that_is_not_in_the_graph_is_refused(self) -> None:
+        target = self._target(SkillParam(name="prompt", type="string", node="99", field="text"))
+        with self.assertRaises(RenderError) as caught:
+            _check_injection_points(target, self.WORKFLOW, self.OBJECT_INFO, target.params)
+        self.assertIn("#99", str(caught.exception))
 
 
 class TargetTableTest(unittest.TestCase):

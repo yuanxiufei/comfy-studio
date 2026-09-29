@@ -20,6 +20,9 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 
 from comfy_studio.agent import (
+    BASE_SYSTEM_PROMPT,
+    CLOSING_SYSTEM_PROMPT,
+    DEFAULT_SYSTEM_PROMPT,
     AgentSession,
     ChatMessage,
     LLMConfig,
@@ -31,7 +34,8 @@ from comfy_studio.agent import (
 from comfy_studio.agent.llm import _is_local_refusal
 from comfy_studio.cancel import CancelToken, Cancelled, race
 from comfy_studio.mcp import McpHub, McpServerConfig, McpStdioClient, McpTool
-from comfy_studio.rpc import RpcError
+from comfy_studio.panel import describe_context
+from comfy_studio.rpc import INVALID_PARAMS, RpcError
 from comfy_studio.server import DEFAULT_SESSION, StudioHost
 from comfy_studio.skills import SkillCatalog
 
@@ -614,6 +618,74 @@ class _Ctx:
 
     async def emit(self, method: str, params: dict[str, Any]) -> None:
         self.events.append({"method": method, "params": params})
+
+
+class PanelContextTests(unittest.IsolatedAsyncioTestCase):
+    """面板选中态随一轮走到人设里（:mod:`comfy_studio.panel`）。
+
+    这里钉的是**接线**：面板那几个键（``agent/chat`` 的 ``context``）→ ``_panel_contexts``
+    → 这一轮的人设 → 收尾抹掉。那段话本身长什么样归 ``test_panel.py``。
+    """
+
+    def _host(self) -> StudioHost:
+        hub = McpHub([])  # 不连引擎：这几条只关心一轮开始时人设长什么样
+        host = StudioHost(hub, SkillCatalog(hub))
+        host._sessions[DEFAULT_SESSION] = AgentSession(
+            FakeHub({}),
+            [_tool("a")],  # 会话要求至少一个工具（见 AgentSession.__init__）；这一轮模型不调它
+            llm=ScriptedLLM(ChatMessage(role="assistant", content="好的")),
+        )
+        return host
+
+    async def test_the_selection_is_in_place_before_the_turn_runs(self) -> None:
+        host = self._host()
+        seen: list[dict[str, str]] = []
+        real = host._ask_with_watchdog
+
+        async def spy(session: Any, text: str, on_event: Any, cancel: Any) -> Any:
+            # 轮子刚转起来的那一刻它就必须已经在了：会话第一次建起来时会当场算一次人设
+            # （``AgentSession.__init__`` 里的 ``_system_text``），晚一步写就等于这一轮白搭。
+            seen.append(dict(host._panel_contexts))
+            return await real(session, text, on_event, cancel)
+
+        with mock.patch.object(host, "_ask_with_watchdog", spy):
+            await host.agent_chat({"text": "改一下这个", "context": {"workflow": "a.json"}}, _Ctx())
+
+        self.assertEqual(list(seen[0]), [DEFAULT_SESSION], "按会话存：别的段不该看见它")
+        self.assertIn("- 工作流：a.json", seen[0][DEFAULT_SESSION])
+        self.assertEqual(host._panel_contexts, {}, "这一轮收尾必须抹掉，否则成了下一轮的面板")
+
+    async def test_the_prompt_of_that_turn_carries_the_selection(self) -> None:
+        host = self._host()
+        source = host._prompt_source(DEFAULT_SESSION)
+        # 面板上什么都没选时，人设与那份默认的一字不差：默认行为不能因为这层新东西改掉。
+        self.assertEqual(source(), DEFAULT_SYSTEM_PROMPT)
+
+        host._panel_contexts[DEFAULT_SESSION] = describe_context({"workflow": "a.json"})
+        text = source()
+        self.assertIn("- 工作流：a.json", text)
+        self.assertTrue(text.startswith(BASE_SYSTEM_PROMPT))
+        self.assertIn(CLOSING_SYSTEM_PROMPT, text, "面板那一段插在收尾要求之前")
+
+    async def test_another_session_does_not_see_this_panels_selection(self) -> None:
+        host = self._host()
+        host._panel_contexts[DEFAULT_SESSION] = describe_context({"workflow": "a.json"})
+
+        self.assertIn("a.json", host._prompt_source(DEFAULT_SESSION)())
+        self.assertNotIn("a.json", host._prompt_source("chat-2")(), "两个会话各聊各的")
+
+    async def test_a_broken_context_is_refused_before_the_turn_starts(self) -> None:
+        # 形状不对的 context 当场报错，别一路带进人设里：面板那边看着一切正常、
+        # 模型这边读到一段半截的话，是最难查的一种（见 test_panel.py 的逐条边界）。
+        host = self._host()
+        for bad in ({"workflows": "a.json"}, {"workflow": 7}, "a.json"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(RpcError) as caught:
+                    await host.agent_chat({"text": "问一句", "context": bad}, _Ctx())
+                self.assertEqual(caught.exception.code, INVALID_PARAMS)
+
+        self.assertEqual(host._turns, {}, "被拒的那一轮没占在飞表")
+        self.assertEqual(host._panel_contexts, {}, "被拒的那一轮一个字都不留")
 
 
 class ServerCancelTests(unittest.IsolatedAsyncioTestCase):

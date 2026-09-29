@@ -29,7 +29,7 @@ from comfy_studio.agent import (
 )
 from comfy_studio.mcp import McpHub
 from comfy_studio.rpc import INVALID_PARAMS, RpcError
-from comfy_studio.server import StudioHost
+from comfy_studio.server import DEFAULT_SESSION, StudioHost
 from comfy_studio.skills import SkillCatalog
 
 
@@ -319,7 +319,7 @@ class HostAgentTests(unittest.IsolatedAsyncioTestCase):
     async def test_switch_changes_the_prompt_every_session_will_use(self) -> None:
         _write(self.dir, "a.md", "# 甲\n> 我是甲\n\n只讲一句话：先定镜头。\n")
         host = self._host()
-        source = host._prompt_source()
+        source = host._prompt_source(DEFAULT_SESSION)
         before = source()
         self.assertEqual(before, DEFAULT_SYSTEM_PROMPT)
 
@@ -340,7 +340,7 @@ class HostAgentTests(unittest.IsolatedAsyncioTestCase):
         host = self._host()
         await host.agent_agent({"agent": "a"}, None)  # type: ignore[arg-type]
         await host.agent_agent({"agent": GENERAL_AGENT_ID}, None)  # type: ignore[arg-type]
-        self.assertEqual(host._prompt_source()(), DEFAULT_SYSTEM_PROMPT)
+        self.assertEqual(host._prompt_source(DEFAULT_SESSION)(), DEFAULT_SYSTEM_PROMPT)
 
     async def test_reading_the_current_agent_does_not_change_it(self) -> None:
         result = await self._host().agent_agent({}, None)  # type: ignore[arg-type]
@@ -373,7 +373,7 @@ class HostAgentTests(unittest.IsolatedAsyncioTestCase):
 
         # 人设读不出来时**当场报错**，不悄悄退回通用助手 —— 用户写的那份被吞掉才是最坏的结果。
         with self.assertRaises(AgentError) as caught:
-            host._prompt_source()()
+            host._prompt_source(DEFAULT_SESSION)()
         self.assertIn("a", str(caught.exception))
 
     async def test_a_broken_file_stays_visible_in_the_listing(self) -> None:

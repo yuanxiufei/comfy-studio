@@ -70,6 +70,9 @@ const RENDER_RUN_ID = 'comfy-desktop-studio-chat-render-run'
 const RENDER_ARGS_ID = 'comfy-desktop-studio-chat-render-args'
 const RENDER_ARG_PREFIX = 'comfy-desktop-studio-chat-render-arg-'
 const RENDER_IMAGES_ID = 'comfy-desktop-studio-chat-render-images'
+const WORKFLOW_ID = 'comfy-desktop-studio-chat-workflow'
+const WORKFLOW_EDIT_ID = 'comfy-desktop-studio-chat-workflow-edit'
+const WORKFLOW_NEW_ID = 'comfy-desktop-studio-chat-workflow-new'
 const FIND_ID = 'comfy-desktop-studio-chat-find'
 const FIND_COUNT_ID = 'comfy-desktop-studio-chat-find-count'
 const FIND_PREV_ID = 'comfy-desktop-studio-chat-find-prev'
@@ -79,6 +82,16 @@ const NOVEL_BATCH_ID = 'comfy-desktop-studio-novel-batch'
 const NOVEL_BATCH_ALL_ID = 'comfy-desktop-studio-novel-batch-all'
 const NOVEL_BATCH_NONE_ID = 'comfy-desktop-studio-novel-batch-none'
 const NOVEL_BATCH_DELETE_ID = 'comfy-desktop-studio-novel-batch-delete'
+const WORKBENCH_VIEW_ID = 'comfy-desktop-studio-workbench-view'
+const WORKBENCH_HINT_ID = 'comfy-desktop-studio-workbench-hint'
+const WORKBENCH_OVERVIEW_ID = 'comfy-desktop-studio-workbench-overview'
+const WORKBENCH_PROJECT_ID = 'comfy-desktop-studio-workbench-project'
+const WORKBENCH_STEPS_ID = 'comfy-desktop-studio-workbench-steps'
+const WORKBENCH_DETAIL_ID = 'comfy-desktop-studio-workbench-detail'
+const WORKBENCH_READER_ID = 'comfy-desktop-studio-workbench-reader'
+const WORKBENCH_EDIT_ID = 'comfy-desktop-studio-workbench-edit'
+const WORKBENCH_SAVE_ID = 'comfy-desktop-studio-workbench-save'
+const WORKBENCH_SAVE_HINT_ID = 'comfy-desktop-studio-workbench-save-hint'
 
 interface StudioBridge {
   status: ReturnType<typeof vi.fn>
@@ -247,6 +260,16 @@ describe('getComfyStudioChatContentScript', () => {
   it('returns a syntactically valid, self-contained IIFE', () => {
     expect(script.startsWith('(function () {')).toBe(true)
     expect(() => new Function(script)).not.toThrow()
+  })
+
+  it('keeps the backslashes the injected regexes need', () => {
+    // 这一段 JS 住在 TS 模板字符串里：源码里写 `\s`，注入前会被模板那层先吃掉、变成字面的 s，
+    // 所以反斜杠要写两遍（这个坑踩过几回，见脚本里那几处注释）。这里把出图落点那两个正则钉死：
+    // 少写一遍的话 `[\\/]` 会退化成只匹配正斜杠 —— Windows 路径那道判断就形同虚设，
+    // 而它挡的是"把图落进一个拼歪的目录"这种不报错的错。
+    expect(script).toContain("replace(/[\\\\/]+$/, '')")
+    expect(script).toContain('/^[a-zA-Z]:[\\\\/]/')
+    expect(script).not.toContain("replace(/[\\/]+$/, '')")
   })
 
   it('injects nothing and keeps no state when the studio bridge is absent', () => {
@@ -3598,7 +3621,10 @@ describe('getComfyStudioChatContentScript', () => {
       // 发出去的是"引用块 + 空一行 + 用户自己的话"：块里带位置，模型要自己去翻全文时有入口。
       expect(bridge.request).toHaveBeenCalledWith('agent/chat', {
         text: '[引用 长夜.txt 0 800]\n原文0-800\n[/引用]\n\n照这个写',
-        session_id: 'default'
+        session_id: 'default',
+        // 他这会儿正开着 长夜.txt 在读，这一轮就把它一起带上：引用块里写的文件名是"这一条
+        // 引用"，而面板上开着哪一篇是另一件事（见 chatContext）。
+        context: { novel: '长夜.txt' }
       })
       expect(view(QUOTE_BAR_ID).style.display, '发出去了，卡就不再挂着').toBe('none')
       const bubble = rows('user')[0]
@@ -3676,7 +3702,9 @@ describe('getComfyStudioChatContentScript', () => {
 
       expect(bridge.request).toHaveBeenCalledWith('agent/chat', {
         text: '就这些，不加原文了',
-        session_id: 'default'
+        session_id: 'default',
+        // 引用卡丢光了，可面板上那篇原文还开着：这句话里的"原文"只剩这一个落点。
+        context: { novel: '长夜.txt' }
       })
     })
 
@@ -4575,6 +4603,201 @@ describe('getComfyStudioChatContentScript', () => {
 
       expect(runCalls(bridge)).toHaveLength(1)
       expect(document.getElementById(STATUS_ID)?.textContent).toContain('还在跑')
+    })
+  })
+
+  describe('工作流目录（选中 + 交给对话）', () => {
+    /**
+     * 宿主 workflows/list 里的一份图（形状见 lib/comfy_studio/workflows.py 的 to_json）：
+     * `usedBy` 为空说明这张图还没登记成渲染目标 —— 那正是这一行存在的理由。
+     *
+     * 注意键名与 renders/list **不一样**：那边是 snake_case 的 workflows_dir，这边是
+     * workflowsDir（见 server.py 的 workflows_list）。桩按后者写，面板也得按后者取。
+     */
+    const entry = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+      file: '01_角色定妆板_Qwen2512.json',
+      bytes: 20480,
+      modified: '2026-09-20 11:02:31',
+      digest: 'a'.repeat(64),
+      usedBy: [],
+      ...over
+    })
+
+    const listing = (files: unknown[], over: Record<string, unknown> = {}): unknown => ({
+      ok: true,
+      result: {
+        workflowsDir: 'D:/comfy/user/default/workflows/AIGC中国风漫剧',
+        note: null,
+        files,
+        ...over
+      }
+    })
+
+    /** 只有 workflows/* 那件事走自己的桩；开抽屉要问的那些保持默认。 */
+    const host =
+      (handlers: Record<string, unknown>): RequestStub =>
+      (method, params) =>
+        method in handlers
+          ? typeof handlers[method] === 'function'
+            ? (handlers[method] as RequestStub)(method, params)
+            : handlers[method]
+          : { ok: true, result: { text: '答案在此' } }
+
+    const picker = (): HTMLSelectElement =>
+      document.getElementById(WORKFLOW_ID) as HTMLSelectElement
+    const editButton = (): HTMLButtonElement =>
+      document.getElementById(WORKFLOW_EDIT_ID) as HTMLButtonElement
+    const newButton = (): HTMLButtonElement =>
+      document.getElementById(WORKFLOW_NEW_ID) as HTMLButtonElement
+    const input = (): HTMLTextAreaElement =>
+      document.getElementById(INPUT_ID) as HTMLTextAreaElement
+    const calls = (bridge: StudioBridge, method: string): unknown[][] =>
+      bridge.request.mock.calls.filter((call: unknown[]) => call[0] === method)
+
+    /** 开面板（默认停在对话页），顺带把下拉选到某一份上。 */
+    const openWith = async (files: unknown[], pick = ''): Promise<{ bridge: StudioBridge }> => {
+      const bridge = installBridge({ request: host({ 'workflows/list': listing(files) }) })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      if (pick !== '') {
+        picker().value = pick
+        picker().dispatchEvent(new Event('change'))
+      }
+      return { bridge }
+    }
+
+    it('lists every file in the directory, including the ones nothing is using yet', async () => {
+      await openWith([
+        entry({ usedBy: ['渲染目标 character-board'] }),
+        entry({ file: '我的试验.json', bytes: 3145728 })
+      ])
+
+      // 渲染那一行只覆盖登记过的 12 张，这一行是**整个目录**：用户自己存的图也得能选出来。
+      expect(picker().options).toHaveLength(2)
+      expect(picker().options[1]?.textContent).toBe('我的试验.json')
+      expect(picker().options[0]?.title).toContain('渲染目标 character-board')
+      expect(picker().options[1]?.title).toContain('还没登记成渲染目标')
+      expect(picker().options[1]?.title).toContain('3.0 MB')
+    })
+
+    it('hands the picked file to the composer, and sends nothing on its own', async () => {
+      const { bridge } = await openWith([entry()])
+
+      editButton().click()
+
+      // 这一行的产物是一句话，不是一次写入：写图的是对话里模型手上那几把 MCP 工具。
+      expect(input().value).toBe('改一下工作流「01_角色定妆板_Qwen2512.json」')
+      expect(calls(bridge, 'agent/chat'), 'nothing is sent for the user').toHaveLength(0)
+      expect(calls(bridge, 'workflows/list'), 'the panel only ever reads').toHaveLength(1)
+      expect(document.getElementById(STATUS_ID)?.textContent).toContain('补上要改哪儿再发')
+    })
+
+    it('appends to a half-typed sentence instead of overwriting it', async () => {
+      await openWith([entry()])
+
+      input().value = '把背景换成雪天'
+      editButton().click()
+
+      expect(input().value).toBe('把背景换成雪天\n改一下工作流「01_角色定妆板_Qwen2512.json」')
+    })
+
+    it('names the picked file as the reference when making a new one', async () => {
+      await openWith([entry()])
+
+      newButton().click()
+
+      // 新建不是改它：选中的那份只当参照，模型该建一份新的（见 workflowToChat）。
+      expect(input().value).toBe('新建一份工作流，参照「01_角色定妆板_Qwen2512.json」')
+    })
+
+    it('keeps the pick across the re-read that follows every turn', async () => {
+      const { bridge } = await openWith([entry({ file: 'a.json' }), entry({ file: 'b.json' })])
+
+      picker().value = 'b.json'
+      picker().dispatchEvent(new Event('change'))
+      const readsBefore = calls(bridge, 'workflows/list').length
+
+      await send('就按这个来')
+
+      // 一轮过后模型可能刚改过或新建过一份图：清单重读一次（否则下拉停在旧世界上），
+      // 但**不替用户改选择** —— 拨回第一份等于把下一步要改的那份换掉了。
+      expect(calls(bridge, 'workflows/list').length).toBe(readsBefore + 1)
+      expect(picker().value).toBe('b.json')
+    })
+
+    it('tells the host what the panel has picked when a turn goes out', async () => {
+      const { bridge } = await openWith([entry({ file: 'a.json' }), entry({ file: 'b.json' })])
+
+      picker().value = 'b.json'
+      picker().dispatchEvent(new Event('change'))
+      await send('就按这个来')
+
+      // 选中态随这一轮带出去：没有 context，"就按这个来"里的"这个"全靠模型猜
+      // （宿主把它拼进这一段的人设，见 lib/comfy_studio/panel.py）。
+      expect(calls(bridge, 'agent/chat')[0]?.[1]).toMatchObject({
+        text: '就按这个来',
+        session_id: 'default',
+        context: {
+          workflow: 'b.json',
+          workflows_dir: 'D:/comfy/user/default/workflows/AIGC中国风漫剧'
+        }
+      })
+    })
+
+    it('sends no context at all when nothing is picked', async () => {
+      const { bridge } = await openWith([])
+
+      await send('随便聊聊')
+
+      // 空目录时下拉里只有一条 value='' 的占位项：那不是"选中了一份图"，所以**整个键都不带**
+      // （老形状一字不变；宿主那边"缺这个键"与"空对象"是同一个意思）。
+      expect(calls(bridge, 'agent/chat')[0]?.[1]).not.toHaveProperty('context')
+    })
+
+    it('says so when the directory has no workflow at all', async () => {
+      await openWith([])
+
+      expect(picker().options[0]?.textContent).toBe('（工作流目录里没有 .json）')
+      expect(picker().disabled).toBe(true)
+      expect(editButton().disabled).toBe(true)
+      expect(newButton().disabled).toBe(true)
+    })
+
+    it('keeps the directory and the engine note on the picker instead of hiding them', async () => {
+      installBridge({
+        request: host({
+          'workflows/list': listing([], {
+            workflowsDir: 'D:/nowhere/workflows',
+            note: '这个目录不存在；可以用 COMFY_STUDIO_WORKFLOWS 指定它'
+          })
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      // 目录不在时清单就是空的，那得让人看得见图该去哪儿找 —— 面板照引擎说的原样写。
+      expect(picker().title).toContain('D:/nowhere/workflows')
+      expect(picker().title).toContain('这个目录不存在')
+    })
+
+    it('puts the failure on the picker when the host cannot read the directory', async () => {
+      installBridge({
+        request: host({
+          'workflows/list': {
+            ok: false,
+            error: { code: -32603, message: '工作流清单读不了：引擎没起来' }
+          }
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      expect(picker().options[0]?.textContent).toBe('（工作流目录里没有 .json）')
+      expect(picker().title).toContain('读工作流清单失败')
+      expect(picker().title).toContain('引擎没起来')
     })
   })
 
@@ -5964,6 +6187,33 @@ describe('getComfyStudioChatContentScript', () => {
     const asks = (bridge: StudioBridge, method: string): unknown[][] =>
       bridge.request.mock.calls.filter((call: unknown[]) => call[0] === method)
 
+    /** 宿主 renders/list 里的一条目标（形状见 lib/comfy_studio/renders/catalog.py 的 to_json）。 */
+    const renderTarget = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+      id: 'character-sheet',
+      title: '角色定妆板（Qwen-Image 2512）',
+      file: '01_角色定妆板_Qwen2512.json',
+      fileExists: true,
+      tags: ['image'],
+      referenceImages: false,
+      params: [],
+      ...over
+    })
+
+    const renders = (targets: unknown[]): unknown => ({
+      ok: true,
+      result: {
+        workflows_dir: 'D:/comfy/user/default/workflows/AIGC中国风漫剧',
+        note: null,
+        targets
+      }
+    })
+
+    /** 阶段卡上那排「去出图」（宿主绑了图才有这排，见注入脚本的 pipeRenderRow）。 */
+    const renderButtons = (code: string): HTMLButtonElement[] =>
+      Array.from(
+        card(code)?.querySelectorAll<HTMLButtonElement>('.cs-pipe-render button') ?? []
+      )
+
     const openPipeline = async (): Promise<void> => {
       tab('流水线')?.click()
       await flush()
@@ -6008,6 +6258,177 @@ describe('getComfyStudioChatContentScript', () => {
       expect(card('S0')?.textContent).not.toContain('跑完还要回引擎侧')
       // 「哪几段跑完还得渲染」在总览那一行也报一遍：扫一眼就够，不用一段段翻。
       expect(view(PIPELINE_OVERVIEW_ID).textContent).toContain('S2')
+    })
+
+    it('binds the stage to the workflows the host named, and runs one from the card', async () => {
+      const bridge = installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'pipeline/plan': plan({
+            // 项目根是绝对路径（真实载荷如此，见 pipeline.py 的 plan_payload / steps_payload）：
+            // 出图时把它拼在落点前面当 output_dir，图才落得进项目。
+            project: 'D:/戏/长夜',
+            stages: [
+              stage('S0'),
+              stage('S1'),
+              stage('S2', {
+                needs_render: true,
+                actor: '分镜智能体',
+                render_targets: ['character-sheet', 'scene-card'],
+                // 落点按目标分开给：角色那格与场景那格不是一个目录（见 STAGE_RENDER）。
+                render_lands: { 'character-sheet': '02_CHARACTERS', 'scene-card': '05_ENVIRONMENTS' },
+                render_note: '角色/服装/道具走定妆板，场景走设定卡'
+              })
+            ]
+          }),
+          'renders/list': renders([
+            renderTarget(),
+            renderTarget({ id: 'scene-card', title: '场景设定卡', file: '02_场景卡.json' })
+          ]),
+          'renders/run': () => new Promise(() => {})
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openPipeline()
+
+      // 用哪张图是宿主 STAGE_RENDER 绑的：面板不自己挑、也不去猜（认错图不报错，只会出成另一张）。
+      expect(renderButtons('S2').map((b) => b.textContent)).toEqual([
+        '去出图（角色定妆板（Qwen-Image 2512））',
+        '去出图（场景设定卡）'
+      ])
+      // 附言跟着按钮一起画：光看 id 会把话说满（哪一半用它、到哪儿为止都在这一句里）。
+      expect(card('S2')?.textContent).toContain('角色/服装/道具走定妆板，场景走设定卡')
+      // "跑完存哪"按之前就该看得见，而且是**按目标分开**的：两枚按钮各说自己那一格。
+      expect(renderButtons('S2')[0]?.title).toContain('D:/戏/长夜/02_CHARACTERS')
+      expect(renderButtons('S2')[1]?.title).toContain('D:/戏/长夜/05_ENVIRONMENTS')
+      // 一格装不下（S2 就是两种落点）就不顺口说"出完存进" —— 那句话会漏掉另一半。
+      expect(card('S2')?.textContent).not.toContain('出完存进')
+      // 不用出图的那几段一个按钮都没有 —— 摆出来只会让人以为这一步也得回引擎侧出图。
+      expect(card('S0')?.querySelector('.cs-pipe-render')).toBeNull()
+
+      renderButtons('S2')[1]?.click()
+      await flush()
+
+      // 按下去 = 把渲染那一行切到这张图（下拉真换过去了），再走用户自己按「跑一遍」那条路。
+      expect((document.getElementById(RENDER_ID) as HTMLSelectElement).value).toBe('scene-card')
+      expect(view(CHAT_VIEW_ID).style.display, '跑渲染那张卡片在对话页，切过去才看得见').toBe('flex')
+      expect(asks(bridge, 'renders/run')[0]?.[1]).toMatchObject({
+        target_id: 'scene-card',
+        // 落点拼上项目根交给渲染：图才会落进这一段体检真看的目录，卡片上「还缺图」当场就消。
+        output_dir: 'D:/戏/长夜/05_ENVIRONMENTS'
+      })
+    })
+
+    it('says the bound workflow is missing instead of drawing a dead button', async () => {
+      installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'pipeline/plan': plan({
+            stages: [
+              stage('S0'),
+              stage('S1'),
+              stage('S2', {
+                needs_render: true,
+                render_targets: ['character-sheet', 'scene-card'],
+                render_lands: { 'character-sheet': '02_CHARACTERS', 'scene-card': '05_ENVIRONMENTS' }
+              })
+            ]
+          }),
+          // 引擎那份清单里只有一张：另一张（改名了、或者这一版没有）不能画成能按的按钮。
+          // 宿主核对不了引擎的清单（两边分开装，见 pipeline.py 的 STAGE_RENDER），这里是兜底。
+          'renders/list': renders([renderTarget()])
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openPipeline()
+
+      expect(renderButtons('S2').map((b) => b.textContent)).toEqual([
+        '去出图（角色定妆板（Qwen-Image 2512））'
+      ])
+      const text = card('S2')?.textContent ?? ''
+      expect(text).toContain('引擎那份清单里没有：scene-card')
+      expect(text, '说清为什么少一枚，而不是留一行空的').toContain('引擎没起来，或者图改名了')
+    })
+
+    it('says where the shots land when the stage has one landing for all of them', async () => {
+      const bridge = installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'pipeline/plan': plan({
+            project: 'D:/戏/长夜',
+            stages: [
+              stage('S0'),
+              stage('S1'),
+              stage('S5', {
+                needs_render: true,
+                render_targets: ['video-draft', 'video-final'],
+                render_lands: { 'video-draft': '09_SHOTS', 'video-final': '09_SHOTS' },
+                render_note: '先试片（768p）看提示词对不对，再上正片'
+              })
+            ]
+          }),
+          'renders/list': renders([
+            renderTarget({ id: 'video-draft', title: '视频 768p 试片', file: '05_试片.json', tags: ['video'] }),
+            renderTarget({ id: 'video-final', title: '视频 1080p 正片', file: '06_正片.json', tags: ['video'] })
+          ]),
+          'renders/run': () => new Promise(() => {})
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openPipeline()
+
+      // 几张图落同一格时顺口说一句：这一段的体检只看 09_SHOTS 而已。
+      expect(card('S5')?.textContent).toContain('出完存进 09_SHOTS')
+
+      renderButtons('S5')[0]?.click()
+      await flush()
+
+      expect(asks(bridge, 'renders/run')[0]?.[1]).toMatchObject({
+        target_id: 'video-draft',
+        output_dir: 'D:/戏/长夜/09_SHOTS'
+      })
+    })
+
+    it('does not guess an output dir when the project path is not absolute', async () => {
+      const bridge = installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          // 项目根是相对的：拼出来会相对于**引擎那边的当前目录**，图就落进一个谁也没打算的
+          // 地方，而且不报错 —— 与"落点绑错"是同一种错法。
+          'pipeline/plan': plan({
+            project: '长夜',
+            stages: [
+              stage('S0'),
+              stage('S1'),
+              stage('S2', {
+                needs_render: true,
+                render_targets: ['character-sheet'],
+                render_lands: { 'character-sheet': '02_CHARACTERS' }
+              })
+            ]
+          }),
+          'renders/list': renders([renderTarget()]),
+          'renders/run': () => new Promise(() => {})
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openPipeline()
+
+      expect(renderButtons('S2')[0]?.title).not.toContain('另存进')
+
+      renderButtons('S2')[0]?.click()
+      await flush()
+
+      // 宁可让它落引擎自己的 output/：送进一个拼歪的目录更糟，而且没人会知道。
+      expect(asks(bridge, 'renders/run')[0]?.[1]).not.toHaveProperty('output_dir')
     })
 
     it('marks the stages the host recorded as settled', async () => {
@@ -6327,12 +6748,13 @@ describe('getComfyStudioChatContentScript', () => {
       expect(view(PIPELINE_VIEW_ID).style.display).toBe('flex')
       expect(document.activeElement).toBe(tabOf('pipeline'))
 
-      // 到头了绕回第一页
+      // 到头了绕回第一页 —— 现在排在最前的是「工作台」（它是这条链的入口）
       tabOf('pipeline').dispatchEvent(
         new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true })
       )
       await flush()
-      expect(view(CHAT_VIEW_ID).style.display).toBe('flex')
+      expect(view(WORKBENCH_VIEW_ID).style.display).toBe('flex')
+      expect(document.activeElement).toBe(tabOf('workbench'))
     })
 
     it('says which page each tab stands for', async () => {
@@ -6351,6 +6773,665 @@ describe('getComfyStudioChatContentScript', () => {
       expect(view(CHAT_VIEW_ID).getAttribute('role')).toBe('tabpanel')
       expect(view(PROJECT_VIEW_ID).getAttribute('role')).toBe('tabpanel')
       expect(view(PIPELINE_VIEW_ID).getAttribute('role')).toBe('tabpanel')
+    })
+  })
+
+  describe('工作台', () => {
+    /** 宿主 projects/list 里的一行。这一页只借它填剧目下拉。 */
+    const projectRow = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+      name: '长夜',
+      path: 'D:/comfy/custom_nodes/comfy_studio/manju/projects/长夜',
+      files: 3,
+      missing: [],
+      missing_count: 0,
+      stages: [],
+      stages_done: 1,
+      stages_total: 1,
+      mtime: 1758900000,
+      ...over
+    })
+
+    const listing = (projects: unknown[]): unknown => ({
+      ok: true,
+      result: {
+        dir: 'D:/comfy/custom_nodes/comfy_studio/manju/projects',
+        exists: true,
+        query: '',
+        matched: projects.length,
+        returned: projects.length,
+        truncated: false,
+        limit: 200,
+        projects
+      }
+    })
+
+    /**
+     * pipeline/steps 里的一步。栏名**照宿主 steps_payload 抄** —— 面板画的就是那几栏，
+     * 名字对不上就成了一条永远空着的行。key 与先后也全照宿主的来：这一页不自己编号、
+     * 不自己排一次序，否则"面板说还差第三步、模型说早跑完了"，两边都不报错。
+     */
+    const stepOf = (
+      key: string,
+      name: string,
+      over: Record<string, unknown> = {}
+    ): Record<string, unknown> => ({
+      key,
+      name,
+      goal: '',
+      note: '',
+      needs: [],
+      stages: [],
+      landings: [],
+      count: 0,
+      seed_count: 0,
+      state: 'empty',
+      blocked_by: [],
+      ready: true,
+      ...over
+    })
+
+    /** 一步认领的一个落点格子。 */
+    const landingOf = (
+      rel: string,
+      over: Record<string, unknown> = {}
+    ): Record<string, unknown> => ({
+      rel,
+      title: rel,
+      shelf: '',
+      scope: '',
+      exists: true,
+      files: [],
+      count: 0,
+      seed_count: 0,
+      truncated: false,
+      ...over
+    })
+
+    const fileOf = (rel: string, over: Record<string, unknown> = {}): Record<string, unknown> => ({
+      rel,
+      name: rel.split('/').pop() ?? rel,
+      bytes: 12,
+      mtime: 1758900000,
+      readable: true,
+      seed: false,
+      ...over
+    })
+
+    /** 一步底下的机器阶段（谁做、落哪、要不要回引擎侧渲染，全由这几栏说了算）。 */
+    const stageOf = (
+      code: string,
+      over: Record<string, unknown> = {}
+    ): Record<string, unknown> => ({
+      code,
+      name: code + ' 那一段',
+      owner: 'script',
+      agent: 'studio-script',
+      actor: '剧本智能体',
+      artifact: '落点-' + code,
+      needs_render: false,
+      state: 'todo',
+      agent_name: '剧本智能体',
+      how: '跑 ' + code,
+      ...over
+    })
+
+    const payloadOf = (over: Record<string, unknown> = {}): unknown => ({
+      ok: true,
+      result: {
+        project: 'D:/comfy/custom_nodes/comfy_studio/manju/projects/长夜',
+        name: '长夜',
+        novel: '长夜.txt',
+        linked_novel: '',
+        gaps: [],
+        order: [],
+        current: '',
+        steps: [],
+        render_required: [],
+        ...over
+      }
+    })
+
+    /** 只有工作台那几件事走自己的桩；开抽屉时要问的那些保持默认。 */
+    const host =
+      (handlers: Record<string, unknown>): RequestStub =>
+      (method, params) =>
+        method in handlers
+          ? typeof handlers[method] === 'function'
+            ? (handlers[method] as RequestStub)(method, params)
+            : handlers[method]
+          : { ok: true, result: { text: '答案在此' } }
+
+    const view = (id: string): HTMLElement => document.getElementById(id) as HTMLElement
+    const tab = (label: string): HTMLButtonElement | undefined =>
+      Array.from(document.querySelectorAll<HTMLButtonElement>(`#${TABS_ID} .cs-tab`)).find(
+        (b) => b.textContent === label
+      )
+    const tile = (key: string): HTMLElement | null =>
+      document.querySelector<HTMLElement>(`#${WORKBENCH_STEPS_ID} .cs-wb-step[data-step="${key}"]`)
+    const tiles = (): HTMLElement[] =>
+      Array.from(document.querySelectorAll<HTMLElement>(`#${WORKBENCH_STEPS_ID} .cs-wb-step`))
+    const fileRow = (rel: string): HTMLButtonElement | null =>
+      document.querySelector<HTMLButtonElement>(
+        `#${WORKBENCH_DETAIL_ID} .cs-wb-file[data-rel="${rel}"]`
+      )
+    const edit = (): HTMLTextAreaElement => view(WORKBENCH_EDIT_ID) as HTMLTextAreaElement
+    const save = (): HTMLButtonElement => view(WORKBENCH_SAVE_ID) as HTMLButtonElement
+    const saveHint = (): HTMLElement => view(WORKBENCH_SAVE_HINT_ID)
+    const hint = (): HTMLElement => view(WORKBENCH_HINT_ID)
+    const detail = (): HTMLElement => view(WORKBENCH_DETAIL_ID)
+    const asks = (bridge: StudioBridge, method: string): unknown[][] =>
+      bridge.request.mock.calls.filter((call: unknown[]) => call[0] === method)
+
+    const openWorkbench = async (): Promise<void> => {
+      tab('工作台')?.click()
+      await flush()
+    }
+
+    /** 读一份落点里的资料，并把宿主那一段回话交回给调用处核对。 */
+    const readFile = async (rel: string): Promise<void> => {
+      fileRow(rel)?.click()
+      await flush()
+    }
+
+    /** 一套三步的读数：第一步做完了、第二步还没动、第三步只出了文本。 */
+    const threeSteps = (): Record<string, unknown>[] => [
+      stepOf('parse', '小说文本解析', {
+        state: 'done',
+        count: 3,
+        stages: [stageOf('S0a', { state: 'done' })],
+        landings: [
+          landingOf('00_PROJECT/00_原文解析', {
+            count: 3,
+            files: [fileOf('00_PROJECT/00_原文解析/人物表.md')]
+          })
+        ]
+      }),
+      stepOf('cast', '角色与场景提取', {
+        state: 'empty',
+        needs: ['parse'],
+        blocked_by: ['parse']
+      }),
+      stepOf('board', '分镜脚本', {
+        state: 'partial',
+        count: 1,
+        stages: [stageOf('S4', { state: 'text' })],
+        landings: [
+          landingOf('08_STORYBOARDS', {
+            count: 1,
+            files: [fileOf('08_STORYBOARDS/EP01.md', { bytes: 2048 })]
+          })
+        ]
+      })
+    ]
+
+    it('only asks the host once that page is opened', async () => {
+      const bridge = installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'pipeline/steps': payloadOf({ order: ['parse'], current: 'parse', steps: threeSteps() })
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+
+      expect(view(WORKBENCH_VIEW_ID).style.display).toBe('none')
+      expect(asks(bridge, 'pipeline/steps'), '没打开这一页就别去问它走到第几步了').toHaveLength(0)
+
+      await openWorkbench()
+
+      expect(view(CHAT_VIEW_ID).style.display).toBe('none')
+      expect(view(WORKBENCH_VIEW_ID).style.display).toBe('flex')
+      expect(tab('工作台')?.dataset.active).toBe('true')
+      // 下拉里是宿主 projects/list 那几行，默认挑第一部。
+      expect((view(WORKBENCH_PROJECT_ID) as HTMLSelectElement).value).toBe('长夜')
+      expect(bridge.request).toHaveBeenCalledWith('pipeline/steps', { name: '长夜' })
+    })
+
+    it('paints the steps exactly as the host reported them', async () => {
+      installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'pipeline/steps': payloadOf({
+            order: ['parse', 'cast', 'board'],
+            current: 'cast',
+            steps: threeSteps()
+          })
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openWorkbench()
+
+      // 顺序照宿主 order，名字照宿主 name，数照宿主 count，状态照宿主 state —— 一条都不自己算。
+      expect(tiles().map((one) => one.dataset.step)).toEqual(['parse', 'cast', 'board'])
+      expect(tiles().map((one) => one.querySelector('.cs-wb-step-name')?.textContent)).toEqual([
+        '小说文本解析',
+        '角色与场景提取',
+        '分镜脚本'
+      ])
+      expect(tiles().map((one) => one.querySelector('.cs-wb-step-count')?.textContent)).toEqual([
+        '3',
+        '0',
+        '1'
+      ])
+      expect(tiles().map((one) => one.dataset.state)).toEqual(['done', 'empty', 'partial'])
+      expect(tile('parse')?.textContent).toContain('成了')
+      expect(tile('cast')?.textContent).toContain('还没动')
+      // 「现在该看哪一步」是宿主说的 current，不是第一个没做完的、也不是面板自己数的。
+      expect(tile('cast')?.dataset.current).toBe('1')
+      expect(tile('parse')?.dataset.current).toBeUndefined()
+      // 一格一个序号：人靠它说"第几步"，所以宁可照 order 的下标，也不按数组位置编。
+      expect(tiles().map((one) => one.querySelector('.cs-wb-step-no')?.textContent)).toEqual([
+        '1',
+        '2',
+        '3'
+      ])
+    })
+
+    it('adds up the eight steps from the same reading, and says what is missing', async () => {
+      installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'pipeline/steps': payloadOf({
+            order: ['parse', 'cast', 'board'],
+            current: 'cast',
+            gaps: ['阶段 S9 不在工作台任何一步里'],
+            steps: [
+              stepOf('parse', '小说文本解析', { state: 'done', seed_count: 2 }),
+              stepOf('cast', '角色与场景提取', { state: 'empty' }),
+              stepOf('board', '分镜脚本', {
+                state: 'partial',
+                stages: [stageOf('S4', { state: 'missing' })]
+              })
+            ]
+          })
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openWorkbench()
+
+      const line = view(WORKBENCH_OVERVIEW_ID).textContent ?? ''
+      expect(line).toContain('八步走了 1/3 步')
+      expect(line).toContain('现在该看：角色与场景提取')
+      expect(line).toContain('有 1 段的产物不见了')
+      expect(line).toContain('另有 2 份预置空表（不算进度）')
+      expect(line).toContain('原文：长夜.txt')
+      // gaps 非空是宿主那张步骤表自己的毛病：不说出来，它就只是"少了一步"，没有别的迹象。
+      expect(line).toContain('步骤表对不上（1 处）')
+    })
+
+    it('reads a file whole and writes it back with the digest it read', async () => {
+      const text = '第一镜：雪落长街。'
+      const bridge = installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'pipeline/steps': payloadOf({
+            order: ['board'],
+            current: 'board',
+            steps: [
+              stepOf('board', '分镜脚本', {
+                state: 'partial',
+                stages: [stageOf('S4', { state: 'done' })],
+                landings: [
+                  landingOf('08_STORYBOARDS', {
+                    count: 1,
+                    files: [fileOf('08_STORYBOARDS/EP01.md')]
+                  })
+                ]
+              })
+            ]
+          }),
+          'projects/read': {
+            ok: true,
+            result: {
+              name: '长夜',
+              rel: '08_STORYBOARDS/EP01.md',
+              encoding: 'utf-8',
+              bytes: 24,
+              digest: 'd1',
+              total_chars: text.length,
+              offset: 0,
+              chars: text.length,
+              truncated: false,
+              text
+            }
+          },
+          'projects/write': {
+            ok: true,
+            result: {
+              name: '长夜',
+              rel: '08_STORYBOARDS/EP01.md',
+              bytes: 30,
+              chars: 10,
+              created: false,
+              digest: 'd2'
+            }
+          }
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openWorkbench()
+      await readFile('08_STORYBOARDS/EP01.md')
+
+      // **整份读**：这一栏的目的就是改完写回去，只读一页的话，写回时会把没读到的那半截删掉。
+      expect(bridge.request).toHaveBeenCalledWith('projects/read', {
+        name: '长夜',
+        rel: '08_STORYBOARDS/EP01.md',
+        whole: true
+      })
+      expect(edit().value).toBe(text)
+      expect(edit().readOnly).toBe(false)
+
+      edit().value = '第一镜：雪落长街，灯一盏。'
+      edit().dispatchEvent(new Event('input'))
+      save().click()
+      await flush()
+
+      // 带的是**读进来那一刻**的摘要：宿主拿它核对"我改的是我读到的这一版"。
+      expect(bridge.request).toHaveBeenCalledWith('projects/write', {
+        name: '长夜',
+        rel: '08_STORYBOARDS/EP01.md',
+        text: '第一镜：雪落长街，灯一盏。',
+        base_digest: 'd1'
+      })
+      expect(saveHint().textContent).toBe('写好了。')
+      // 写回之后落点里那份的"多新"变了：重问一遍宿主，但正在编辑的这一栏留着。
+      expect(asks(bridge, 'pipeline/steps')).toHaveLength(2)
+      expect(edit().value).toBe('第一镜：雪落长街，灯一盏。')
+    })
+
+    it('says why the host refused the write instead of overwriting', async () => {
+      const bridge = installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'pipeline/steps': payloadOf({
+            order: ['board'],
+            current: 'board',
+            steps: [
+              stepOf('board', '分镜脚本', {
+                state: 'partial',
+                landings: [
+                  landingOf('08_STORYBOARDS', {
+                    count: 1,
+                    files: [fileOf('08_STORYBOARDS/EP01.md')]
+                  })
+                ]
+              })
+            ]
+          }),
+          'projects/read': {
+            ok: true,
+            result: {
+              name: '长夜',
+              rel: '08_STORYBOARDS/EP01.md',
+              encoding: 'utf-8',
+              digest: 'd1',
+              total_chars: 4,
+              offset: 0,
+              chars: 4,
+              truncated: false,
+              text: '第一镜'
+            }
+          },
+          'projects/write': {
+            ok: false,
+            error: { code: 'conflict', message: '在编辑期间被改过了，请重读一遍' }
+          }
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openWorkbench()
+      await readFile('08_STORYBOARDS/EP01.md')
+
+      edit().value = '第二镜'
+      edit().dispatchEvent(new Event('input'))
+      save().click()
+      await flush()
+
+      // 被拒不是失败，是"你手上这份已经不是最新的"：把宿主那句话说出来，
+      // **不**自作主张地覆盖，也不把人刚打的字清掉。
+      expect(saveHint().textContent).toContain('没写成')
+      expect(saveHint().textContent).toContain('在编辑期间被改过了')
+      expect(saveHint().getAttribute('data-tone')).toBe('error')
+      expect(hint().textContent).toContain('08_STORYBOARDS/EP01.md')
+      expect(edit().value).toBe('第二镜')
+      expect(asks(bridge, 'projects/write')).toHaveLength(1)
+    })
+
+    it('only shows a too-long file, and never writes half of it back', async () => {
+      const bridge = installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'pipeline/steps': payloadOf({
+            order: ['board'],
+            current: 'board',
+            steps: [
+              stepOf('board', '分镜脚本', {
+                state: 'partial',
+                landings: [
+                  landingOf('08_STORYBOARDS', {
+                    count: 1,
+                    files: [fileOf('08_STORYBOARDS/EP01.md')]
+                  })
+                ]
+              })
+            ]
+          }),
+          'projects/read': {
+            ok: true,
+            result: {
+              name: '长夜',
+              rel: '08_STORYBOARDS/EP01.md',
+              encoding: 'utf-8',
+              digest: 'd1',
+              total_chars: 900000,
+              offset: 0,
+              chars: 200000,
+              truncated: true,
+              text: '前面这一段'
+            }
+          }
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openWorkbench()
+      await readFile('08_STORYBOARDS/EP01.md')
+
+      // 半份也"合法"（那是一段更短的完整文本），所以这道拦必须在**这一侧**：
+      // truncated 为真就只给看，保存键直接按下去。
+      expect(edit().readOnly).toBe(true)
+      expect(save().disabled).toBe(true)
+      expect(save().title).toContain('不拿半份写回去')
+      expect(detail().textContent).toContain('只读')
+      expect(detail().textContent).toContain('面板不拿半份写回去')
+
+      // 保存键按下去也不该发出一个写请求：disabled 只是一层皮，真正的拦在这一侧。
+      save().click()
+      await flush()
+      expect(asks(bridge, 'projects/write')).toHaveLength(0)
+    })
+
+    it('asks before dropping unsaved edits when another file is picked', async () => {
+      const bridge = installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'pipeline/steps': payloadOf({
+            order: ['board'],
+            current: 'board',
+            steps: [
+              stepOf('board', '分镜脚本', {
+                state: 'partial',
+                landings: [
+                  landingOf('08_STORYBOARDS', {
+                    count: 2,
+                    files: [fileOf('08_STORYBOARDS/EP01.md'), fileOf('08_STORYBOARDS/EP02.md')]
+                  })
+                ]
+              })
+            ]
+          }),
+          'projects/read': {
+            ok: true,
+            result: {
+              name: '长夜',
+              rel: '08_STORYBOARDS/EP01.md',
+              encoding: 'utf-8',
+              digest: 'd1',
+              total_chars: 4,
+              offset: 0,
+              chars: 4,
+              truncated: false,
+              text: '第一镜'
+            }
+          }
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openWorkbench()
+      await readFile('08_STORYBOARDS/EP01.md')
+
+      edit().value = '改到一半'
+      edit().dispatchEvent(new Event('input'))
+      await readFile('08_STORYBOARDS/EP02.md')
+
+      // 丢字这种事**不会报错**：人只会过一会儿发现刚才写的没了，从此不再信这个编辑框。
+      expect(hint().textContent).toContain('改过还没保存')
+      expect(asks(bridge, 'projects/read')).toHaveLength(1)
+      expect(edit().value).toBe('改到一半')
+    })
+
+    it('drops the file it was holding when another step is picked', async () => {
+      installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'pipeline/steps': payloadOf({
+            order: ['board', 'cut'],
+            current: 'board',
+            steps: [
+              stepOf('board', '分镜脚本', {
+                state: 'partial',
+                landings: [
+                  landingOf('08_STORYBOARDS', {
+                    count: 1,
+                    files: [fileOf('08_STORYBOARDS/EP01.md')]
+                  })
+                ]
+              }),
+              stepOf('cut', '短剧合成', { state: 'empty' })
+            ]
+          }),
+          'projects/read': {
+            ok: true,
+            result: {
+              name: '长夜',
+              rel: '08_STORYBOARDS/EP01.md',
+              encoding: 'utf-8',
+              digest: 'd1',
+              total_chars: 4,
+              offset: 0,
+              chars: 4,
+              truncated: false,
+              text: '第一镜'
+            }
+          }
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openWorkbench()
+      await readFile('08_STORYBOARDS/EP01.md')
+      expect(view(WORKBENCH_EDIT_ID)).not.toBeNull()
+
+      tile('cut')?.click()
+      await flush()
+
+      // 换了一步，手上那份就不是这一步的了：留着的话编辑框里是上一步的正文，
+      // 按下保存会写到**另一个**文件上去（名字对不上，宿主的乐观锁也拦不住）。
+      expect(detail().textContent).toContain('短剧合成')
+      expect(document.getElementById(WORKBENCH_EDIT_ID)).toBeNull()
+      expect(view(WORKBENCH_READER_ID).textContent).toContain('点上面任何一份资料')
+    })
+
+    it('says the upstream it is still waiting on, by name', async () => {
+      installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'pipeline/steps': payloadOf({
+            order: ['parse', 'board'],
+            current: 'board',
+            steps: [
+              stepOf('parse', '小说文本解析', { state: 'empty' }),
+              stepOf('board', '分镜脚本', {
+                state: 'empty',
+                needs: ['parse'],
+                blocked_by: ['parse'],
+                stages: [stageOf('S4', { state: 'todo' })]
+              })
+            ]
+          })
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openWorkbench()
+      tile('board')?.click()
+      await flush()
+
+      // blocked_by 里存的是 key，把 key 原样摆上去（"还等：parse"）等于让人去猜。
+      expect(detail().textContent).toContain('还等：小说文本解析')
+      // 这一步的阶段卡照宿主那几栏念：谁做、落哪、怎么跑。
+      expect(detail().textContent).toContain('S4')
+    })
+
+    it('hands the conversation over to the agent this stage uses', async () => {
+      const bridge = installBridge({
+        request: host({
+          'projects/list': listing([projectRow()]),
+          'pipeline/steps': payloadOf({
+            order: ['board'],
+            current: 'board',
+            steps: [
+              stepOf('board', '分镜脚本', {
+                state: 'empty',
+                stages: [stageOf('S4', { state: 'todo' })]
+              })
+            ]
+          }),
+          'agent/agent': {
+            ok: true,
+            result: { agent: 'studio-storyboard', name: '分镜导演' }
+          }
+        })
+      })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openWorkbench()
+
+      const button = Array.from(
+        document.querySelectorAll<HTMLButtonElement>(`#${WORKBENCH_DETAIL_ID} .cs-proj-btn`)
+      ).find((one) => one.textContent === '用「剧本智能体」')
+      button?.click()
+      await flush()
+
+      expect(bridge.request).toHaveBeenCalledWith('agent/agent', { agent: 'studio-script' })
+      // 换完就切回对话页：留人在这页看着一个已经变了的"人设"，下一步点哪儿都是猜。
+      expect(view(CHAT_VIEW_ID).style.display).toBe('flex')
+      expect(view(WORKBENCH_VIEW_ID).style.display).toBe('none')
     })
   })
 })

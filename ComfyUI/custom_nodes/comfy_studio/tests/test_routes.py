@@ -25,7 +25,7 @@ from ..agent.types import ChatMessage, ToolCall
 from ..engine import EngineError
 from ..skills.render import RENDER_TARGETS, WORKFLOWS_ENV, find_target
 from ..web import WebFetcher
-from .support import FakeEngine, FakeLLM
+from .support import RENDER_DOC, RENDER_OBJECT_INFO, FakeEngine, FakeLLM
 from .test_tools import GENERIC_TOOLS
 
 WORKFLOW_BODY = {"params": {"ckpt_name": "a.safetensors", "positive": "一只猫", "seed": 7}}
@@ -390,17 +390,6 @@ class RouteContractTest(unittest.IsolatedAsyncioTestCase):
                     await (await self.client.post("/comfy-studio/agent/chat", json={"message": "c", "session_id": "s3"})).text()
                     self.assertEqual(sorted(routes._sessions), ["s2", "s3"])
                     self.assertEqual(oldest.messages, [], "被淘汰的会话要清掉历史，别把上下文留在内存里")
-
-
-#: 渲染路由用的一张最小视频图（08 补帧：只留 LoadVideo 一个节点）。真图是开发机上那 12 张，
-#: 这里只验"面板这条路接线通了" —— 真跑视频生成占 GPU，不塞进单测。
-RENDER_DOC = {"nodes": [{"id": 1, "type": "LoadVideo", "mode": 0, "widgets_values": ["in.mp4"]}], "links": []}
-RENDER_OBJECT_INFO = {
-    "LoadVideo": {
-        "input": {"required": {"file": [["in.mp4"], {"video_upload": True}]}},
-        "output": ["VIDEO"],
-    },
-}
 
 
 class RenderRouteTest(RouteContractTest):

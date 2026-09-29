@@ -15,7 +15,7 @@ from ..mcp.tools import Tool, build_tools, error_result, schema_for, skill_entry
 from ..skills import SkillRegistry, load_skills, WORKFLOWS_DIR
 from ..skills.render import RENDER_TARGETS, WORKFLOWS_ENV, RenderError, find_target
 from ..skills.types import SkillParam
-from .support import FakeEngine, WORKFLOW, make_skill
+from .support import RENDER_DOC, RENDER_OBJECT_INFO, FakeEngine, WORKFLOW, make_skill
 
 
 def registry_of(skills: tuple[Any, ...]) -> SkillRegistry:
@@ -34,6 +34,11 @@ GENERIC_TOOLS = [
     "comfy_interrupt",
     "comfy_list_renders",
     "comfy_render",
+    # 工作流库：对着工作流目录里**存成文件**的 UI 图做增删改查（see skills/workflows.py）。
+    # 它们排在渲染那两把之后，因为先说清"有哪些现成的目标"，再说"目录里其余的图怎么改"。
+    "comfy_list_workflows",
+    "comfy_read_workflow",
+    "comfy_write_workflow",
 ]
 
 
@@ -374,20 +379,12 @@ class SaveSkillToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(skill.tags, ("人像",))
 
 
-#: 渲染工具用的一张最小视频图（08 补帧：只留 LoadVideo 一个节点）。
-#: 真图是开发机上那 12 张（见 ``skills/render.py`` 的目标表）；这里只验"接线通了" ——
-#: 真跑一次视频生成是真的占 GPU，不该塞进单测。
-RENDER_DOC = {"nodes": [{"id": 1, "type": "LoadVideo", "mode": 0, "widgets_values": ["in.mp4"]}], "links": []}
-RENDER_OBJECT_INFO = {
-    "LoadVideo": {
-        "input": {"required": {"file": [["in.mp4"], {"video_upload": True}]}},
-        "output": ["VIDEO"],
-    },
-}
-
-
 class RenderToolsTest(unittest.IsolatedAsyncioTestCase):
-    """渲染工具：与 ``skills/render.py`` 同源；参数不过关先报错，绝不提交半张图。"""
+    """渲染工具：与 ``skills/render.py`` 同源；参数不过关先报错，绝不提交半张图。
+
+    图上那份骨架（``support.RENDER_DOC``）与参数表指向同一批节点 —— 它们对不上时
+    ``build_render_skill`` 会报错，所以夹具不能比真图少注入点。
+    """
 
     def setUp(self) -> None:
         self._tmpdir = tempfile.TemporaryDirectory(prefix="comfy-studio-renders-")

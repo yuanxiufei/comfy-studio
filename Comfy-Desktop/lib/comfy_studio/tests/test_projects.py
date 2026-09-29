@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -29,6 +30,8 @@ from comfy_studio import projects as projects_module
 from comfy_studio.mcp import McpError, McpHub
 from comfy_studio.novels import MANJU_REL
 from comfy_studio.projects import (
+    DEFAULT_READ_CHARS,
+    MAX_READ_CHARS,
     MAX_TREE_FILES,
     PROJECT_SHELVES,
     PROJECT_SUBDIR,
@@ -408,6 +411,37 @@ class ProjectsLibraryTest(unittest.TestCase):
         self.assertFalse(tail["truncated"])
         self.assertEqual(tail["chars"], 3)
 
+    def test_read_whole_hands_back_the_whole_file(self) -> None:
+        # 工作台那一栏要"整份读来改"：面板只说 whole，不抄这里的上限（40 万字也是这里给的）。
+        self.library.create("剧丁二")
+        script = self.root / "剧丁二/00_PROJECT/01_剧本/第01集.md"
+        body = "场" * (DEFAULT_READ_CHARS + 500)
+        script.write_bytes(body.encode("utf-8"))
+        # 不带 whole：照默认一页，后面的字没上来。
+        page = self.library.read("剧丁二", "00_PROJECT/01_剧本/第01集.md")
+        self.assertEqual(page["chars"], DEFAULT_READ_CHARS)
+        self.assertTrue(page["truncated"])
+        # 带 whole：整份都在手上，可以原样写回去。
+        whole = self.library.read("剧丁二", "00_PROJECT/01_剧本/第01集.md", whole=True)
+        self.assertEqual(whole["text"], body)
+        self.assertFalse(whole["truncated"])
+        self.assertEqual(whole["offset"], 0)
+        # offset / chars 是翻页用的，whole 那一趟不该被它们带偏。
+        again = self.library.read(
+            "剧丁二", "00_PROJECT/01_剧本/第01集.md", 10, 5, whole=True
+        )
+        self.assertEqual(again["text"], body)
+        # 比上限还长的：whole 也读不完，truncated 仍然是真 —— 这一份就只能看不能改。
+        (self.root / "剧丁二/00_PROJECT/01_剧本/第02集.md").write_bytes(
+            ("长" * (MAX_READ_CHARS + 10)).encode("utf-8")
+        )
+        long_page = self.library.read("剧丁二", "00_PROJECT/01_剧本/第02集.md", whole=True)
+        self.assertEqual(long_page["chars"], MAX_READ_CHARS)
+        self.assertTrue(long_page["truncated"])
+        with self.assertRaises(ProjectsError) as err:
+            self.library.read("剧丁二", "00_PROJECT/01_剧本/第01集.md", whole="是")
+        self.assertIn("whole", str(err.exception))
+
     def test_read_judges_the_encoding_instead_of_guessing(self) -> None:
         # 剧本常常不是 UTF-8（老编辑器、从别处贴来的）：编码是**判**出来的，
         # 判出来是什么就如实说什么，判不出来就报错 —— 不交一屏乱码。
@@ -435,6 +469,140 @@ class ProjectsLibraryTest(unittest.TestCase):
             with self.subTest(chars=chars):
                 with self.assertRaises(ProjectsError):
                     self.library.read("剧己", "00_PROJECT/06_对白/对白表_EP01.md", 0, chars)
+
+    # ---- 改一份资料 -----------------------------------------------------
+
+    def test_write_needs_the_digest_instead_of_guessing(self) -> None:
+        """没读过就写 = **拒写**，不是"照写不误"。
+
+        "我没读过"与"我读过、它没变"是两件事。把前者当后者，一次盲写就盖掉了别人
+        （智能体、生成脚本）刚写进去的东西，而面板上什么都不会报 —— 所以就当场拒。
+        """
+        self.library.create("剧甲二")
+        rel = "00_PROJECT/06_对白/对白表_EP01.md"
+        before = (self.root / "剧甲二" / rel).read_text(encoding="utf-8")
+        with self.assertRaises(ProjectsError) as err:
+            self.library.write("剧甲二", rel, "抢写")
+        self.assertIn("得先读一遍", str(err.exception))
+        with self.assertRaises(ProjectsError) as loose:
+            self.library.write("剧甲二", rel, "抢写", 5)
+        self.assertIn("base_digest 必须是字符串", str(loose.exception))
+        self.assertEqual((self.root / "剧甲二" / rel).read_text(encoding="utf-8"), before)
+
+    def test_write_creates_a_new_artifact_only_when_it_is_really_absent(self) -> None:
+        """``base_digest == ""`` 的意思是"我读到的是它还不存在"：真不在才让写。
+
+        这期间有人建了一份同名文件就**拒写**（绝不覆盖）—— 建产物与改产物是两件事，
+        把前者当成后者的后果是把别人的东西删成一句话。
+        """
+        self.library.create("剧乙二")
+        rel = "08_STORYBOARDS/分镜表.md"
+        made = self.library.write("剧乙二", rel, "第一镜：全景。\n", "")
+        self.assertTrue(made["created"])
+        self.assertEqual(
+            (self.root / "剧乙二" / rel).read_text(encoding="utf-8"), "第一镜：全景。\n"
+        )
+        with self.assertRaises(ProjectsError) as err:
+            self.library.write("剧乙二", rel, "又写", "")
+        self.assertIn("已经存在", str(err.exception))
+        self.assertEqual(
+            (self.root / "剧乙二" / rel).read_text(encoding="utf-8"), "第一镜：全景。\n"
+        )
+
+    def test_write_refuses_a_digest_that_moved_under_it(self) -> None:
+        """摘要对不上 = 编辑期间别人改过了。**不合并、不覆盖**，把两边摆出来。
+
+        自动合并冲突在 markdown 上做不对，而"做不对还默默做"正是把一份手改过的分镜表
+        毁掉的方式；所以这里只报错，让人自己决定。
+        """
+        self.library.create("剧丙二")
+        rel = "00_PROJECT/01_剧本/第01集.md"
+        target = self.root / "剧丙二" / rel
+        # 用 write_bytes 而不是 write_text：后者在 Windows 上会把 \n 翻成 \r\n，
+        # 而 digest 是**盘上那些字节**的摘要，翻过之后这条断言就只在 Linux 上成立。
+        target.write_bytes("甲\n乙\n".encode("utf-8"))
+        page = self.library.read("剧丙二", rel)
+        self.assertEqual(
+            page["digest"], hashlib.sha256("甲\n乙\n".encode("utf-8")).hexdigest()
+        )
+        target.write_bytes("甲\n乙\n丙\n".encode("utf-8"))
+        with self.assertRaises(ProjectsError) as err:
+            self.library.write("剧丙二", rel, "甲\n改\n", page["digest"])
+        self.assertIn("被改过了", str(err.exception))
+        self.assertIn(page["digest"][:12], str(err.exception))
+        self.assertEqual(target.read_text(encoding="utf-8"), "甲\n乙\n丙\n")
+        # 重读一遍就能改：守卫拦的是"拿着旧版本硬写"，不是"不许改"。
+        again = self.library.read("剧丙二", rel)
+        out = self.library.write("剧丙二", rel, "甲\n乙\n丙丁\n", again["digest"])
+        self.assertFalse(out["created"])
+        self.assertEqual(target.read_text(encoding="utf-8"), "甲\n乙\n丙丁\n")
+
+    def test_write_keeps_the_line_endings_and_the_encoding_it_found(self) -> None:
+        """行尾与编码**沿用原文件**。
+
+        :meth:`read` 把 ``\\r\\n`` 归一成 ``\\n``；写回不还原的话，在 Windows 上改一个字
+        会让整份文件在 git 里"全变了" —— 下一次 diff review 就没法看了。
+        """
+        self.library.create("剧丁三")
+        rel = "00_PROJECT/01_剧本/第01集.md"
+        target = self.root / "剧丁三" / rel
+        target.write_bytes("甲\r\n乙\r\n".encode("gb18030"))
+        page = self.library.read("剧丁三", rel)
+        self.assertEqual(page["encoding"], "gb18030")
+        out = self.library.write("剧丁三", rel, "甲\n丙\n", page["digest"])
+        self.assertEqual(out["newline"], "crlf")
+        self.assertEqual(out["encoding"], "gb18030")
+        self.assertEqual(target.read_bytes(), "甲\r\n丙\r\n".encode("gb18030"))
+
+    def test_write_refuses_what_it_cannot_serve(self) -> None:
+        """与 :meth:`read` 同一套守卫：越界、二进制、正文不是字符串，一个都不放过去。"""
+        self.library.create("剧戊三")
+        (self.root / "剧戊三/09_SHOTS/第01镜.mp4").write_bytes(b"\x00\x01")
+        with self.assertRaises(ProjectsError) as err:
+            self.library.write("剧戊三", "09_SHOTS/第01镜.mp4", "字", "")
+        self.assertIn("不在这里改", str(err.exception))
+        with self.assertRaises(ProjectsError) as notext:
+            self.library.write("剧戊三", "00_PROJECT/01_剧本/第01集.md", None, "")
+        self.assertIn("必须是字符串", str(notext.exception))
+        for rel in ("../跑出去.md", "..\\跑出去.md", "00_PROJECT/../../跑出去.md"):
+            with self.subTest(rel=rel):
+                with self.assertRaises(ProjectsError) as out:
+                    self.library.write("剧戊三", rel, "字", "")
+                self.assertIn("跑到项目外面", str(out.exception))
+        # 别人刚删了我要改的那一份：报"已经不在了"，不是当成新建悄悄写下去。
+        with self.assertRaises(ProjectsError) as gone:
+            self.library.write("剧戊三", "00_PROJECT/01_剧本/第01集.md", "字", "a" * 64)
+        self.assertIn("已经不在了", str(gone.exception))
+
+    def test_tree_marks_the_premade_blank_tables(self) -> None:
+        """预置空表要被标出来 —— 它是**空模板**，不是"这一步做过了"。
+
+        不标记的失效模式在面板上很难看：刚建完项目，空对白表与真产物长得一模一样，
+        而"阶段工作台"与"资料库"都照着文件数说"这里有料了"。
+        """
+        self.library.create("剧己三")
+        rows = self._dirs("剧己三")
+        dialogue = rows["00_PROJECT/06_对白"]
+        self.assertEqual(dialogue["count"], 1)
+        self.assertEqual(dialogue["seed_count"], 1)
+        self.assertTrue(all(row["seed"] for row in dialogue["files"]))
+        # 第 2 集的空表与第 1 集是同一种东西：按集号放宽，不是逐字相等。
+        (self.root / "剧己三/00_PROJECT/06_对白/对白表_EP02.md").write_text("", encoding="utf-8")
+        again = self._dirs("剧己三")["00_PROJECT/06_对白"]
+        self.assertEqual(again["seed_count"], 2)
+        self.assertEqual(again["count"], 2)
+        # 真产物不会被误标，也不进 seed_count
+        self.library.write("剧己三", "00_PROJECT/06_对白/对白稿_第01集.md", "台词。\n", "")
+        written = self._dirs("剧己三")["00_PROJECT/06_对白"]
+        by_name = {row["name"]: row["seed"] for row in written["files"]}
+        self.assertFalse(by_name["对白稿_第01集.md"])
+        self.assertEqual(written["seed_count"], 2)
+        self.assertEqual(written["count"], 3)
+
+    def _dirs(self, name: str) -> dict:
+        """``tree`` 里所有落点，按相对路径索引。"""
+        tree = self.library.tree(name)
+        return {item["rel"]: item for shelf in tree["shelves"] for item in shelf["dirs"]}
 
     # ---- 越界 -----------------------------------------------------------
 
@@ -617,6 +785,7 @@ class ProjectsRpcTest(unittest.TestCase):
             "projects/create",
             "projects/link_novel",
             "projects/brief",
+            "projects/write",
         ):
             self.assertIn(method, self.host.server.methods)
 
@@ -649,6 +818,28 @@ class ProjectsRpcTest(unittest.TestCase):
         self.assertIn("【项目】流氓天尊", brief["text"])
         self.assertEqual(self.host.projects_list({}, None)["matched"], 1)
 
+    def test_write_over_rpc_round_trips_and_refuses_a_stale_digest(self) -> None:
+        self.host.projects_create({"name": "流氓天尊"}, None)
+        rel = "00_PROJECT/06_对白/对白表_EP01.md"
+        page = self.host.projects_read({"name": "流氓天尊", "rel": rel, "chars": 1}, None)
+        written = self.host.projects_write(
+            {"name": "流氓天尊", "rel": rel, "text": "改了\n", "base_digest": page["digest"]}, None
+        )
+        self.assertFalse(written["created"])
+        self.assertNotEqual(written["digest"], page["digest"])
+        # 拿着读过的旧 digest 再写一次 —— 中间那份文件已经变了，必须拒写。
+        with self.assertRaises(RpcError) as stale:
+            self.host.projects_write(
+                {"name": "流氓天尊", "rel": rel, "text": "又改\n", "base_digest": page["digest"]}, None
+            )
+        self.assertEqual(stale.exception.code, INTERNAL_ERROR)
+        self.assertIn("被改过", stale.exception.message)
+        # 压根没读过就写 —— 等于盲写，拒。
+        with self.assertRaises(RpcError) as blind:
+            self.host.projects_write({"name": "流氓天尊", "rel": rel, "text": "盲写\n"}, None)
+        self.assertEqual(blind.exception.code, INTERNAL_ERROR)
+        self.assertIn("先读一遍", blind.exception.message)
+
     def test_rpc_validates_parameters(self) -> None:
         for method, params in (
             ("projects_tree", {}),
@@ -661,6 +852,11 @@ class ProjectsRpcTest(unittest.TestCase):
             ("projects_create", {"name": "甲", "novel": 7}),
             ("projects_link_novel", {"name": "甲", "novel": "  "}),
             ("projects_brief", {"name": "  "}),
+            ("projects_write", {"name": "甲", "rel": "x.md"}),
+            ("projects_write", {"name": "甲", "rel": "x.md", "text": 5}),
+            ("projects_write", {"name": "甲", "rel": "x.md", "text": "x", "base_digest": 5}),
+            ("projects_write", {"name": "甲", "rel": "  ", "text": "x"}),
+            ("projects_read", {"name": "甲", "rel": "x.md", "whole": 5}),
             ("projects_list", {"name": 5}),
         ):
             with self.subTest(method=method, params=params):

@@ -9,6 +9,12 @@
 ``novels/import``   把本机一份 txt/md 接进原文目录（导入第一本时会把目录建出来）
 ``novels/delete``   删掉一篇（面板先问一次再调它）
 
+**另有给模型看的一组工具**（:data:`NOVELS_TOOLS`，四张，**都只读**）：上面那六个动作是面板
+用的，模型看不到；模型看到的是 ``novels__list`` / ``novels__read`` / ``novels__chapters`` /
+``novels__search``。少了这一组，流水线里每一段提示词写的那句"先读原文"就只是句客气话 ——
+模型手里没有任何能碰到原文的家伙，只能凭前面几段转述过的内容往下编。导入与删除**不给模型**：
+那是"落盘 / 删文件"，由人在面板上按（见 :class:`NovelsClient`）。
+
 **目录从哪来**：漫剧那份业务数据住在引擎侧（``ComfyUI/custom_nodes/comfy_studio/manju/``），
 原文在它的 ``novel/`` 下 —— 落点见 :data:`MANJU_REL`，与 ``.codebuddy/agents/_build.py`` 里那份
 指的是同一个地方。桌面侧只知道 ``--comfyui-dir``，所以默认 =
@@ -34,14 +40,18 @@
 from __future__ import annotations
 
 import codecs
+import json
 import os
 import re
 import shutil
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .cancel import CancelToken
 from .localfiles import is_within
+from .mcp import McpError, McpTool
 
 #: 漫剧业务数据在引擎检出里的相对落点（相对 ``--comfyui-dir``）。
 MANJU_REL = Path("custom_nodes") / "comfy_studio" / "manju"
@@ -633,6 +643,273 @@ def resolve_novel(library: NovelLibrary, name: str) -> str:
     raise NovelsError(f"原文库里没有 {name!r}；现在有的是：{known}")
 
 
+
+# ─────────────────────────────────────────────────────────────
+# 二、给模型的四张工具（**只读**）
+# ─────────────────────────────────────────────────────────────
+
+#: 汇进工具表时的 server 名：模型看到的是 ``novels__list`` / ``novels__read`` / …
+NOVELS_SERVER = "novels"
+
+#: 模型一次最多读多少字。比面板那条上限（:data:`MAX_READ_CHARS`，四万）紧：面板那边是人
+#: 一页页在屏幕上看，多要点没坏处；模型只有**这一条回话**，一次喂两万字以上，就把对话里
+#: 别的材料（上一段的产物、资产表、分镜）挤出去了。超了明确报错、让它按 ``offset`` 翻页，
+#: 不静默截断 —— 截了它多半会把"这一页的结尾"当成"这一章的结尾"。
+TOOL_MAX_READ_CHARS = 20000
+
+#: 模型一次最多要多少处搜索命中。面板上那是一列给人在屏幕前滚的；模型问的多半是
+#: "这段话在哪一章"，几十处足够定位，再多只是把上下文填满。
+TOOL_MAX_SEARCH_LIMIT = 100
+
+
+@dataclass(frozen=True)
+class _Spec:
+    """一张原文工具：工具名 + 说明与参数表（与 :class:`comfy_studio.projects._Spec` 同形）。"""
+
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+
+
+#: 四张工具，**都只读**。为什么不是六个动作全给：``import`` / ``delete`` 是"落盘 / 删文件"，
+#: 那是人在面板上按的（导入哪一本、删哪一本，按错了没有后悔药）。
+#: 说明里都写清了"什么时候该用它"：模型挑工具挑错的代价，比它不会用这几张工具还大。
+NOVELS_TOOLS: tuple[_Spec, ...] = (
+    _Spec(
+        name="list",
+        description=(
+            "列出原文书库里有哪些小说，一行一本：书库里的相对名字、字节数、改于何时、"
+            "以及 text 是否为 true（**只有 txt/md 才算原文**，其余后缀也照报，但读不了）。"
+            "要改编哪一本、或用户说「我导入的那本」时先用它确认真实名字 —— 下面三张工具、"
+            "以及流水线每一步的原文，用的都是这个名字。"
+            "返回 exists 为 false 表示这台机器还没导入过原文：**那不是错误**，"
+            "如实说「书库里还没有原文，先在面板上导入一本」，别当成一次失败。"
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "可选：按名字子串过滤（找某一本时用，别把整张表拉回来）",
+                },
+            },
+        },
+    ),
+    _Spec(
+        name="read",
+        description=(
+            "读一篇原文的一页：从第 offset 个字开始，给 chars 个字（默认 4000，最多 20000）。"
+            "返回里带 total_chars / next_offset / at_end —— 长篇要**分页**读：先读开头，"
+            "再拿 next_offset 当下一次的 offset 接着往下读。别指望一次吞完整本："
+            "几十万字塞不进一次回话，也会把后面的活儿挤掉。"
+            "读出来的 text 就是原文本身：分析、提取人物、写剧本都以它为准，不要凭印象复述剧情。"
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "书库里的相对名字（用 list 拿）"},
+                "offset": {
+                    "type": "integer",
+                    "description": "从第几个字开始（默认 0；接着上次读就给 next_offset）",
+                },
+                "chars": {
+                    "type": "integer",
+                    "description": "这一页要多少字（默认 4000，最多 20000）",
+                },
+            },
+            "required": ["name"],
+        },
+    ),
+    _Spec(
+        name="chapters",
+        description=(
+            "把一篇原文切成章节，回每一章的标题、在全文里的起始 offset 与字数。"
+            "**要动某一章（改剧本、拆场景、写分镜）先看这个目录**：拿标题定位章节，"
+            "再用 novels__read 的 offset 精确读那一章 —— 不要凭记忆猜章节号，"
+            "章节的切法是机器认出来的，跟人印象里的分章不一定一样。"
+            "整篇一条标题都没认出来时，返回里的 message 会说明：那时改用 novels__read 翻页，"
+            "或 novels__search 搜一串字跳过去。"
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "书库里的相对名字（用 list 拿）"},
+                "limit": {
+                    "type": "integer",
+                    "description": "最多回几章（默认给全篇；两万章以内够用）",
+                },
+            },
+            "required": ["name"],
+        },
+    ),
+    _Spec(
+        name="search",
+        description=(
+            "在原文里找一串字，回每一处的 offset 与前后各一小段文（片段）。"
+            "用户提「某句话」「他们第一次见面那段」「某某第一次出场」时，用它定位，"
+            "再按 offset 去 novels__read 把上下文补全。"
+            "只看字面：不分词、不忽略大小写 —— 给什么字就找什么字，"
+            "所以关键词要按原文里**可能的长相**写（别写只有你会的简称）。"
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "书库里的相对名字（用 list 拿）"},
+                "query": {"type": "string", "description": "要找的那串字（原文里的一段话）"},
+                "limit": {
+                    "type": "integer",
+                    "description": f"最多回几处（默认 {DEFAULT_SEARCH_LIMIT}，最多 {TOOL_MAX_SEARCH_LIMIT}）",
+                },
+            },
+            "required": ["name", "query"],
+        },
+    ),
+)
+
+
+def _tool_name(args: dict[str, Any], key: str) -> str:
+    """``name`` / ``query`` 这类必填字符串：空的不放行（空名字去翻目录只会翻出一句废话）。"""
+    value = args.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise McpError(f"{key} 必须是非空字符串")
+    return value
+
+
+def _tool_int(
+    args: dict[str, Any], key: str, default: int, *, low: int, high: int
+) -> int:
+    """可选整数参数。``bool`` 挡掉：Python 里 ``True`` 也是 ``int``，放进去会变成 offset=1。"""
+    value = args.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise McpError(f"{key} 必须是整数")
+    if value < low or value > high:
+        raise McpError(f"{key} 要在 {low}..{high} 之间，给的是 {value}")
+    return value
+
+
+def _validate(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """参数在本地先挡一道：形状不对就别去翻目录（与 projects 那一组同一个规矩）。"""
+    if name == "list":
+        query = args.get("name")
+        if query is not None and not isinstance(query, str):
+            raise McpError("name 必须是字符串（子串过滤）")
+        return {"name": query}
+    if name == "read":
+        return {
+            "name": _tool_name(args, "name"),
+            # 上限的取法与 RPC 那边同一个道理：汉字在 UTF-8 里至少占一个字节，
+            # 所以"第几个字"不可能超过字节上限，比它大的 offset 一定是算错了。
+            "offset": _tool_int(args, "offset", 0, low=0, high=MAX_TEXT_BYTES),
+            "chars": _tool_int(
+                args, "chars", DEFAULT_READ_CHARS, low=1, high=TOOL_MAX_READ_CHARS
+            ),
+        }
+    if name == "chapters":
+        return {
+            "name": _tool_name(args, "name"),
+            "limit": _tool_int(
+                args, "limit", DEFAULT_CHAPTER_LIMIT, low=1, high=MAX_CHAPTER_LIMIT
+            ),
+        }
+    if name == "search":
+        return {
+            "name": _tool_name(args, "name"),
+            "query": _tool_name(args, "query"),
+            "limit": _tool_int(
+                args, "limit", DEFAULT_SEARCH_LIMIT, low=1, high=TOOL_MAX_SEARCH_LIMIT
+            ),
+        }
+    raise McpError(f"原文工具表里没有 {name}")
+
+
+@dataclass(frozen=True)
+class NovelsServerConfig:
+    """与 :class:`~comfy_studio.mcp.McpServerConfig` 同形的极小配置：这里只需要名字。"""
+
+    name: str = NOVELS_SERVER
+
+
+class NovelsClient:
+    """鸭子型 MCP client：形状与 :class:`~comfy_studio.mcp.client.McpStdioClient` 一致，
+    好直接汇进 :class:`~comfy_studio.mcp.McpHub` 的工具表（与项目 / 画布 / 本地文件 / 记忆同一个做法）。
+
+    它把 :class:`NovelLibrary` 的四张只读工具端给模型。**同一个书库、同一套越界检查**：
+    :meth:`NovelLibrary._resolve` 挡 ``../`` 那类名字，这里不再实现一遍 ——
+    两面各写一套"什么名字算存在"，早晚会分家。
+    """
+
+    def __init__(self, library: NovelLibrary, config: NovelsServerConfig | None = None) -> None:
+        self.library = library
+        self.config = config if config is not None else NovelsServerConfig()
+
+    @property
+    def alive(self) -> bool:
+        return True
+
+    def stderr_tail(self) -> str:
+        return ""
+
+    async def start(self) -> None:
+        """没有子进程要拉：这张工具表一直都在。"""
+
+    async def close(self) -> None:
+        """没有连接要关；原文就是磁盘上的文件，随时可以再读。"""
+
+    async def list_tools(self) -> list[McpTool]:
+        return [
+            McpTool(
+                server=self.config.name,
+                name=spec.name,
+                description=spec.description,
+                input_schema=spec.input_schema,
+            )
+            for spec in NOVELS_TOOLS
+        ]
+
+    async def call_tool(
+        self, name: str, arguments: dict[str, Any], *, cancel: CancelToken | None = None
+    ) -> dict[str, Any]:
+        """跑一个只读动作。
+
+        ``cancel`` 收下但不用：四个动作都是**本地读盘**（最慢的一步是把整篇解出来判编码，
+        也就几秒），没有可中断的长等待 —— 为它加一套取消，比它能省下的那点时间贵。
+
+        失败分两路，**两路都会回到模型手里**（都能自己改对再来一次）：
+
+        * 书库说不行（名字不在书库里、认不出编码、文件太大）→ ``isError`` 文本；
+        * 参数形状不对（``chars`` 超上限、``query`` 是空的）→ :class:`McpError`，
+          由 ``agent/loop.py`` 翻成 ``ERROR: …`` 一并交给模型。
+        """
+        spec = next((item for item in NOVELS_TOOLS if item.name == name), None)
+        if spec is None:
+            known = ", ".join(item.name for item in NOVELS_TOOLS)
+            raise McpError(f"原文工具表里没有 {name}；可用: {known}")
+        try:
+            kwargs = _validate(name, dict(arguments or {}))
+            if name == "list":
+                result: Any = self.library.list(**kwargs)
+            elif name == "read":
+                result = self.library.read(**kwargs)
+            elif name == "chapters":
+                result = self.library.chapters(**kwargs)
+            else:
+                # 库那边这个形参叫 needle（面板那一列叫 query）：这里按模型看到的叫法转一次，
+                # 不改库的签名 —— 那会牵动面板与 RPC 两处。
+                result = self.library.search(
+                    kwargs["name"], kwargs["query"], kwargs["limit"]
+                )
+        except NovelsError as err:
+            return {"content": [{"type": "text", "text": str(err)}], "isError": True}
+        return {
+            "content": [
+                {"type": "text", "text": json.dumps(result, ensure_ascii=False, default=str)}
+            ],
+            "isError": False,
+        }
+
+
 __all__ = [
     "CACHE_MAX_ENTRIES",
     "CHAPTER_RE",
@@ -649,12 +926,18 @@ __all__ = [
     "MAX_READ_CHARS",
     "MAX_SEARCH_LIMIT",
     "MAX_TEXT_BYTES",
+    "NOVELS_SERVER",
+    "NOVELS_TOOLS",
     "NOVEL_SUBDIR",
     "NovelLibrary",
+    "NovelsClient",
     "NovelsError",
+    "NovelsServerConfig",
     "SEARCH_WINDOW",
     "SNIFF_CHARS",
     "TEXT_SUFFIXES",
+    "TOOL_MAX_READ_CHARS",
+    "TOOL_MAX_SEARCH_LIMIT",
     "decode_text",
     "default_novel_dir",
     "resolve_novel",

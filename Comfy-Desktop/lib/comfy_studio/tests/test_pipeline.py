@@ -46,6 +46,9 @@ from comfy_studio.pipeline import (
     RUN_DECLINE,
     STATE_REL,
     STATE_VERSION,
+    STAGE_ARTIFACT,
+    STAGE_RENDER,
+    STAGE_RENDER_NOTE,
     STAGE_TASKS,
     STAGE_TASK_BY_CODE,
     STATUS_DONE,
@@ -57,14 +60,35 @@ from comfy_studio.pipeline import (
     main,
     plan_payload,
     state_payload,
+    steps_payload,
 )
-from comfy_studio.projects_spec import PROJECT_DIRS, STAGE_ORDER, create_project
+from comfy_studio.projects import ProjectLibrary
+from comfy_studio.projects_spec import (
+    PROJECT_DIRS,
+    STAGE_ORDER,
+    STEP_ORDER,
+    WORKBENCH_STEPS,
+    ProjectError,
+    create_project,
+    step_gaps,
+    step_of_stage,
+    step_stages,
+)
 
 #: S0 那次要回一份**带合格 ```json 块**的正文 —— 机器可读大纲就从那儿取。
 S0_TEXT = (
     "# 分集大纲与三表\n\n正文正文。\n\n"
     '```json\n{"集数": ["EP01"], "角色": ["CHR_001"]}\n```\n'
 )
+
+
+def _stage(report: dict, code: str) -> dict:
+    """报告里某一段那一行。
+
+    **按代码取，不按下标** —— 链前面补了 S0a（原文解析）之后，``report["stages"][0]``
+    已经不是 S0 了。这种错法不响：断言照样过，只是断在了另一段上。
+    """
+    return {s["code"]: s for s in report["stages"]}[code]
 
 
 class FakeRunner:
@@ -128,6 +152,63 @@ class StaticGuardTest(unittest.TestCase):
             with self.subTest(stage=task.code):
                 parent = os.path.dirname(task.artifact).replace("\\", "/")
                 self.assertIn(parent, PROJECT_DIRS, f"{task.code} 的落点 {task.artifact!r} 不在清单里")
+
+    def test_render_bindings_match_the_stages_that_need_a_render(self):
+        """``STAGE_RENDER`` 的键集必须与 ``needs_render=True`` 的那几段**一字不差**。
+
+        两种错法都不响，而且坏在不同地方：少一条 = 卡片画不出「去出图」、用户又得自己在引擎
+        那 12 张里认（认错只会出成另一张图）；多一条 = 卡片摆出一个"出图"按钮，而这一步的
+        完成判定压根不看图 —— 跑出来的东西没人验，也没人知道该不该验。
+
+        ``_check_render_bindings()`` 在 ``_build_tasks()`` 里已经拦了一道（表**本来就**配错），
+        这条再钉一次，钉的是"以后有人改了 needs_render 却忘了同步那张表"。
+        """
+        pending = {code for code, (_, needs) in STAGE_ARTIFACT.items() if needs}
+        self.assertEqual(set(STAGE_RENDER), pending)
+        self.assertEqual(
+            sorted(code for code, task in STAGE_TASK_BY_CODE.items() if task.needs_render),
+            sorted(pending),
+        )
+        for task in STAGE_TASKS:
+            with self.subTest(stage=task.code):
+                self.assertEqual(
+                    task.needs_render,
+                    bool(task.render_lands),
+                    f"{task.code} 的 needs_render 与它绑的图对不上：说不用出图却绑了图，"
+                    "或者反过来说要出图却没绑",
+                )
+                for target, land in task.render_lands:
+                    self.assertRegex(target, r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+                    # 落点必须在**这一段自己的**体检目录里：不在的话，图出得成、也确实落了盘，
+                    # 只是落在体检不看的地方 —— 卡片上「还缺图」永远不消，人以为白跑一趟。
+                    self.assertIn(
+                        land,
+                        task.check_dirs,
+                        f"{task.code} 给 {target} 绑的落点 {land!r} 不在体检目录里",
+                    )
+                self.assertEqual(
+                    task.render_targets,
+                    tuple(target for target, _ in task.render_lands),
+                    f"{task.code} 的 render_targets 与 render_lands 分家了",
+                )
+        # 附言挂在没绑图的那一段就成了没人看得见的一句话。
+        self.assertLessEqual(set(STAGE_RENDER_NOTE), set(STAGE_RENDER))
+
+    def test_render_binding_guard_rejects_a_landing_outside_the_check_dirs(self):
+        """落点写歪了要**当场**说，而不是等跑完一遍才看出来图落错了地方。
+
+        ``_check_render_bindings`` 是模块导入时跑的（``STAGE_TASKS = _build_tasks()``），
+        所以这条在真实运行里的表现是"程序起不来" —— 这正是想要的：表配错了，一动就报。
+        """
+        with unittest.mock.patch.dict(
+            pipeline_module.STAGE_RENDER,
+            {"S2": (("character-sheet", "09_SHOTS"),)},
+        ):
+            with self.assertRaises(PipelineError) as caught:
+                pipeline_module._check_render_bindings()
+        message = str(caught.exception)
+        self.assertIn("09_SHOTS", message)
+        self.assertIn("不在这一段的体检目录里", message)
 
     def test_no_hardcoded_absolute_paths_in_source(self):
         """不许写死机器绝对路径：写死的害处不是报错，是**换台机器就静默跳过**。"""
@@ -226,7 +307,9 @@ class RunTest(unittest.TestCase):
             runner = FakeRunner()
             asyncio.run(NovelToVideoPipeline(project, _write_novel(project), runner=runner).run())
             prompt_of = {code: user for code, _, user in runner.calls}
-            self.assertNotIn("上游产物", prompt_of["S0"])
+            # 链上的**第一段**没有上游产物可塞（它是最前面那一段，不是"S0"这个代号 ——
+            # S0a 原文解析补进来之后就不是 S0 了）。
+            self.assertNotIn("上游产物", prompt_of[STAGE_ORDER[0]])
             self.assertIn("上游产物", prompt_of["S5"])
             self.assertIn(STAGE_TASK_BY_CODE["S4"].artifact, prompt_of["S5"])
 
@@ -237,13 +320,24 @@ class RunTest(unittest.TestCase):
             report = asyncio.run(
                 NovelToVideoPipeline(project, None, runner=runner).run()
             )
-            self.assertEqual(report["render_required"], ["S2", "S3", "S5", "S6"])
+            self.assertEqual(report["render_required"], ["S2", "S3", "S5", "S6", "S7a"])
             by_code = {s["code"]: s for s in report["stages"]}
-            for code in ("S2", "S3", "S5", "S6"):
+            for code in ("S2", "S3", "S5", "S6", "S7a"):
                 self.assertTrue(by_code[code]["render_pending"], code)
                 self.assertIn("引擎侧", by_code[code]["note"])
-            for code in ("S0", "S1", "S4", "S7"):
+                # "还缺"还得说得出"缺的那几张叫什么"：面板上那枚「去出图」全靠这一条
+                # （认错图不会报错，只会出成另一张 —— 见 STAGE_RENDER 的注释）。
+                self.assertEqual(
+                    by_code[code]["render_targets"], [t for t, _ in STAGE_RENDER[code]], code
+                )
+                # 还得说得出"出完存进哪一格"：面板把它拼上项目根当 output_dir，图才落进
+                # 体检真看的目录（不然卡片上「还缺图」永远不消）。
+                self.assertEqual(by_code[code]["render_lands"], dict(STAGE_RENDER[code]), code)
+                self.assertEqual(by_code[code]["render_note"], STAGE_RENDER_NOTE.get(code, ""), code)
+            for code in ("S0a", "S0", "S1", "S4", "S4a", "S7"):
                 self.assertFalse(by_code[code]["render_pending"], code)
+                self.assertEqual(by_code[code]["render_targets"], [], code)
+                self.assertEqual(by_code[code]["render_lands"], {}, code)
 
     def test_second_run_skips_everything(self):
         """断点续跑：跑过的段一次都不该再叫模型。"""
@@ -293,7 +387,7 @@ class RunTest(unittest.TestCase):
             self.assertEqual(last["status"], STATUS_FAILED)
             self.assertIn("模型炸了", last["error"])
             # 后面的段依赖这一段，不许硬着头皮往下跑
-            self.assertEqual(report["not_ran"], ["S5", "S6", "S7"])
+            self.assertEqual(report["not_ran"], ["S4a", "S5", "S6", "S7", "S7a"])
             self.assertEqual(pipe.state()["stages"]["S4"]["status"], STATUS_FAILED)
 
     def test_stage_outcomes_land_in_state_account(self):
@@ -408,7 +502,10 @@ class RunTest(unittest.TestCase):
 
             # 门收干净了：同一个项目再来一条照跑（这一段上次跑过，这次是 skipped）。
             again = asyncio.run(NovelToVideoPipeline(project, None, runner=FakeRunner()).run())
-            self.assertEqual(again["stages"][0]["status"], STATUS_SKIPPED)
+            # 按代码取 S0：第一趟是 `--from S0 --to S0` 只跑了它，而这一趟是整条链，
+            # 排在它前面的 S0a 是这一趟才跑的 —— "上次跑过的段这次 skipped"说的是 S0。
+            by_code = {s["code"]: s for s in again["stages"]}
+            self.assertEqual(by_code["S0"]["status"], STATUS_SKIPPED)
 
     def test_a_stage_that_never_answers_times_out_and_stops_the_line(self):
         """收不住的模型要变成**一条写着阶段与用时的失败**，不是"外面看着永远卡住"。
@@ -427,9 +524,10 @@ class RunTest(unittest.TestCase):
                 NovelToVideoPipeline(project, None, runner=Hanging(), stage_timeout=0.05).run()
             )
             first = report["stages"][0]
+            self.assertEqual(first["code"], STAGE_ORDER[0], "失败的是链上第一段")
             self.assertEqual(first["status"], STATUS_FAILED)
             self.assertIn("超过单段上限", first["error"] or "")
-            self.assertIn("S0", first["error"] or "")
+            self.assertIn(STAGE_ORDER[0], first["error"] or "")
             self.assertFalse(report["ok"])
             # 失败即停：后面的段一段都不许跑。
             self.assertEqual(len(report["not_ran"]), len(STAGE_ORDER) - 1)
@@ -470,28 +568,28 @@ class OutlineTest(unittest.TestCase):
 
             report = asyncio.run(NovelToVideoPipeline(project, None, runner=FakeRunner()).run())
             self.assertEqual(outline.read_text(encoding="utf-8"), '{"人改过": true}')
-            self.assertIn("没动它", report["stages"][0]["note"])
+            self.assertIn("没动它", _stage(report, "S0")["note"])
 
     def test_missing_json_block_is_reported_not_faked(self):
         with temp_project() as project:
             runner = FakeRunner(s0_text="# 大纲\n\n正文，没有 JSON 块。\n")
             report = asyncio.run(NovelToVideoPipeline(project, None, runner=runner).run())
             self.assertFalse((project / OUTLINE_JSON).exists())
-            self.assertIn("没落盘", report["stages"][0]["note"])
+            self.assertIn("没落盘", _stage(report, "S0")["note"])
 
     def test_broken_json_block_is_reported_not_faked(self):
         with temp_project() as project:
             runner = FakeRunner(s0_text="# 大纲\n\n```json\n{这不是 JSON}\n```\n")
             report = asyncio.run(NovelToVideoPipeline(project, None, runner=runner).run())
             self.assertFalse((project / OUTLINE_JSON).exists())
-            self.assertIn("没落盘", report["stages"][0]["note"])
+            self.assertIn("没落盘", _stage(report, "S0")["note"])
 
     def test_non_object_json_block_is_rejected(self):
         with temp_project() as project:
             runner = FakeRunner(s0_text='# 大纲\n\n```json\n["EP01"]\n```\n')
             report = asyncio.run(NovelToVideoPipeline(project, None, runner=runner).run())
             self.assertFalse((project / OUTLINE_JSON).exists())
-            self.assertIn("顶层不是对象", report["stages"][0]["note"])
+            self.assertIn("顶层不是对象", _stage(report, "S0")["note"])
 
 
 class CheckStageTest(unittest.TestCase):
@@ -523,6 +621,169 @@ class EventTest(unittest.TestCase):
             self.assertEqual(len([p for p in phases if p == "stage"]), 2)
             self.assertEqual([e["code"] for e in events if e["phase"] == "stage"], ["S6", "S7"])
             self.assertTrue(all(e["type"] == "pipeline" for e in events))
+
+
+class WorkbenchStepsTest(unittest.TestCase):
+    """八步工作台的读数：每一步凭什么算"做完了"。
+
+    面板左侧那八步全靠一份 :func:`steps_payload`。它错的方式全是**静默**的：预置空表被
+    算成产物、阶段被判成"下一步该做这个"、某一步的落点根本没进回话 —— 界面上都只是
+    "看起来正常"。所以这里逐条钉，不靠肉眼看面板。
+    """
+
+    @staticmethod
+    def _pair(project: Path) -> tuple[NovelToVideoPipeline, ProjectLibrary]:
+        """项目 + 它所在的库（:func:`temp_project` 已经把项目建在 ``project.parent`` 下了）。"""
+        return (
+            NovelToVideoPipeline(project, None, runner=FakeRunner()),
+            ProjectLibrary(project.parent),
+        )
+
+    @staticmethod
+    def _step(report: dict, key: str) -> dict:
+        return {step["key"]: step for step in report["steps"]}[key]
+
+    @classmethod
+    def _stage(cls, report: dict, key: str, code: str) -> dict:
+        return {s["code"]: s for s in cls._step(report, key)["stages"]}[code]
+
+    def test_the_eight_steps_cover_the_eleven_stages_exactly_once(self):
+        """八步 × 11 阶段：**每个阶段恰好归一步**，一段都不许漏、不许两边挂。
+
+        ``step_gaps()`` 为空就是这条（它同时看住落点覆盖与 ``needs`` 指向）。漏一段的
+        失效模式是那一段从导航里**消失**，挂两段的失效模式是它被跑两遍 —— 两种都不报错。
+        """
+        self.assertEqual(step_gaps(), ())
+        seen = [code for step in WORKBENCH_STEPS for code in step.stages]
+        self.assertEqual(sorted(seen), sorted(STAGE_ORDER))
+        self.assertEqual(len(seen), len(set(seen)))
+
+    def test_stages_inside_a_step_keep_the_machine_order(self):
+        """一步之内的阶段顺序**一律按 ``STAGE_ORDER``**，不按步骤表里写的先后。
+
+        步骤的先后是**创作顺序**，12 段生产链不是照着它排的：``prompts``（提示词）那一步
+        盖着 S2 与 S3，它们排在 S4（分镜）**后面**，却在生产链里排在前面。面板照步骤表
+        摆导航是对的，**跑**却必须照生产链 —— 两处各排一遍的失效模式是：面板写着
+        "先 S3 再 S2"，跑起来正好颠倒。
+        """
+        self.assertEqual(step_stages("prompts"), ("S2", "S3"))
+        self.assertEqual(step_stages("cut"), ("S7", "S7a"))
+        self.assertEqual(step_stages("style"), (), "没有机器阶段的一步该回空元组")
+        self.assertEqual(step_of_stage("S3"), "prompts")
+        for step in WORKBENCH_STEPS:
+            order = [STAGE_ORDER.index(code) for code in step_stages(step.key)]
+            self.assertEqual(order, sorted(order), f"{step.key} 的阶段不是生产链顺序")
+        with self.assertRaises(ProjectError):
+            step_stages("没有这一步")
+
+    def test_a_fresh_project_is_empty_and_seed_tables_are_not_progress(self):
+        """刚建完项目：八步**一步都不算做过**，空模板只记在 ``seed_count`` 里。
+
+        这是这次改造最容易做错的一处：``06_对白/``、``07_素材归档/``、``05_流程/``
+        里躺着建项目写下的空模板。把它们算进 ``count``，用户一步没跑就会看见
+        "对白与旁白 · 已有 2 份产物"，而盘上全是空表。
+        """
+        with temp_project() as project:
+            pipe, library = self._pair(project)
+            got = steps_payload(pipe, library)
+
+            self.assertEqual(got["gaps"], [], "八步与阶段表/落点表分家了")
+            self.assertEqual([s["key"] for s in got["steps"]], list(STEP_ORDER))
+            self.assertEqual({s["state"] for s in got["steps"]}, {"empty"})
+            self.assertEqual(got["current"], STEP_ORDER[0], "该指向第一步")
+            for step in got["steps"]:
+                self.assertEqual(step["count"], 0, f"{step['key']} 把空表算成了产物")
+            seeds = {step["key"]: step["seed_count"] for step in got["steps"]}
+            self.assertEqual(seeds["dialogue"], 2, "两张空对白表没被认出来")
+            self.assertEqual(seeds["cut"], 1, "预置的单元进度台账没被认出来")
+            self.assertEqual(seeds["parse"], 2, "素材归档的两张空表没被认出来")
+            self.assertEqual(got["render_required"], ["S2", "S3", "S5", "S6", "S7a"])
+
+    def test_a_step_turns_done_only_when_its_own_stages_are(self):
+        """做完两段，头两步才变 ``done``，``current`` 跟着挪到第三步。
+
+        面板拿 ``current`` 当"你现在该看哪一步"。自己再数一遍就会与这里的判据分家 ——
+        分家之后面板指的那一步跟跑出来的那一步不是同一步，而两边看着都对。
+        """
+        with temp_project() as project:
+            pipe, library = self._pair(project)
+            asyncio.run(pipe.run(from_code="S0a", to_code="S1"))  # 解析 + 建纲/资产设计
+            got = steps_payload(pipe, library)
+
+            self.assertEqual(self._step(got, "parse")["state"], "done")
+            self.assertEqual(self._step(got, "cast")["state"], "done")
+            self.assertEqual(got["current"], "board")
+            self.assertEqual(self._step(got, "board")["blocked_by"], [])
+            self.assertTrue(self._step(got, "board")["ready"])
+            # 上游与"上游里还欠哪几个"是两件事：面板只摆欠的那几个。
+            self.assertEqual(self._step(got, "dialogue")["blocked_by"], ["board"])
+            self.assertFalse(self._step(got, "dialogue")["ready"])
+            self.assertEqual(self._step(got, "style")["blocked_by"], [])
+
+    def test_a_render_stage_is_text_not_done(self):
+        """只有文本那半的阶段记 ``text``，**不记 ``done``**。
+
+        S2（出图）把提示词写出去了，图还在引擎侧排队。面板若把它说成"做完了"，
+        用户就会以为资产已经出好了 —— 这正是"文本写出去了 ≠ 这一段完成了"。
+        """
+        with temp_project() as project:
+            pipe, library = self._pair(project)
+            asyncio.run(pipe.run(from_code="S2", to_code="S2"))
+            got = steps_payload(pipe, library)
+
+            stage = self._stage(got, "prompts", "S2")
+            self.assertEqual(stage["state"], "text")
+            self.assertTrue(stage["needs_render"], "这一步该说清实质产物要引擎侧渲染")
+            self.assertEqual(self._step(got, "prompts")["state"], "partial")
+
+    def test_an_artifact_that_vanished_is_missing_not_done(self):
+        """账上写着跑完了、产物却不在 —— 报 ``missing``，不报 ``done``。
+
+        与 :meth:`NovelToVideoPipeline._done_before` 同一个判据：盘上没有就是没做完。
+        这里报成完成的话，面板会指着一个空落点说"这一步已经好了"。
+        """
+        with temp_project() as project:
+            pipe, library = self._pair(project)
+            asyncio.run(pipe.run(from_code="S4a", to_code="S4a"))
+            self.assertEqual(self._stage(steps_payload(pipe, library), "dialogue", "S4a")["state"], "done")
+
+            (project / STAGE_TASK_BY_CODE["S4a"].artifact).unlink()
+            got = steps_payload(pipe, library)
+            self.assertEqual(self._stage(got, "dialogue", "S4a")["state"], "missing")
+            self.assertNotEqual(self._step(got, "dialogue")["state"], "done")
+
+    def test_every_step_hands_over_its_own_landings(self):
+        """每一步都把**自己那几个落点**交出来，一份都不省（空目录也要交）。
+
+        省掉空落点的失效模式：面板上少一格，而用户不知道"这一步该往哪放东西"。
+        这几条断言与 :func:`step_gaps` 是搭档：一个盯表、一个盯回话。
+        """
+        with temp_project() as project:
+            pipe, library = self._pair(project)
+            got = steps_payload(pipe, library)
+
+            handed = [landing["rel"] for step in got["steps"] for landing in step["landings"]]
+            self.assertEqual(handed, [rel for step in WORKBENCH_STEPS for rel in step.landings])
+            self.assertEqual(sorted(handed), sorted(PROJECT_DIRS), "落点没盖满")
+            for step in got["steps"]:
+                for landing in step["landings"]:
+                    self.assertTrue(landing["exists"], landing["rel"])
+                    self.assertTrue(landing["title"], f"{landing['rel']} 没给人看的名字")
+                    self.assertIsInstance(landing["files"], list)
+
+    def test_reading_the_rail_costs_nothing(self):
+        """看一眼**不花钱、不动盘**：与 :func:`plan_payload` 同一个保证。"""
+        with temp_project() as project:
+            library = ProjectLibrary(project.parent)
+            runner = FakeRunner()
+            pipe = NovelToVideoPipeline(project, None, runner=runner)
+            before = sorted(str(p.relative_to(project)) for p in project.rglob("*"))
+            steps_payload(pipe, library)
+            self.assertEqual(runner.calls, [])
+            self.assertFalse((project / STATE_REL).exists(), "读导航把进度账写出来了")
+            self.assertEqual(
+                sorted(str(p.relative_to(project)) for p in project.rglob("*")), before
+            )
 
 
 class CliTest(unittest.TestCase):
@@ -565,14 +826,26 @@ class RpcWiringTest(unittest.TestCase):
     def test_methods_are_registered(self):
         """注册漏一条，面板就永远点不到它，而且**不报错** —— 所以拿源码机械核一遍。"""
         src = Path(server_module.__file__).read_text(encoding="utf-8")
-        for name in ("pipeline/plan", "pipeline/run", "pipeline/state"):
+        for name in ("pipeline/plan", "pipeline/run", "pipeline/state", "pipeline/steps"):
             self.assertIn(f'self.server.on("{name}"', src, f"{name} 没注册")
+
+    def test_steps_returns_the_eight_step_rail(self):
+        """面板左侧那八步从这一条来：它要有 ``current``、要有八步、要与阶段表对齐。"""
+        with temp_project() as project:
+            host = self._host()
+            host.projects = ProjectLibrary(project.parent)
+            host._projects = types.MethodType(StudioHost._projects, host)
+            got = StudioHost.pipeline_steps(host, {"name": str(project)}, None)
+            self.assertEqual([s["key"] for s in got["steps"]], list(STEP_ORDER))
+            self.assertEqual(got["gaps"], [])
+            self.assertEqual(got["order"], list(STEP_ORDER))
+            self.assertEqual(got["current"], STEP_ORDER[0])
 
     def test_plan_returns_the_stage_list(self):
         with temp_project() as project:
             got = StudioHost.pipeline_plan(self._host(), {"name": str(project)}, None)
             self.assertEqual([s["code"] for s in got["stages"]], list(STAGE_ORDER))
-            self.assertEqual(got["render_required"], ["S2", "S3", "S5", "S6"])
+            self.assertEqual(got["render_required"], ["S2", "S3", "S5", "S6", "S7a"])
             self.assertEqual(got["state"], {})
             self.assertFalse((project / STATE_REL).exists(), "plan 不该落盘")
 
@@ -844,6 +1117,7 @@ class ToolWiringTest(unittest.TestCase):
         src = self._src()
         self.assertIn("plan_payload(pipeline)", src)
         self.assertIn("state_payload(pipeline)", src)
+        self.assertIn("steps_payload(pipeline,", src)
         self.assertIn("resolve_novel(", src, "按名字取原文又出了一份规则")
 
     def test_the_model_config_comes_from_the_host(self):

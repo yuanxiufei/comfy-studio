@@ -7,21 +7,29 @@
 后一组 ``NovelsRpcTest`` 顺手把宿主那一层也钉住：直接建 ``StudioHost``（不 serve）调那四个
 ``novels/*``，看参数越界是不是 ``INVALID_PARAMS``、没挂原文目录时说不说得清 ——
 "面板收到的错误"和"库抛的异常"不是一回事，两边都得有人说理。
+
+最后一组 ``NovelsToolsTest`` 钉的是**给模型看**的那四张只读工具：它们是流水线里每一段
+提示词那句"先读原文"的落脚点 —— 工具表里没有这一组，那句话就只是句客气话。
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from comfy_studio.mcp import McpHub
+from comfy_studio.mcp import McpError, McpHub
 from comfy_studio.novels import (
     MANJU_REL,
     NOVEL_SUBDIR,
     NovelLibrary,
+    NovelsClient,
     NovelsError,
+    NOVELS_TOOLS,
+    TOOL_MAX_READ_CHARS,
     default_novel_dir,
 )
 from comfy_studio.rpc import INTERNAL_ERROR, INVALID_PARAMS, RpcError
@@ -512,6 +520,125 @@ class NovelsRpcTest(unittest.TestCase):
         with self.assertRaises(RpcError) as bare:
             self.bare.novels_search({"name": "x.txt", "query": "张三"}, None)
         self.assertEqual(bare.exception.code, INTERNAL_ERROR)
+
+
+class NovelsToolsTest(unittest.TestCase):
+    """给**模型**看的那四张只读工具（``novels__list`` / ``read`` / ``chapters`` / ``search``）。
+
+    要防的是这种缺口：流水线里每一段提示词都写着"先读原文"，而模型手里根本没有能碰原文的
+    家伙 —— 它不报错，只会让每一段都凭上文的转述往下编。所以这里走的是**模型那条路**：
+    先挂进 :class:`McpHub`，再用带 server 前缀的名字调。
+    """
+
+    TEXT = "第一章 起\n张三走进了城。\n第二章 承\n张三又走了。\n"
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="comfy-studio-novels-tools-")
+        self.novel_dir = Path(self._tmp.name) / MANJU_REL / NOVEL_SUBDIR
+        self.library = NovelLibrary(self.novel_dir)
+        self.novel_dir.mkdir(parents=True, exist_ok=True)
+        # 按**字节**写：``write_text`` 在 Windows 上会把 ``\n`` 翻成 ``\r\n``，
+        # 于是"读回来的"和"这里写下的"差一个字符 —— 那是测试自己的坑，不是库的。
+        (self.novel_dir / "长夜.txt").write_bytes(self.TEXT.encode("utf-8"))
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _call(self, tool: str, arguments: dict | None = None) -> dict:
+        """挂进 hub 调一次（走的就是模型那条路：名字是 ``<server>__<工具>``）。"""
+
+        async def flow() -> dict:
+            hub = McpHub([], extra_clients=[NovelsClient(self.library)])
+            await hub.start()
+            try:
+                return await hub.call_tool(tool, arguments or {})
+            finally:
+                await hub.close()
+
+        return asyncio.run(flow())
+
+    def _json(self, tool: str, arguments: dict | None = None) -> dict:
+        """调一次并解开正文；``isError`` 时把那条错误当断言失败报出来。"""
+        result = self._call(tool, arguments)
+        self.assertFalse(result["isError"], result["content"])
+        return json.loads(result["content"][0]["text"])
+
+    def _error_text(self, tool: str, arguments: dict | None = None) -> str:
+        result = self._call(tool, arguments)
+        self.assertTrue(result["isError"], "这一路本该回一条 isError 文本")
+        return result["content"][0]["text"]
+
+    def test_only_the_four_read_only_tools_are_offered(self) -> None:
+        """只挂四张只读的：导入 / 删除是"落盘 / 删文件"，由人在面板上按，不给模型。"""
+
+        async def flow() -> list:
+            hub = McpHub([], extra_clients=[NovelsClient(self.library)])
+            await hub.start()
+            try:
+                return sorted(tool.qualified_name for tool in hub.tools)
+            finally:
+                await hub.close()
+
+        names = asyncio.run(flow())
+        self.assertEqual(
+            names,
+            ["novels__chapters", "novels__list", "novels__read", "novels__search"],
+        )
+        for tool in NOVELS_TOOLS:
+            self.assertEqual(tool.input_schema["type"], "object")
+            self.assertTrue(tool.description.strip(), tool.name)
+
+    def test_read_hands_the_original_text_to_the_model(self) -> None:
+        got = self._json("novels__read", {"name": "长夜.txt"})
+        self.assertEqual(got["text"], self.TEXT)
+        self.assertEqual(got["total_chars"], len(self.TEXT))
+        self.assertTrue(got["at_end"])
+
+    def test_read_pages_by_next_offset(self) -> None:
+        """长篇要分页读：``next_offset`` 必须是**能接着用**的下一个位置。"""
+        first = self._json("novels__read", {"name": "长夜.txt", "chars": 5})
+        self.assertEqual(first["text"], self.TEXT[:5])
+        self.assertEqual(first["next_offset"], 5)
+        self.assertFalse(first["at_end"])
+        second = self._json(
+            "novels__read", {"name": "长夜.txt", "offset": first["next_offset"], "chars": 5}
+        )
+        self.assertEqual(second["text"], self.TEXT[5:10])
+
+    def test_chapters_and_search_hand_back_offsets_read_can_use(self) -> None:
+        """目录和搜索给的是**真位置**：拿它去 read，读出来的就是那一段。"""
+        book = self._json("novels__chapters", {"name": "长夜.txt"})
+        titles = [chapter["title"] for chapter in book["chapters"]]
+        self.assertIn("第一章 起", titles)
+        at = book["chapters"][0]["offset"]
+        self.assertEqual(self._json("novels__read", {"name": "长夜.txt", "offset": at})["offset"], at)
+        found = self._json("novels__search", {"name": "长夜.txt", "query": "张三"})
+        self.assertEqual(found["query"], "张三")
+        self.assertEqual(found["matched"], 2)
+        for hit in found["matches"]:
+            self.assertEqual(self.TEXT[hit["offset"] : hit["offset"] + 2], "张三")
+
+    def test_oversized_read_is_refused_not_truncated(self) -> None:
+        """超上限明确报错，不静默截断：截了模型会把"这一页的结尾"当成"这一章的结尾"。"""
+        with self.assertRaises(McpError) as err:
+            self._call(
+                "novels__read", {"name": "长夜.txt", "chars": TOOL_MAX_READ_CHARS + 1}
+            )
+        self.assertIn("chars", str(err.exception))
+
+    def test_missing_novel_comes_back_as_a_tool_error_the_model_can_read(self) -> None:
+        """书库说不行 → isError 文本，不是抛异常：模型照着这句话能自己去 list 一下改对名字。
+
+        （错的是名字时，那句话里报的就是它用的名字 —— 它拿这个名字去 list 过滤一遍即可。）
+        """
+        text = self._error_text("novels__read", {"name": "没有这本.txt"})
+        self.assertIn("没有这本.txt", text)
+
+    def test_blank_query_is_refused_before_touching_the_disk(self) -> None:
+        with self.assertRaises(McpError):
+            self._call("novels__search", {"name": "长夜.txt", "query": "   "})
+        with self.assertRaises(McpError):
+            self._call("novels__search", {"name": "长夜.txt"})
 
 
 if __name__ == "__main__":

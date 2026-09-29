@@ -425,6 +425,39 @@ def _input_keys(object_info: dict[str, Any], class_type: str) -> frozenset[str]:
     return frozenset(names)
 
 
+def _check_injection_points(
+    target: RenderTarget,
+    workflow: dict[str, Any],
+    object_info: dict[str, Any],
+    params: Sequence[SkillParam],
+) -> None:
+    """每条参数的 ``node``/``field`` 都要落在**节点定义**里，否则注入会被引擎静默丢掉。
+
+    为什么非拦不可：引擎校验输入是**按节点定义遍历**的（``execution.validate_inputs`` 里那句
+    ``if x not in inputs`` 的 ``inputs`` 是定义侧），报文里多出来的键既不校验也不执行 ——
+    参数就这么没了，图照出，一路没人报错。用户在前端改图（换个节点版本、删个节点）就会这样。
+
+    判据取**节点定义**、不取转换后的 ``inputs``：graph 对"定义里可选、图上又没值"的字段会
+    跳过不写，那种字段注进去是**生效**的，拿 ``inputs`` 判会误伤。这条正是把
+    ``test_skills_render`` 里那条"逐条对真图核注入点"的断言搬到运行期 —— 那以前只在
+    跑测试（还得本机有引擎在跑）时才成立，运行期不设防。
+    """
+    for param in params:
+        node = workflow.get(param.node)
+        if node is None:
+            raise RenderError(
+                f"渲染目标 {target.id}（{target.file}）的参数 {param.name} 指向节点 #{param.node}，"
+                f"转换后的图里没有它（图被改过？目标表的 node 得跟着改）"
+            )
+        keys = _input_keys(object_info, str(node["class_type"]))
+        if param.field not in keys:
+            raise RenderError(
+                f"渲染目标 {target.id}（{target.file}）的参数 {param.name} 指向 "
+                f"{param.node}.{param.field}，而 {node['class_type']} 的定义里没有这个键"
+                f"（真有的键：{sorted(keys)}）—— 注进去会被引擎静默丢掉，所以先在这儿报"
+            )
+
+
 def _group_slots(kind: str, object_info: dict[str, Any]) -> tuple[str, ...]:
     """参考图槽名序列（按 index 排好），并核对该组节点真的存在、真的收图。
 
@@ -550,6 +583,9 @@ def build_render_skill(
             for param in target.params
         )
 
+    # 注入点核在**最终** params 与图上（含接完外部组之后改指到组节点的那条 prompt）。
+    _check_injection_points(target, workflow, object_info, params)
+
     skill = Skill(
         id=target.id,
         title=target.title,
@@ -590,6 +626,22 @@ async def prepare_render(
     只对 04/05/06 有用，给了图就会接外部组，``duration_sec`` 也就跟着要（不给会按图上帧数折算）。
     """
     target = find_target(target_id)
+    return await prepare_render_target(engine, target, images=images, duration_sec=duration_sec)
+
+
+async def prepare_render_target(
+    engine: Any,
+    target: RenderTarget,
+    *,
+    images: Iterable[str | Path] = (),
+    duration_sec: float | None = None,
+) -> RenderPlan:
+    """按**目标对象**组装（同 :func:`prepare_render`，只是不拿 id 去表里找）。
+
+    之所以要有这一条：目录里那些没登记进 ``RENDER_TARGETS`` 的工作流也得能跑
+    （见 ``skills/workflows.as_target``）—— 它们不在表里，``find_target`` 找不到，
+    而"看见了却跑不了"等于没看见。
+    """
     object_info = await engine.object_info()
     names = tuple(stage_input_file(path) for path in images)
     return build_render_skill(target, object_info, image_names=names, duration_sec=duration_sec)

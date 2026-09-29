@@ -35,7 +35,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-__all__ = ["GraphConvertError", "GraphResult", "API_WORKFLOW_FORMAT", "graph_to_api"]
+__all__ = ["GraphConvertError", "GraphResult", "API_WORKFLOW_FORMAT", "graph_to_api", "widget_slots"]
 
 #: 本模块产出的形状（写进 skill 定义时用它做校验用）。
 API_WORKFLOW_FORMAT = "comfy_api_workflow"
@@ -103,6 +103,37 @@ def graph_to_api(doc: dict[str, Any], object_info: dict[str, Any], *, source: st
     if not result.graph:
         raise GraphConvertError(f"{where}转换后没有任何可执行节点（是不是全被 mute / bypass 了？）")
     return result
+
+
+def widget_slots(node: dict[str, Any], info: dict[str, Any]) -> dict[str, int]:
+    """``{字段名: widgets_values 里的下标}``（动态下拉的子字段用点号扁平名，同 API 报文的键）。
+
+    为什么要有这张表：UI 图的 ``widgets_values`` 是**纯位置数组**，图上不带字段名 —— 想按
+    "改 steps" 去动它，只能先知道 steps 是第几格。让调用方自己去数，等于把
+    :func:`_node_inputs` 里那些坑（``control_after_generate`` 多占一位、动态下拉自带子 widget、
+    已被连线占位的 widget 仍留值）在外面重踩一遍，迟早两处口径不一致。
+
+    这里与 :func:`_node_inputs` 共用同一套推进规则（``_skip_one`` / ``_fields_from_option``），
+    所以"这张表指的那一格"与"转换时读的那一格"必然是同一格。
+
+    * **已被连线占位的字段不进表**：它的值不在这条链上，改它没用（转换时会跳过该值）。
+    * 下标可能等于 ``len(widgets_values)``：图上没给值、定义里却有默认，那种字段要改就得先
+      把数组补到这一格（见 ``skills/workflows.py`` 的改值那段）。
+    """
+    values = node.get("widgets_values")
+    if isinstance(values, dict):  # 老格式按名字存：按定义顺序摆成一个数组来看待（同 _node_inputs）
+        values = [values.get(name) for _section, name, _spec in _widget_fields(info)]
+    if not isinstance(values, list):
+        values = []
+    wired = {item.get("name") for item in node.get("inputs") or [] if item.get("link") is not None}
+    slots: dict[str, int] = {}
+    cursor = 0
+    for _section, name, spec in _widget_fields(info):
+        if name in wired:
+            cursor = _skip_one(spec, values, cursor)
+            continue
+        cursor = _walk_slots(name, spec, values, cursor, slots)
+    return slots
 
 
 # --------------------------------------------------------------------------- 内部
@@ -260,6 +291,22 @@ def _take_into(name: str, spec: Any, values: list[Any], cursor: int, inputs: dic
         return cursor
     inputs[name] = values[cursor]
     return _skip_one(spec, values, cursor)
+
+
+def _walk_slots(name: str, spec: Any, values: list[Any], cursor: int, slots: dict[str, int]) -> int:
+    """记下 ``name`` 占的那一格再推进游标；动态下拉连它自带的子字段一起记（同 :func:`_take_into`）。"""
+    itype = spec[0] if isinstance(spec, (list, tuple)) and spec else None
+    slots[name] = cursor
+    if itype != "COMFY_DYNAMICCOMBO_V3":
+        return _skip_one(spec, values, cursor)
+    key = values[cursor] if cursor < len(values) else None
+    cursor += 1
+    options = (spec[1] or {}).get("options") or []
+    chosen = next((opt for opt in options if isinstance(opt, dict) and opt.get("key") == key), None)
+    if chosen is not None:
+        for _section, sub_name, sub_spec in _fields_from_option(chosen.get("inputs")):
+            cursor = _walk_slots(f"{name}.{sub_name}", sub_spec, values, cursor, slots)
+    return cursor
 
 
 def _skip_one(spec: Any, values: list[Any], cursor: int) -> int:

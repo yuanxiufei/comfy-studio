@@ -30,7 +30,7 @@ from unittest import mock
 from comfy_studio import __main__ as main_module
 from comfy_studio.cancel import Cancelled
 from comfy_studio.mcp import McpHub
-from comfy_studio.server import StudioHost
+from comfy_studio.server import DEFAULT_SESSION, StudioHost
 from comfy_studio.skills import SkillCatalog
 from comfy_studio.web import (
     SEARCH_BACKEND_BING,
@@ -1002,12 +1002,12 @@ class WebSwitchTests(unittest.IsolatedAsyncioTestCase):
             [n for n in names if n.startswith("web__")],
             ["web__crawl", "web__fetch", "web__search"],
         )
-        self.assertIn(WEB_PROMPT_RULES, with_web._prompt_source()())
+        self.assertIn(WEB_PROMPT_RULES, with_web._prompt_source(DEFAULT_SESSION)())
 
         without = await self._mounted_host(None)
         names = [t.qualified_name for t in without.hub.tools]
         self.assertEqual([n for n in names if n.startswith("web__")], [], "关掉了还留着能出门的工具")
-        self.assertNotIn(WEB_PROMPT_RULES, without._prompt_source()())
+        self.assertNotIn(WEB_PROMPT_RULES, without._prompt_source(DEFAULT_SESSION)())
 
 
 class HostInfoWebFieldsTests(unittest.TestCase):
