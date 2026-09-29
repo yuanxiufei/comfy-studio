@@ -2,7 +2,7 @@
 
 整合自 5 篇飞书文档（原文抓取时间：2026-09-26；先经 `web_fetch` 取首屏，再用**无头浏览器滚动累积采集**补齐渲染后正文，5 篇的正文均已抓到，仅图片/视频块与登录墙内容无法文本化，已在文中标注）。
 
-> 文档分两部分：**第 0～14 节**是按主题整理的速查与合成；**附录 A～F** 是各篇文档的**逐段原文摘录**（原文是英文的附中英对照），要看细节直接跳到附录。
+> 文档分两部分：**第 0～15 节**是按主题整理的速查与合成（其中**第 15 节为本机实测记录**，非文档摘录）；**附录 A～F** 是各篇文档的**逐段原文摘录**（原文是英文的附中英对照），要看细节直接跳到附录。
 
 | # | 来源 | 标题 | 文档日期 |
 |---|---|---|---|
@@ -402,6 +402,106 @@ H3-Context-IR（托管） → H3-Base 768p（本地） → H3-Regenerate-2K（�
 ### 待补原文（需登录）
 - 完整硬件与优化指南：https://vrfi1sk8a0.feishu.cn/docx/VJA3dLNNpo2gnDxkKfFcaCXbnTf
 - 完整混合实现指南：https://vrfi1sk8a0.feishu.cn/docx/O6Aid7HxloyFRSxi9Nic2DDwnng
+
+---
+
+## 15. 本机落地实录：问题与解决（2026-09-29）
+
+> **本节是实测记录，不是上述 5 篇飞书文档的摘录**。数据来源：`D:\code\voide\comfy-studio\ComfyUI\user\comfyui_8188.log` 等启动与运行日志，以及对共享模型库 `D:\Comfy-Desktop\ComfyUI-Shared\models` 的文件级校验。
+
+### 15.1 本机环境（实测值）
+
+| 项目 | 值 |
+|---|---|
+| ComfyUI | **0.37.0**（非 git 仓库安装，Manager 显示 Revision UNKNOWN） |
+| Python | 3.11.9 |
+| PyTorch | **2.14.0+cu130** ｜ torchvision 0.29.0+cu130 ｜ **torchaudio 未安装** |
+| GPU | NVIDIA RTX A5000 ｜ **VRAM 23028 MB** ｜ `cudaMallocAsync` |
+| 系统内存 | **95848 MB**（≈93.6 GB） |
+| 注意力 | pytorch attention（未装 SageAttention / triton） |
+| 量化后端 | `comfy-kitchen 0.2.35`，cuda 后端可用：`convrot_w4a4_linear`、`int8_linear`、`scaled_mm_nvfp4` 等 50+ 能力在线 |
+| DynamicVRAM | **已启用**（`fast_disk=True`、async offload 2 streams、pinned memory 38339 MB） |
+| 前端 / 模板 | comfyui-frontend 1.53.6 ｜ workflow-templates 0.11.70 ｜ `comfy-aimdo 0.5.5` |
+| 模型库 | `D:\Comfy-Desktop\ComfyUI-Shared\models`（与 `ComfyUI\models` 合并索引） |
+
+**对照第 3 节分档**：24 GB 显存 + 93.6 GB 内存，正落在「int8 34G DiT + int8 TE」推荐档。
+
+**实测耗时（可作为本机基线）**：
+
+| 任务 | 模型 | 实测 |
+|---|---|---|
+| H3 fl2v，124 帧 @ 24fps，1344×768，含音频 | `minimax_h3_fl2va_int8_convrot`（32427 MB staged）+ `qwen3vl_32b` TE（25882 MB）+ 双 VAE | **471.39 秒**（Prompt executed） |
+| Qwen-Image 2.1 出图，25 步 | `qwen_image_2.1_int8_convrot`（6920 MB） | **21–35 秒/张** |
+
+### 15.2 下载完整性校验方法（可复现，不靠"文件看起来在"）
+
+对每个 `.safetensors`：读文件头 8 字节得到 JSON 头长度 `n` → 解析该 JSON → 取所有张量 `data_offsets[1]` 的最大值 `max_off` → 断言
+
+```
+max_off + 8 + n == 文件实际字节数
+```
+
+相等即**字节级完整**（可检出截断下载与尾部多余写入），且只需读文件头、**不加载权重**，秒级完成。
+
+**校验结果**
+
+| 文件 | 体积 | 张量数 | 头期望 = 实际 | 结论 |
+|---|---|---|---|---|
+| `diffusion_models\minimax_h3_fl2va_int8_convrot.safetensors` | 31.70 GB | 1035 | 34038892334 = 34038892334 | 完整 |
+| `diffusion_models\minimax_h3_ref2va_int8_convrot.safetensors` | 31.70 GB | 1035 | 34038894550 = 34038894550 | 完整 |
+| `diffusion_models\minimax_h3_fl2va_pruned_int8_convrot.safetensors` | 19.53 GB | 932 | 20970379616 = 20970379616 | 完整 |
+| `diffusion_models\minimax_h3_ref2va_pruned_int8_convrot.safetensors` | 19.53 GB | 932 | 20970379616 = 20970379616 | 完整 |
+
+- 全库 **无 `.part` / `.part.dl-meta` / `.orphan` 残留**（断点续传痕迹为零）
+- `user\default\workflows\AIGC中国风漫剧\` 下 **11 个工作流**（01~09 + `01_Lightning` + `02_ZImage`）引用的模型文件**全部命中**，零缺失
+
+### 15.3 问题及主要解决
+
+#### ① 已解决 / 判定无需处理
+
+| # | 问题 | 证据 | 处理结果 |
+|---|---|---|---|
+| 1 | ComfyUI-Manager 拉取 `custom-node-list.json` **超时失败** | `15:43:46` aiohttp `readany` 超时 → `TimeoutError` | **自动重试成功**：`15:49:12 [DONE]`、`15:49:13 All startup tasks completed`。纯网络抖动，无需干预 |
+| 2 | `torchaudio` 未安装，疑似缺口 | `custom_nodes` 下**零处** `import torchaudio`；核心仅注释提及（`comfy/audio.py` 自带 DSP 实现） | **判定无需安装**，避免误装多余包 |
+| 3 | `triton` 未安装 | `comfy_kitchen backend triton: {'available': False, 'disabled': True}` | **不影响**：可选加速后端，eager + cuda 均已可用 |
+| 4 | 怀疑模型未下完 | 见 15.2 全部校验 | **已排除** |
+| 5 | 怀疑自定义节点缺失（静态扫描曾报 19 项） | 启动日志 `IMPORT FAILED` 计数 = **0** | **误报，已作废**，见 ③ |
+| 6 | Manager 报 `PyTorch is not installed` | 13:18 日志第 11 行；实际 torch 2.14.0+cu130 正常、VRAM 已正确识别 | Manager **自身依赖探测误报**，不影响运行 |
+
+**已确认注册成功的自定义节点**：`ComfyUI-MiniMaxH3`、`ComfyUI_MiniMaxH3_Director`（`MiniMax H3 Director HTTP routes registered`）、`ComfyUI-H3-Motion-Context`、`ComfyUI-H3-Multishot`、`ComfyUI-MiniMaxH3-TeaCache`、`ComfyUI-GGUF`（`[H3] taught ComfyUI-GGUF the 'minimax_h3' architecture`）、`comfyui_controlnet_aux`、`ComfyUI_IPAdapter_plus`、`ComfyUI-Custom-Scripts`、`ComfyUI_JoyAI_Echo`、`comfy_studio`、`comfyui-openai-llm`。
+
+#### ② 唯一真实异常：H3 文本编码器偶发设备不匹配（当前未复现）
+
+```
+Expected all tensors to be on the same device, but got index is on cuda:0,
+different from other tensors on cpu  (wrapper_CUDA__index_select)
+```
+
+调用链：`ComfyUI-MiniMaxH3\nodes\conditioning.py:192` → `utils\encoder_use.py:109` → `models\text_encoder\encoder.py:329`
+发生时间：9/29 `15:23:40`（13:18 那次会话）；**9/29 15:41 及之后的会话未再出现**，同一套 fl2v 流程 471 秒跑通。
+
+**判定**：**不是模型文件损坏**（已通过 15.2 字节校验），而是 DynamicVRAM 部分加载（`25882MB Staged` / `Forced pre-loaded 310 weights`）状态下，编码器权重与索引张量落到不同设备的**时序问题**。
+
+**若复现，按代价从低到高处理**（②③为基于日志的推断，尚未实测）：
+
+1. **直接重跑**（当前已自愈，成本最低）
+2. 让 TE 完整驻留：加 `--disable-dynamic-vram`，或调高 `--reserve-vram` 避免 32B 文本编码器被分片换出
+3. 仍复现才改 `encoder_use.py`：在 `encode()` 入口统一把 `payload` 与模型参数 `to(device)`（属修改三方节点代码，非必要不动）
+
+#### ③ 排查方法上的两次失误（非环境问题，记录下来避免重犯）
+
+| 失误 | 根因 | 修正 |
+|---|---|---|
+| 静态扫描报 19 项"节点未找到" | 核心节点注册在**根目录 `nodes.py`**，只扫了 `comfy/`、`comfy_extras/`、`custom_nodes/` | 改以**启动日志**为准（`IMPORT FAILED` 计数） |
+| "缺失节点"清单里混入 `COMBO`/`AUDIO`/`VIDEO`/`SIGMAS` | 递归时把所有 `"type"` 键都当节点类型，未区分 **widget 数据类型**与**节点类** | 只认 `class_types` 与带 `widgets_values` 的节点对象 |
+
+> **方法论结论**：判断"节点是否齐全"应以**运行时启动日志**为唯一准据，静态扫描只适合查"模型文件是否缺"，且需明确"注册点在哪"。
+
+### 15.4 本节结论
+
+- 模型、节点、量化后端、torch/cu130 链路**全部验证通过**，且已由真实生成任务（H3 fl2v 471 秒成片 + Qwen-Image 2.1 连续出图）反向证明可用，**无需再下载任何文件**
+- 硬件档位与本机实测耗时已记入 15.1，可作为后续调优对照基线
+- 唯一遗留：H3 文本编码器偶发 device mismatch，**未复现则不动代码**；一旦复现按 15.3② 顺序处理
 
 ---
 
