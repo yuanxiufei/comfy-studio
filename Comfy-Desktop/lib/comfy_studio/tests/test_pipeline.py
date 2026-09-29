@@ -39,6 +39,8 @@ from comfy_studio import pipeline as pipeline_module
 from comfy_studio.agent.catalog import AgentCatalog
 from comfy_studio.mcp import McpError
 from comfy_studio.pipeline import (
+    DEFAULT_JOURNAL_LIMIT,
+    MAX_JOURNAL_LIMIT,
     OUTLINE_JSON,
     PIPELINE_SERVER,
     PIPELINE_TOOLS,
@@ -57,8 +59,10 @@ from comfy_studio.pipeline import (
     NovelToVideoPipeline,
     PipelineClient,
     PipelineError,
+    journal_payload,
     main,
     plan_payload,
+    read_ledger,
     state_payload,
     steps_payload,
 )
@@ -828,7 +832,13 @@ class RpcWiringTest(unittest.TestCase):
     def test_methods_are_registered(self):
         """注册漏一条，面板就永远点不到它，而且**不报错** —— 所以拿源码机械核一遍。"""
         src = Path(server_module.__file__).read_text(encoding="utf-8")
-        for name in ("pipeline/plan", "pipeline/run", "pipeline/state", "pipeline/steps"):
+        for name in (
+            "pipeline/plan",
+            "pipeline/run",
+            "pipeline/state",
+            "pipeline/steps",
+            "journal/list",
+        ):
             self.assertIn(f'self.server.on("{name}"', src, f"{name} 没注册")
 
     def test_steps_returns_the_eight_step_rail(self):
@@ -892,6 +902,202 @@ class RpcWiringTest(unittest.TestCase):
             ("S1", "S3", True),
         )
         self.assertEqual(StudioHost._pipeline_slice({}), (None, None, False))
+
+
+class JournalTest(unittest.TestCase):
+    """记录页（``journal/list``）：把各项目的账摊平成一条时间倒序的流水。
+
+    **这一页最容易出的两种错都不响**：把读不动的账读成"没跑过"（于是几百条记录凭空消失），
+    或者一条读不出来就让整页空白。所以这里专门喂坏账、喂非对象的 json、喂根目录里的杂项文件。
+    """
+
+    @staticmethod
+    def _host(projects=None):
+        host = SimpleNamespace(projects=projects)
+        host._projects = types.MethodType(StudioHost._projects, host)
+        return host
+
+    @staticmethod
+    def _ledger(project: Path, stages: dict, updated: str = "") -> None:
+        path = project / STATE_REL
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {"version": STATE_VERSION, "updated": updated, "stages": stages},
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+    @contextlib.contextmanager
+    def _root(self):
+        """一个只有项目根、没有别的临时目录。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            yield Path(tmp)
+
+    def test_a_root_without_projects_is_empty_not_an_error(self):
+        with self._root() as root:
+            got = journal_payload(ProjectLibrary(root))
+            self.assertTrue(got["exists"])
+            self.assertEqual(got["projects"], 0)
+            self.assertEqual(got["entries"], [])
+            self.assertEqual(got["matched"], 0)
+            self.assertFalse(got["truncated"])
+
+    def test_an_absent_root_is_reported_as_not_existing(self):
+        with self._root() as root:
+            got = journal_payload(ProjectLibrary(root / "还没建过"))
+            self.assertFalse(got["exists"])
+            self.assertEqual(got["entries"], [])
+
+    def test_entries_are_flattened_and_sorted_newest_first(self):
+        with self._root() as root:
+            self._ledger(
+                root / "甲剧",
+                {
+                    "S0a": {"status": STATUS_DONE, "at": "2026-09-28T10:00:00", "artifact": "a.md"},
+                    "S1": {"status": STATUS_FAILED, "at": "2026-09-28T11:00:00", "error": "超时"},
+                },
+                updated="2026-09-28T11:00:00",
+            )
+            self._ledger(
+                root / "乙剧",
+                {"S0a": {"status": STATUS_SKIPPED, "at": "2026-09-27T09:00:00"}},
+                updated="2026-09-27T09:00:00",
+            )
+            got = journal_payload(ProjectLibrary(root))
+            self.assertEqual(got["projects"], 2)
+            self.assertEqual(got["matched"], 3)
+            self.assertEqual(got["updated"], "2026-09-28T11:00:00")
+            self.assertEqual(
+                [(e["project"], e["code"]) for e in got["entries"]],
+                [("甲剧", "S1"), ("甲剧", "S0a"), ("乙剧", "S0a")],
+            )
+            first = got["entries"][0]
+            self.assertEqual(first["status"], STATUS_FAILED)
+            self.assertEqual(first["error"], "超时")
+            self.assertEqual(first["name"], "资产设计", "阶段中文名要带上，语言包里没有时兜底")
+            self.assertEqual(got["entries"][1]["artifact"], "a.md")
+
+    def test_entries_without_a_time_go_last_and_keep_the_chain_order(self):
+        """老账（或手写的账）里可能没记时间。它们排最后，且仍按链上的先后摆。"""
+        with self._root() as root:
+            self._ledger(
+                root / "甲剧",
+                {
+                    "S1": {"status": STATUS_DONE},
+                    "S0a": {"status": STATUS_DONE},
+                    "S0": {"status": STATUS_DONE, "at": "2026-09-28T10:00:00"},
+                },
+            )
+            got = journal_payload(ProjectLibrary(root))
+            self.assertEqual([e["code"] for e in got["entries"]], ["S0", "S0a", "S1"])
+
+    def test_a_broken_ledger_is_listed_but_does_not_empty_the_page(self):
+        """**最要紧的一条**：一份坏账不能让另外几百条记录凭空消失。"""
+        with self._root() as root:
+            self._ledger(root / "好剧", {"S0a": {"status": STATUS_DONE, "at": "2026-09-28T10:00:00"}})
+            bad = root / "坏剧" / STATE_REL
+            bad.parent.mkdir(parents=True, exist_ok=True)
+            bad.write_text("{不是 json", encoding="utf-8")
+            got = journal_payload(ProjectLibrary(root))
+            self.assertEqual([e["project"] for e in got["entries"]], ["好剧"])
+            self.assertEqual(len(got["problems"]), 1)
+            self.assertEqual(got["problems"][0]["project"], "坏剧")
+            self.assertIn("状态账读不动", got["problems"][0]["error"])
+
+    def test_a_ledger_of_the_wrong_version_is_reported_not_guessed(self):
+        with self._root() as root:
+            path = root / "老剧" / STATE_REL
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('{"version": 1, "stages": {"S0": {"status": "done"}}}', encoding="utf-8")
+            got = journal_payload(ProjectLibrary(root))
+            self.assertEqual(got["entries"], [])
+            self.assertIn("版本不认", got["problems"][0]["error"])
+
+    def test_a_ledger_that_is_not_an_object_says_what_it_is(self):
+        """非对象（手改坏成数组）时要报"版本不认且是 None"，不能抛 AttributeError ——
+        那句英文的 ``list object has no attribute get`` 会把真正的病因盖掉。"""
+        with self._root() as root:
+            path = root / "坏剧" / STATE_REL
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("[1, 2]", encoding="utf-8")
+            with self.assertRaises(PipelineError) as caught:
+                read_ledger(path)
+            self.assertIn("版本不认", str(caught.exception))
+            self.assertNotIn("AttributeError", str(caught.exception))
+
+    def test_loose_files_in_the_root_are_not_counted_as_projects(self):
+        """``.DS_Store`` 那种文件、以及点开头的目录，都不该被当成一部剧。"""
+        with self._root() as root:
+            (root / ".DS_Store").write_text("x", encoding="utf-8")
+            (root / "备注.txt").write_text("x", encoding="utf-8")
+            (root / ".git").mkdir()
+            self._ledger(root / "好剧", {"S0a": {"status": STATUS_DONE, "at": "2026-09-28T10:00:00"}})
+            got = journal_payload(ProjectLibrary(root))
+            self.assertEqual(got["projects"], 1)
+            self.assertEqual(len(got["entries"]), 1)
+
+    def test_limit_truncates_but_matched_stays_the_total(self):
+        """面板要靠 ``matched`` 与 ``len(entries)`` 两个数说清"还有多少没显示"。"""
+        with self._root() as root:
+            self._ledger(
+                root / "甲剧",
+                {
+                    code: {"status": STATUS_DONE, "at": f"2026-09-2{index + 1}T00:00:00"}
+                    for index, code in enumerate(("S0a", "S0", "S1", "S2"))
+                },
+            )
+            got = journal_payload(ProjectLibrary(root), "", 2)
+            self.assertEqual(len(got["entries"]), 2)
+            self.assertEqual(got["matched"], 4)
+            self.assertTrue(got["truncated"])
+            self.assertEqual(got["limit"], 2)
+
+    def test_query_filters_by_project_name(self):
+        with self._root() as root:
+            self._ledger(root / "甲剧", {"S0a": {"status": STATUS_DONE, "at": "2026-09-28T10:00:00"}})
+            self._ledger(root / "乙剧", {"S0a": {"status": STATUS_DONE, "at": "2026-09-27T10:00:00"}})
+            got = journal_payload(ProjectLibrary(root), "甲")
+            self.assertEqual(got["projects"], 1)
+            self.assertEqual([e["project"] for e in got["entries"]], ["甲剧"])
+
+    def test_read_ledger_treats_a_missing_file_as_empty_not_an_error(self):
+        with self._root() as root:
+            ledger = read_ledger(root / "没有" / "state.json")
+            self.assertEqual(ledger["stages"], {})
+            self.assertEqual(ledger["version"], STATE_VERSION)
+
+    # ---- RPC 那一层 -----------------------------------------------------
+
+    def test_the_rpc_is_registered(self):
+        src = Path(server_module.__file__).read_text(encoding="utf-8")
+        self.assertIn('self.server.on("journal/list"', src)
+
+    def test_the_rpc_goes_through_the_project_library(self):
+        with self._root() as root:
+            self._ledger(root / "甲剧", {"S0a": {"status": STATUS_DONE, "at": "2026-09-28T10:00:00"}})
+            host = self._host(ProjectLibrary(root))
+            got = StudioHost.journal_list(host, {}, None)
+            self.assertEqual([e["project"] for e in got["entries"]], ["甲剧"])
+
+    def test_the_rpc_without_a_project_root_says_so(self):
+        with self.assertRaises(RpcError) as caught:
+            StudioHost.journal_list(self._host(), {}, None)
+        self.assertIn("项目管理", str(caught.exception))
+
+    def test_the_rpc_rejects_wrong_shapes(self):
+        for bad in ({"name": 7}, {"limit": 0}, {"limit": MAX_JOURNAL_LIMIT + 1}, {"limit": "多"}):
+            with self.subTest(args=bad), self.assertRaises(RpcError):
+                StudioHost.journal_list(self._host(ProjectLibrary(Path("."))), bad, None)
+
+    def test_the_rpc_default_limit_is_the_module_constant(self):
+        """上限在 ``pipeline.py`` 里，RPC 层不另抄一份 —— 抄了就会两边分家。"""
+        src = Path(server_module.__file__).read_text(encoding="utf-8")
+        self.assertIn("DEFAULT_JOURNAL_LIMIT", src)
+        self.assertIn("journal_payload(", src)
+        self.assertGreaterEqual(DEFAULT_JOURNAL_LIMIT, 1)
+        self.assertGreater(MAX_JOURNAL_LIMIT, DEFAULT_JOURNAL_LIMIT)
 
 
 class FakeReview:

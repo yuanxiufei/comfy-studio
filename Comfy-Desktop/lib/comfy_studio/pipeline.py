@@ -617,6 +617,34 @@ def _slice_tasks(
     return tasks[start:stop]
 
 
+def read_ledger(path: str | os.PathLike[str]) -> dict[str, Any]:
+    """读一份状态账。**没有就是没有**（新项目），不是错误；有但读不动才是错误。
+
+    :meth:`NovelToVideoPipeline.state` 与记录页（:func:`journal_payload`）共用这一处：
+    「账长什么样」（版本号、``stages`` 必须是个对象）只写一遍，两边才不会对**同一份文件**
+    得出两种结论 —— 记录页说"没跑过"、工作台说"版本不认"这种事，谁都不报错。
+    """
+    path = Path(path)
+    if not path.is_file():
+        return {"version": STATE_VERSION, "stages": {}}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as err:
+        raise PipelineError(f"状态账读不动（{path}）：{err}") from err
+    # 非对象（手改坏成数组/字符串）时**也要说得出它是什么**：直接取 ``raw.get`` 会在这里
+    # 抛 AttributeError，把一句"版本不认"变成一句「list object has no attribute get」。
+    version = raw.get("version") if isinstance(raw, dict) else None
+    if version != STATE_VERSION:
+        raise PipelineError(
+            f"状态账的版本不认（{path} 里是 {version!r}，"
+            f"本程序认 {STATE_VERSION}）。要么换回旧程序，要么删掉它重跑一遍 —— "
+            "猜着读会把「哪一段跑过」读错，之后重跑与不跑都是错的。"
+        )
+    if not isinstance(raw.get("stages"), dict):
+        raise PipelineError(f"状态账里没有 stages（{path}）")
+    return raw
+
+
 class NovelToVideoPipeline:
     """一部小说 → 一套可投产产物的那一条流水线。
 
@@ -729,21 +757,12 @@ class NovelToVideoPipeline:
 
     def state(self) -> dict[str, Any]:
         """读状态账。**没有就是没有**（新项目），不是错误；有但读不动才是错误。"""
-        if not self.state_path.is_file():
-            return {"version": STATE_VERSION, "project": str(self.project), "stages": {}}
-        try:
-            raw = json.loads(self.state_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as err:
-            raise PipelineError(f"状态账读不动（{self.state_path}）：{err}") from err
-        if not isinstance(raw, dict) or raw.get("version") != STATE_VERSION:
-            raise PipelineError(
-                f"状态账的版本不认（{self.state_path} 里是 {raw.get('version')!r}，"
-                f"本程序认 {STATE_VERSION}）。要么换回旧程序，要么删掉它重跑一遍 —— "
-                "猜着读会把「哪一段跑过」读错，之后重跑与不跑都是错的。"
-            )
-        if not isinstance(raw.get("stages"), dict):
-            raise PipelineError(f"状态账里没有 stages（{self.state_path}）")
-        return raw
+        # 读法与判据都在 :func:`read_ledger`（记录页也走它）。
+        # ``setdefault`` 而不是赋值：账里存过 ``project`` 就以账为准，没存过才补上 ——
+        # 靠它把"这部是哪一部"补齐，才不至于让老账（或手写的账）在报告里没有主语。
+        ledger = read_ledger(self.state_path)
+        ledger.setdefault("project", str(self.project))
+        return ledger
 
     def _save_state(self, state: dict[str, Any]) -> None:
         state["updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -1294,6 +1313,118 @@ def state_payload(pipeline: NovelToVideoPipeline) -> dict[str, Any]:
         "stages": state.get("stages", {}),
         **pipeline.roots_payload(),
     }
+
+
+#: 记录页一次摊开多少条。一条 = 一段跑过一次；一部剧最多十一段，200 条够铺十几部剧。
+#: 再加也只是把"翻不完"换成"读得慢"——每多一部剧就多读一份账，而账是逐个文件读的。
+DEFAULT_JOURNAL_LIMIT = 200
+MAX_JOURNAL_LIMIT = 5000
+
+
+def _as_text(value: Any) -> str:
+    """账里的字段按"是字符串就用，不是就当没有"读。
+
+    账是**盘上的 json**，手改过、被别的工具写过都算数，那里可能是 ``null`` 或者数字。
+    ``str()`` 一把梭会把 ``None`` 变成 ``"None"`` 摆到界面上 —— 那比空着更像真的。
+    """
+    return value if isinstance(value, str) else ""
+
+
+def _journal_rank(code: str) -> int:
+    """阶段在链上的先后，用来给同一时刻的几条定序。认不出的排最后（手改的账里可能有别的代号）。"""
+    return STAGE_ORDER.index(code) if code in STAGE_ORDER else len(STAGE_ORDER)
+
+
+def _journal_row(project: str, code: str, record: dict[str, Any]) -> dict[str, Any]:
+    """账里一条 → 时间线上的一行。
+
+    字段名**与账里逐字一致**（``status`` / ``artifact`` / ``at`` / ``note`` / ``error``），
+    这样这一行跟 :meth:`NovelToVideoPipeline.state` 摊出来的那一条是同一件事的两种摆法，
+    面板不必为"时间线里的一行"另立一套字段名。只另外补两样账里没有的：
+    ``project``（时间线是跨项目的，不写清是哪一部就没法看）与 ``name``（阶段的中文名，
+    面板的语言包里没有这个代号时兜底）。
+    """
+    spec = STAGE_BY_CODE.get(code)
+    return {
+        "project": project,
+        "code": code,
+        "name": spec.name if spec is not None else "",
+        "status": _as_text(record.get("status")),
+        "artifact": _as_text(record.get("artifact")),
+        "at": _as_text(record.get("at")),
+        "note": _as_text(record.get("note")),
+        "error": _as_text(record.get("error")),
+    }
+
+
+def journal_payload(
+    library: ProjectLibrary, query: str = "", limit: int = DEFAULT_JOURNAL_LIMIT
+) -> dict[str, Any]:
+    """跨项目的执行记录：把每一部的状态账摊平成**一条按时间倒序的流水**。
+
+    与 :func:`state_payload` 的关系：那个答"**这一部**现在到哪了"（工作台按阶段看），
+    这个答"**所有剧**都跑过什么"（记录页按时间看）。读的是同一份账、走同一个
+    :func:`read_ledger`，只是摆法不同 —— 分别实现的话，"哪一段算跑过"就会有两份规则，
+    而它们分家时谁都不报错。
+
+    **一部剧的账读不动，不该让整页空掉**：那种账记进 ``problems`` 单独列出来，其余照常摊开。
+    反过来（整页报错）的失效模式是：一份手改坏的 json 让用户以为"什么都没跑过"，
+    而真相是几百条记录都在，只有一条读不出来。
+
+    ``query`` 是项目名上的子串过滤（复核某一部剧时用）；``limit`` 只截**摊开的条数**，
+    ``matched`` 始终是过滤后的总条数 —— 面板要靠这两个数说清"还有多少没显示"。
+
+    ⚠️ **只读**：不碰模型、不落盘。
+    """
+    out: dict[str, Any] = {
+        "dir": str(library.directory),
+        "exists": library.directory.is_dir(),
+        "query": query,
+        "limit": int(limit),
+        "projects": 0,
+        "entries": [],
+        "matched": 0,
+        "truncated": False,
+        "updated": "",
+        "problems": [],
+    }
+    if not out["exists"]:
+        return out
+    try:
+        children = sorted(library.directory.iterdir(), key=lambda path: path.name)
+    except OSError as err:
+        raise PipelineError(f"项目根读不动（{library.directory}）：{err}") from err
+    needle = query.strip().lower()
+    rows: list[dict[str, Any]] = []
+    updated = ""
+    for child in children:
+        # 只看目录，且跳过点开头的（``.DS_Store`` 那种会被当成一部剧数进去）。
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        if needle and needle not in child.name.lower():
+            continue
+        out["projects"] += 1
+        try:
+            ledger = read_ledger(child / STATE_REL)
+        except PipelineError as err:
+            # 读到这就说明"这个目录是部剧、但它的账坏了"。只记下它，继续摊其余几部。
+            out["problems"].append({"project": child.name, "error": str(err)})
+            continue
+        stamp = ledger.get("updated")
+        if isinstance(stamp, str) and stamp > updated:
+            updated = stamp
+        for code, record in ledger["stages"].items():
+            if isinstance(record, dict):
+                rows.append(_journal_row(child.name, str(code), record))
+    # 两趟排：先按"哪一部 · 第几段"定序，再按时间倒序 —— 后一趟是稳定排序，
+    # 于是同一时刻（或同样没记时间）的几条仍保持着链上的先后。
+    rows.sort(key=lambda row: (row["project"], _journal_rank(row["code"])))
+    rows.sort(key=lambda row: row["at"], reverse=True)
+    out["updated"] = updated
+    out["matched"] = len(rows)
+    out["entries"] = rows[: out["limit"]]
+    out["truncated"] = len(out["entries"]) < len(rows)
+    return out
 
 
 #: 工作台每一步的落点里，回话里带几个文件名。带全了没用（`08_STORYBOARDS/` 上千个文件），

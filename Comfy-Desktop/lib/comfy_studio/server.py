@@ -39,6 +39,8 @@
 ``pipeline/run``         ``{name, novel?, episodes?, from?, to?, force?}`` → 跑流水线；
                          过程中推 ``pipeline/event`` 通知（与 ``agent/event`` 一个路子）
 ``pipeline/state``       ``{name}`` → 进度账：哪一段跑过、产物是哪一份
+``journal/list``         ``{name?, limit?}`` → 记录页：所有剧跑过的每一段，按时间倒序摊平
+                         （跨项目；``name`` 只当子串过滤，不给就是全看）
 ======================  ==============================================
 
 ``agent/canvas_result`` / ``agent/answer`` / ``agent/plan_result`` 是三条「回程」：桌面壳要
@@ -107,9 +109,12 @@ from .novels import (
 )
 from .panel import PanelContextError, describe_context, parse_context
 from .pipeline import (
+    DEFAULT_JOURNAL_LIMIT,
+    MAX_JOURNAL_LIMIT,
     NovelToVideoPipeline,
     PipelineClient,
     PipelineError,
+    journal_payload,
     plan_payload,
     state_payload,
     steps_payload,
@@ -377,6 +382,7 @@ class StudioHost:
         self.server.on("pipeline/run", self.pipeline_run)
         self.server.on("pipeline/state", self.pipeline_state)
         self.server.on("pipeline/steps", self.pipeline_steps)
+        self.server.on("journal/list", self.journal_list)
 
     # ---- 方法 -----------------------------------------------------------
 
@@ -1637,6 +1643,32 @@ class StudioHost:
         pipeline = self._make_pipeline(args, "pipeline/steps", config=None)
         try:
             return steps_payload(pipeline, self._projects())
+        except PipelineError as err:
+            raise RpcError(INTERNAL_ERROR, str(err)) from err
+
+    def journal_list(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
+        """记录页：所有剧跑过的每一段，摊成一条按时间倒序的流水。
+
+        与 :meth:`pipeline_state` 的分工：那个答"**这一部**现在到哪了"，要 ``name``；
+        这个答"**所有剧**都跑过什么"，跨项目，所以不问 ``name``（``name`` 只当子串过滤用），
+        根目录从项目库拿。形状由 :func:`comfy_studio.pipeline.journal_payload` 定。
+
+        **不调模型、不落盘**：打开这一页不会花钱，也不会把任何项目写动。
+        """
+        args = _object(params, "journal/list")
+        name = args.get("name")
+        if name is not None and not isinstance(name, str):
+            raise RpcError(INVALID_PARAMS, "name 必须是字符串")
+        limit = _int_param(
+            args,
+            "limit",
+            DEFAULT_JOURNAL_LIMIT,
+            low=1,
+            high=MAX_JOURNAL_LIMIT,
+            method="journal/list",
+        )
+        try:
+            return journal_payload(self._projects(), name or "", limit)
         except PipelineError as err:
             raise RpcError(INTERNAL_ERROR, str(err)) from err
 
