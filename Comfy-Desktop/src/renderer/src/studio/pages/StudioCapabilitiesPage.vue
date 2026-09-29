@@ -8,21 +8,31 @@
  * engine directory is something to go and fix, a genuinely empty catalog is not.
  * See `groupState` for how the two are told apart.
  *
- * MCP tools stay read-only: they are called by the agent, not by this panel.
+ * Three of the four groups can also be run from here, and the form opens in
+ * place rather than on the production page: the point of this page is the
+ * catalogue, and a form next to the entry you just read keeps the parameters,
+ * the description and the result in one eyeful. Skills use `skills/run`, render
+ * targets use `renders/run` with `target_id`, and workflow files use
+ * `renders/run` with `file` — that last one is the path the host documents for
+ * "an image the user saved themselves", which runs the graph *as stored* and
+ * takes no parameters. MCP tools stay read-only: they are called by the agent,
+ * not by this panel.
  */
-import { computed, onMounted } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import {
   AlertCircle,
   Boxes,
   Image,
   LoaderCircle,
+  Play,
   RefreshCw,
   Sparkles,
   TriangleAlert,
   Wrench
 } from 'lucide-vue-next'
 import { useCapabilitiesStore } from '../../stores/capabilitiesStore'
+import { useCapabilityRunStore, type RunRefusal } from '../../stores/capabilityRunStore'
 import {
   capabilityTallies,
   groupState,
@@ -30,14 +40,72 @@ import {
   toolParamCount,
   type SkillParam
 } from './capabilities'
+import { renderKey, skillKey } from './runs'
 import { formatBytes } from './novels'
+import StudioRunForm from '../StudioRunForm.vue'
+import StudioRunResult from '../StudioRunResult.vue'
 
 const capabilities = useCapabilitiesStore()
+const runs = useCapabilityRunStore()
 const { t, n } = useI18n()
 
 onMounted(() => {
   if (!capabilities.loaded) void capabilities.refresh()
 })
+
+/** Which row's form is open. One at a time: the forms are wide, and two open
+ *  forms would push the entry you are reading off screen. */
+const openRun = ref<string | null>(null)
+/** Rows refused locally (currently only a non-numeric duration). */
+const refusals = ref<Record<string, RunRefusal>>({})
+
+function toggleRun(key: string): void {
+  openRun.value = openRun.value === key ? null : key
+  if (openRun.value) {
+    delete refusals.value[key]
+    runs.clear(key)
+  }
+}
+
+/** Runs always go through the store, so a refused request reports its reason
+ *  next to the form that produced it rather than as a toast elsewhere. */
+async function submitSkill(skillId: string, params: Record<string, unknown>): Promise<void> {
+  const answer = await runs.runSkill(skillId, params)
+  if (!answer.ok && answer.refusal) refusals.value[skillKey(skillId)] = answer.refusal
+}
+
+async function submitRender(
+  target: { targetId: string },
+  payload: { params: Record<string, unknown>; images: string; durationSec: string; outputDir: string }
+): Promise<void> {
+  await runRenderAt({ targetId: target.targetId }, renderKey(target.targetId), payload)
+}
+
+/** A workflow file run: `renders/run`'s other addressing mode, for images the
+ *  user saved themselves. Fully keyed by filename, so its run state has to be
+ *  keyed the same way — a file and a target sharing a result slot would show one
+ *  row's artefacts under the other. */
+async function submitFile(
+  file: string,
+  payload: { params: Record<string, unknown>; images: string; durationSec: string; outputDir: string }
+): Promise<void> {
+  await runRenderAt({ file }, renderKey(file), payload)
+}
+
+async function runRenderAt(
+  target: { targetId?: string; file?: string },
+  key: string,
+  payload: { params: Record<string, unknown>; images: string; durationSec: string; outputDir: string }
+): Promise<void> {
+  const answer = await runs.runRender(target, payload)
+  if (!answer.ok && answer.refusal) refusals.value[key] = answer.refusal
+}
+
+function refusalFor(key: string): string {
+  const refusal = refusals.value[key]
+  if (refusal === 'duration') return t('studio.capabilities.run.badDuration')
+  return ''
+}
 
 const tallies = computed(() =>
   capabilityTallies({
@@ -106,12 +174,38 @@ function requiredNames(params: readonly SkillParam[]): string {
             <div class="caps__rowHead">
               <span class="caps__rowTitle">{{ skill.title || skill.id }}</span>
               <span class="caps__id">{{ skill.id }}</span>
+              <button
+                type="button"
+                class="caps__run"
+                :aria-expanded="openRun === skillKey(skill.id)"
+                @click="toggleRun(skillKey(skill.id))"
+              >
+                <Play :size="11" />
+                <span>{{ t('studio.capabilities.run.open') }}</span>
+              </button>
             </div>
             <p v-if="skill.description" class="caps__desc">{{ skill.description }}</p>
             <p v-if="requiredNames(skill.params)" class="caps__dim">
               {{ t('studio.capabilities.required', { names: requiredNames(skill.params) }) }}
             </p>
             <p v-if="skill.tags.length > 0" class="caps__dim">{{ skill.tags.join(' · ') }}</p>
+
+            <StudioRunForm
+              v-if="openRun === skillKey(skill.id)"
+              :params="skill.params"
+              :busy="runs.isRunning(skillKey(skill.id))"
+              @submit="submitSkill(skill.id, $event.params)"
+              @cancel="toggleRun(skillKey(skill.id))"
+            />
+            <p v-if="refusalFor(skillKey(skill.id))" class="caps__error">
+              <AlertCircle :size="11" />
+              <span>{{ refusalFor(skillKey(skill.id)) }}</span>
+            </p>
+            <StudioRunResult
+              v-if="openRun === skillKey(skill.id)"
+              :outcome="runs.outcomeFor(skillKey(skill.id))"
+              :error="runs.errorFor(skillKey(skill.id))"
+            />
           </li>
         </ul>
       </section>
@@ -145,12 +239,42 @@ function requiredNames(params: readonly SkillParam[]): string {
                   <TriangleAlert :size="11" />
                   <span>{{ t('studio.capabilities.fileMissing') }}</span>
                 </span>
+                <button
+                  type="button"
+                  class="caps__run"
+                  :disabled="!target.fileExists"
+                  :title="target.fileExists ? '' : t('studio.capabilities.fileMissing')"
+                  :aria-expanded="openRun === renderKey(target.id)"
+                  @click="toggleRun(renderKey(target.id))"
+                >
+                  <Play :size="11" />
+                  <span>{{ t('studio.capabilities.run.open') }}</span>
+                </button>
               </div>
               <p v-if="target.description" class="caps__desc">{{ target.description }}</p>
               <p class="caps__dim caps__mono">{{ target.file }}</p>
               <p v-if="requiredNames(target.params)" class="caps__dim">
                 {{ t('studio.capabilities.required', { names: requiredNames(target.params) }) }}
               </p>
+
+              <StudioRunForm
+                v-if="openRun === renderKey(target.id)"
+                :params="target.params"
+                :busy="runs.isRunning(renderKey(target.id))"
+                with-media
+                :reference-images="target.referenceImages"
+                @submit="submitRender({ targetId: target.id }, $event)"
+                @cancel="toggleRun(renderKey(target.id))"
+              />
+              <p v-if="refusalFor(renderKey(target.id))" class="caps__error">
+                <AlertCircle :size="11" />
+                <span>{{ refusalFor(renderKey(target.id)) }}</span>
+              </p>
+              <StudioRunResult
+                v-if="openRun === renderKey(target.id)"
+                :outcome="runs.outcomeFor(renderKey(target.id))"
+                :error="runs.errorFor(renderKey(target.id))"
+              />
             </li>
           </ul>
         </template>
@@ -182,6 +306,15 @@ function requiredNames(params: readonly SkillParam[]): string {
               <div class="caps__rowHead">
                 <span class="caps__rowTitle caps__mono">{{ file.file }}</span>
                 <span class="caps__dim">{{ formatBytes(file.bytes) }}</span>
+                <button
+                  type="button"
+                  class="caps__run"
+                  :aria-expanded="openRun === renderKey(file.file)"
+                  @click="toggleRun(renderKey(file.file))"
+                >
+                  <Play :size="11" />
+                  <span>{{ t('studio.capabilities.run.openFile') }}</span>
+                </button>
               </div>
               <p class="caps__dim">
                 <template v-if="file.usedBy.length > 0">
@@ -190,6 +323,25 @@ function requiredNames(params: readonly SkillParam[]): string {
                 <template v-else>{{ t('studio.capabilities.unregistered') }}</template>
                 <span v-if="file.modified"> · {{ file.modified }}</span>
               </p>
+
+              <StudioRunForm
+                v-if="openRun === renderKey(file.file)"
+                :params="[]"
+                :busy="runs.isRunning(renderKey(file.file))"
+                with-media
+                reference-images
+                @submit="submitFile(file.file, $event)"
+                @cancel="toggleRun(renderKey(file.file))"
+              />
+              <p v-if="refusalFor(renderKey(file.file))" class="caps__error">
+                <AlertCircle :size="11" />
+                <span>{{ refusalFor(renderKey(file.file)) }}</span>
+              </p>
+              <StudioRunResult
+                v-if="openRun === renderKey(file.file)"
+                :outcome="runs.outcomeFor(renderKey(file.file))"
+                :error="runs.errorFor(renderKey(file.file))"
+              />
             </li>
           </ul>
         </template>
@@ -385,6 +537,36 @@ function requiredNames(params: readonly SkillParam[]): string {
   gap: 3px;
   color: var(--warning);
   font-size: 10px;
+}
+
+.caps__run {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 6px;
+  border: 1px solid var(--studio-card-border);
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-faint);
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.caps__run:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.caps__run[aria-expanded='true'] {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.caps__run:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 
 .caps__error {

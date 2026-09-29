@@ -7,6 +7,10 @@
  * behaviour is the subtle part: the stream follows new cards only while the user
  * is already at the bottom, otherwise it stays put and offers a jump button —
  * yanking the view down while someone reads history is the classic bug here.
+ *
+ * `StudioRailSetup` sits between the session controls and the stream: the model
+ * and agent answer *who* is talking, which is a property of the conversation
+ * rather than of a page, so it belongs in the column that never leaves.
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -15,6 +19,7 @@ import { useConversationStore, copyText } from '../stores/conversationStore'
 import { useStudioStore } from '../stores/studioStore'
 import StudioComposer from './StudioComposer.vue'
 import StudioMessage from './StudioMessage.vue'
+import StudioRailSetup from './StudioRailSetup.vue'
 
 const { t } = useI18n()
 const conversation = useConversationStore()
@@ -235,6 +240,8 @@ onBeforeUnmount(() => {
         <X :size="13" />
       </button>
     </div>
+
+    <StudioRailSetup />
 
     <div ref="stream" class="rail__stream" @scroll.passive="onScroll">
       <p v-if="conversation.loadingHistory" class="rail__loading">{{ t('studio.rail.loading') }}</p>
