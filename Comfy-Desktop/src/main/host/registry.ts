@@ -36,6 +36,11 @@ export type ComfyPanelKey =
   /** Overlay mode (like `'feedback'`): the launch-announcement modal, opened
    *  from the title-bar news bell. Set programmatically. */
   | 'announcement'
+  /** The native comfy-studio (漫剧) surface: conversation rail + task panel,
+   *  rebuilt from the injected drawer as a desktop Vue view. Full-page body
+   *  (opaque, covers the canvas) — opened from the File menu and closed with
+   *  the page-level ✕. */
+  | 'studio'
 
 export const VALID_PANELS: ReadonlySet<ComfyPanelKey> = new Set([
   'comfy',
@@ -48,7 +53,8 @@ export const VALID_PANELS: ReadonlySet<ComfyPanelKey> = new Set([
   'quick-install',
   'progress',
   'mcp-setup',
-  'announcement'
+  'announcement',
+  'studio'
 ])
 
 /**
@@ -72,6 +78,7 @@ export type BodyMode =
   | 'quick-install'
   | 'mcp-setup'
   | 'announcement'
+  | 'studio'
 
 /**
  * Per-installation handle for a ComfyUI window. The window is a parent

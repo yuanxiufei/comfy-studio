@@ -2,6 +2,11 @@
 // This file is the single source of truth — do not duplicate these types elsewhere.
 
 import type { FirstUseMode } from '../shared/firstUseMode'
+import type {
+  ComfyStudioEventMessage,
+  ComfyStudioRequestResult,
+  ComfyStudioStatus
+} from './comfyDesktopBridge'
 import type { GpuTier } from '../shared/gpuTier'
 export type { FirstUseMode }
 
@@ -1857,6 +1862,24 @@ export interface ElectronApi {
   onErrorDetail(callback: (data: ErrorDetailData) => void): Unsubscribe
   onSuggestChineseMirrors(callback: () => void): Unsubscribe
   onSettingsChanged(callback: (data: { key: string }) => void): Unsubscribe
+  /**
+   * comfy-studio (漫剧) host, as seen from the panel renderer. Same host process
+   * and same JSON-RPC method names the injected drawer drives; `installationId`
+   * is explicit because a panelView sender is not a comfyView sender and main
+   * cannot infer one. Resolves to the host's own `{ ok, result }` envelope.
+   */
+  studioStatus(installationId?: string): Promise<ComfyStudioStatus>
+  studioStart(installationId?: string): Promise<ComfyStudioStatus>
+  studioStop(installationId?: string): Promise<ComfyStudioStatus>
+  studioRequest(
+    method: string,
+    params?: Record<string, unknown>,
+    installationId?: string
+  ): Promise<ComfyStudioRequestResult>
+  /** Host notifications (`agent/event` and friends), already tagged with the
+   *  originating `installationId` — filter on it when several Comfy windows
+   *  are open, since this channel is app-wide. */
+  onStudioEvent(callback: (message: ComfyStudioEventMessage) => void): Unsubscribe
   /**
    * Fired by main when something requests a panel switch in the embedded
    * panel WebContentsView (e.g. from the ComfyUI window's title-bar buttons).

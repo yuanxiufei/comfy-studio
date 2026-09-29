@@ -808,6 +808,10 @@ export function buildTitlePopupMenuItems(entry: ComfyWindowEntry): TitlePopupMen
     )
   }
   items.push(
+    // Native comfy-studio (漫剧) surface. Kept in the menu even while the
+    // injected drawer is the default surface (`studioSurface`), so both can be
+    // compared side by side during the rebuild.
+    { id: 'studio', label: 'Studio', labelKey: 'fileMenu.studio' },
     {
       id: 'performance-test',
       label: 'Performance Tests',
@@ -2043,6 +2047,11 @@ export function activateTitlePopupMenuItem(
     // via `comfy-window:click-feedback`; `source` distinguishes the
     // two entry points in the telemetry payload.
     bindings.triggerOpenFeedback(entry.parentEntryId, 'menu')
+  } else if (id === 'studio') {
+    // `setActivePanel` builds (and lazily rebuilds) the panelView in the opaque
+    // `'studio'` body mode itself, so the canvas is covered before Vue paints —
+    // no separate `ensurePanelViewForEntry` hop needed here.
+    if (parentEntry) bindings.setActivePanel(parentEntry.windowKey, 'studio')
   } else if (id === 'sign-in') {
     // No renderer in this loop — the popup is its own WebContentsView — so the
     // menu calls the same primitive `comfybuilder:signIn` does, which is what

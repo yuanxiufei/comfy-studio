@@ -192,6 +192,7 @@ describe('buildTitlePopupMenuItems', () => {
       'track',
       'load-snapshot',
       'sign-in',
+      'studio',
       'performance-test',
       'benchmarks',
       'settings',
@@ -213,6 +214,7 @@ describe('buildTitlePopupMenuItems', () => {
       'track',
       'load-snapshot',
       'sign-in',
+      'studio',
       'performance-test',
       'benchmarks',
       'settings',
@@ -235,6 +237,7 @@ describe('buildTitlePopupMenuItems', () => {
       'new-install',
       'track',
       'load-snapshot',
+      'studio',
       'performance-test',
       'benchmarks',
       'settings',
@@ -253,6 +256,7 @@ describe('buildTitlePopupMenuItems', () => {
       'track',
       'load-snapshot',
       'sign-in',
+      'studio',
       'performance-test',
       'benchmarks',
       'settings',
@@ -308,20 +312,22 @@ describe('buildTitlePopupMenuItems', () => {
     expect(ids[ids.length - 1]).toBe('close-all-windows')
   })
 
-  it('separates Log in from the Performance Test and Benchmarks group', () => {
+  it('separates Log in from the Studio, Performance Test and Benchmarks group', () => {
     const items = buildTitlePopupMenuItems(makeEntry({ installationId: null }))
     const signInIdx = items.findIndex((i) => i.id === 'sign-in')
     expect(items[signInIdx + 1]?.kind).toBe('separator')
-    expect(items[signInIdx + 2]?.id).toBe('performance-test')
-    expect(items[signInIdx + 3]?.id).toBe('benchmarks')
+    expect(items[signInIdx + 2]?.id).toBe('studio')
+    expect(items[signInIdx + 3]?.id).toBe('performance-test')
+    expect(items[signInIdx + 4]?.id).toBe('benchmarks')
   })
 
-  it('does not leave a doubled separator above Performance Test once signed in', () => {
+  it('does not leave a doubled separator above the Studio group once signed in', () => {
     devPlatformMocks.isSignedInToCloud.mockReturnValue(true)
     const items = buildTitlePopupMenuItems(makeEntry({ installationId: null }))
-    const performanceTestsIdx = items.findIndex((i) => i.id === 'performance-test')
-    expect(items[performanceTestsIdx - 1]?.kind).toBe('separator')
-    expect(items[performanceTestsIdx - 2]?.kind).not.toBe('separator')
+    const studioIdx = items.findIndex((i) => i.id === 'studio')
+    expect(items[studioIdx - 1]?.kind).toBe('separator')
+    expect(items[studioIdx - 2]?.kind).not.toBe('separator')
+    expect(items[studioIdx + 1]?.id).toBe('performance-test')
   })
 
   it('groups Performance Test and Benchmarks above a separator and Desktop Settings', () => {

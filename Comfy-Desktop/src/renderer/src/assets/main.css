@@ -103,6 +103,15 @@
      dismiss. */
   --overlay-bg-opaque: var(--bg);
 
+  /* comfy-studio (漫剧) surface. Three planes, one step apart: the rail reads
+   * darker than the working panel, a card reads lighter than both — so the
+   * conversation stays backgrounded without being dimmed into unreadability. */
+  --studio-rail-bg: #1c1720;
+  --studio-panel-bg: var(--bg);
+  --studio-band-bg: #241e29;
+  --studio-card-bg: #29252c;
+  --studio-card-border: #37303f;
+
   /* Comfy brand neutral ramp — single canonical scale. Yellow at 50,
    * warm grays through deep ink at 950. See @theme block for usage
    * notes. Mirrored here as raw values so scoped CSS can read them via
@@ -198,6 +207,13 @@
   --overlay-bg: rgba(0, 0, 0, 0.35);
   --overlay-bg-heavy: rgba(0, 0, 0, 0.55);
   --overlay-bg-opaque: var(--bg);
+
+  /* comfy-studio (漫剧) surface — see the dark block for the plane rationale. */
+  --studio-rail-bg: #f4f4f5;
+  --studio-panel-bg: var(--bg);
+  --studio-band-bg: #ececec;
+  --studio-card-bg: #ffffff;
+  --studio-card-border: #dcdcdc;
 
   /* Brand neutral ramp — placeholders mirrored from dark.
    * TODO(light-brand-parity): remap when light brand lands. */

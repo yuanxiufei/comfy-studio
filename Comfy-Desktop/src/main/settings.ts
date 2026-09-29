@@ -81,6 +81,12 @@ export interface KnownSettings {
    *  can opt out of seeing it without us removing the feature. Default
    *  false — Cloud stays visible. */
   hideCloudFromPicker?: boolean
+  /** Which surface renders the comfy-studio (漫剧) UI in a Comfy window.
+   *  `'native'` = the desktop Vue panel (body mode `'studio'`); anything else
+   *  (`'injected'`, or unset) = the legacy drawer injected into the ComfyUI
+   *  page. Kept switchable so the native rebuild can never remove a working
+   *  surface; the studio panel header exposes the flip. */
+  studioSurface?: 'native' | 'injected'
   oemManagedModelDirs?: string[]
   oemWorkflowImportVersion?: number
   /** Directory the user last chose in the general "Save image/file" dialog.
@@ -289,6 +295,12 @@ const SETTINGS_SCHEMA = {
   hideCloudFromPicker: {
     nullable: false,
     telemetry: { policy: 'value', toTelemetry: (raw) => raw === true }
+  },
+  // Coarse operator preference, not a per-user feature flag: report only
+  // "did they move to the native surface".
+  studioSurface: {
+    nullable: false,
+    telemetry: { policy: 'value', toTelemetry: (raw) => raw === 'native' }
   },
   oemManagedModelDirs: { nullable: false, telemetry: { policy: 'presence' } },
   oemWorkflowImportVersion: { nullable: false, telemetry: { policy: 'omit' } },

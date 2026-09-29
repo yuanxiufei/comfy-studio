@@ -29,6 +29,7 @@ import {
 import { buildTemplateDeeplink } from '../sources/standalone/curatedTemplates'
 import { abortTemplateDownload } from '../sources/standalone/templateDownloadTask'
 import { abortModelStaging } from '../sources/comfybuilder/modelStagingTask'
+import { get as getSetting } from '../settings'
 import {
   dropInstallationIndex,
   indexInstallationId,
@@ -445,7 +446,15 @@ export function attachInstall(entry: ComfyWindowEntry, opts: AttachInstallOpts):
       // terminal above, and deliberately NOT flag-gated: the script bails out on
       // its own when the desktop preload exposes no `ComfyStudio` bridge, so an
       // older shell simply gets no button instead of a broken one.
-      comfyContents.executeJavaScript(getComfyStudioChatContentScript()).catch(() => {})
+      //
+      // Skipped entirely once `studioSurface === 'native'`, i.e. the user runs
+      // the desktop Vue studio panel (body mode `'studio'`) — the drawer would
+      // otherwise duplicate the same host behind a second entry point. The
+      // canvas relay is unaffected: it drives the page directly from main and
+      // never depended on this script.
+      if (getSetting('studioSurface') !== 'native') {
+        comfyContents.executeJavaScript(getComfyStudioChatContentScript()).catch(() => {})
+      }
       // Local MCP sidebar icon, flag-gated. `getFlagAsync` awaits the in-flight
       // boot fetch so a cold start (empty cache) still resolves the flag before
       // the gate decides; a sync read here would see the not-yet-populated cache

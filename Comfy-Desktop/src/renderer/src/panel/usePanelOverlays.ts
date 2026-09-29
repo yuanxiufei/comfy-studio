@@ -42,6 +42,10 @@ export type PanelKey =
    *  no body branch. Accepting the key keeps `isValidPanel` from swallowing
    *  the panel-switch so the overlay transparency watcher still fires. */
   | 'announcement'
+  /** Mirror of main's `'studio'` ComfyPanelKey: the native comfy-studio (漫剧)
+   *  surface. A full-page body branch (opaque, canvas hidden) — see
+   *  `PanelApp.vue`. */
+  | 'studio'
 
 const VALID_PANELS: ReadonlySet<PanelKey> = new Set([
   'comfy',
@@ -56,7 +60,8 @@ const VALID_PANELS: ReadonlySet<PanelKey> = new Set([
   'quick-install',
   'progress',
   'mcp-setup',
-  'announcement'
+  'announcement',
+  'studio'
 ])
 
 /**

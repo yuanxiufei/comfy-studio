@@ -522,6 +522,26 @@ export function buildElectronApi(): ElectronApi {
       ipcRenderer.on('suggest-chinese-mirrors', handler)
       return () => ipcRenderer.removeListener('suggest-chinese-mirrors', handler)
     },
+    // comfy-studio (漫剧) host bridge — the same `comfy-studio:*` IPC the
+    // injected drawer uses, re-exposed to the panel renderer so the native
+    // studio surface can drive the same host process. The panel is NOT the
+    // comfyView, so main can't resolve the installation from the sender; every
+    // call carries it explicitly.
+    studioStatus: (installationId) => ipcRenderer.invoke('comfy-studio:status', installationId ?? null),
+    studioStart: (installationId) => ipcRenderer.invoke('comfy-studio:start', installationId ?? null),
+    studioStop: (installationId) => ipcRenderer.invoke('comfy-studio:stop', installationId ?? null),
+    studioRequest: (method, params, installationId) =>
+      ipcRenderer.invoke('comfy-studio:request', {
+        method,
+        params,
+        installationId: installationId ?? null
+      }),
+    onStudioEvent: (callback) => {
+      const handler = (_event: IpcRendererEvent, data: unknown) =>
+        callback(data as Parameters<typeof callback>[0])
+      ipcRenderer.on('comfy-studio:event', handler)
+      return () => ipcRenderer.removeListener('comfy-studio:event', handler)
+    },
     onSettingsChanged: (callback) => {
       const handler = (_event: IpcRendererEvent, data: unknown) => callback(data as { key: string })
       ipcRenderer.on('settings-changed', handler)

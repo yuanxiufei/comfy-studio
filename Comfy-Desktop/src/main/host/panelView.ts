@@ -38,6 +38,7 @@ function isOpaqueBodyMode(mode: BodyMode): boolean {
     mode === 'performance-test' ||
     mode === 'benchmarks' ||
     mode === 'new-install' ||
+    mode === 'studio' ||
     mode === 'comfy-lifecycle'
   )
 }
