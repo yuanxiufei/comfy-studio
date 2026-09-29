@@ -17,6 +17,7 @@ import QuickInstallModal from '../views/QuickInstallModal.vue'
 import FirstUseTakeover from '../views/FirstUseTakeover.vue'
 import MigrateConfirmTakeover from '../views/MigrateConfirmTakeover.vue'
 import McpSetupModal from '../views/mcp/McpSetupModal.vue'
+import StudioApp from '../studio/StudioApp.vue'
 import { useTheme } from '../composables/useTheme'
 import { useSessionStore } from '../stores/sessionStore'
 import { useInstallationStore } from '../stores/installationStore'
@@ -366,6 +367,14 @@ function handleMcpClose(): void {
 }
 
 /**
+ * Closes the native studio surface. Unlike the MCP overlay this is an opaque
+ * full-page body, so closing it hands the window back to the canvas.
+ */
+function handleStudioClose(): void {
+  window.api.closeCurrentPanel()
+}
+
+/**
  * Handles the "Open terminal" CTA.
  * Switches to the console tab, and restores the canvas when closed.
  */
@@ -598,6 +607,13 @@ onUnmounted(() => {
           />
         </div>
 
+        <!-- Native comfy-studio (漫剧) surface. Full-page body: the canvas is
+             hidden while it is open, and the studio owns its own rail/panel
+             split (so `panel-content` drops its gutter — see the CSS below). -->
+        <div v-else-if="activePanel === 'studio'" class="panel-studio">
+          <StudioApp :installation-id="installationId" @close="handleStudioClose" />
+        </div>
+
         <div v-else-if="activePanel === 'chooser'" class="panel-chooser">
           <ChooserView
             @pick="handleChooserPick"
@@ -736,7 +752,8 @@ body.panel-overlay-mode .panel-shell {
 .panel-content:has(.panel-comfy-lifecycle),
 .panel-content:has(.panel-chooser),
 .panel-content:has(.panel-performance-test),
-.panel-content:has(.panel-benchmarks) {
+.panel-content:has(.panel-benchmarks),
+.panel-content:has(.panel-studio) {
   padding: 0;
 }
 
@@ -754,7 +771,8 @@ body.panel-overlay-mode .panel-shell {
 .panel-comfy-lifecycle,
 .panel-chooser,
 .panel-performance-test,
-.panel-benchmarks {
+.panel-benchmarks,
+.panel-studio {
   flex: 1;
   min-height: 0;
   display: flex;
