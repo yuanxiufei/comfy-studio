@@ -6811,6 +6811,8 @@ function buildWorkbenchView() {
 }
 
 // 剧目下拉里的选项：只列得出项目名字（工作台要的是"哪一部戏"，别的栏位在这儿没用）。
+// 不吃 refresh：下拉是"顺带填一下"，宿主那份体检快照（projects.py 的 _scan）够用 ——
+// 快照的上限是一秒，而面板自己建的项目一落盘就把旧快照作废了（_forget_snapshots）。
 function loadWorkbenchOptions() {
   var select = document.getElementById(WORKBENCH_PROJECT_ID);
   if (!select) return Promise.resolve();
@@ -7248,6 +7250,7 @@ function pipelineArgs() {
 // 存一份就得操心它什么时候过期，而"这部戏刚被删掉"这种事没人会记得同步。
 // 已选中的那部戏留着：切页回来不该把挑好的东西丢掉；它已经不在列表里也照留，并写清
 // "目录里没这一部"，让后面那句报错有的放矢，而不是悄悄换成另一部戏跑起来。
+// 同样不吃 refresh（理由见 loadWorkbenchOptions）：这两个下拉是顺带填的。
 function loadPipelineOptions() {
   var projectSelect = document.getElementById(PIPELINE_PROJECT_ID);
   var novelSelect = document.getElementById(PIPELINE_NOVEL_ID);
@@ -7599,7 +7602,7 @@ function buildProjectView() {
   bar.className = 'cs-proj-bar';
   bar.appendChild(
     projectButton('刷新', '重新列一遍项目目录（一剧一目录）', function () {
-      loadProjects();
+      loadProjects(true);
     })
   );
   bar.appendChild(
@@ -7753,7 +7756,12 @@ function buildProjectView() {
 
 // 列项目：每次切到这一页都重列（见 switchView）。这一趟拿个票，回来时票不对就丢掉 ——
 // 连点两下刷新时，先发的请求后回来会把新列表盖成旧的。
-function loadProjects() {
+//
+// fresh：只有用户按了"刷新"才传。切页来这一趟吃宿主那份一秒窗口的体检快照
+// （projects.py 的 _scan）—— 它换来的是"来回切页签不至于每次都重扫几十部剧"，
+// 而上限一秒的旧在"人眼看这一页"这件事上够不着。按刷新那一下不吃：那一句就是
+// "我现在要看盘上是什么样"。面板自己建/搬的那两趟也不用传：那几笔会让宿主作废旧快照。
+function loadProjects(fresh) {
   // 筛项目那串字交给宿主去匹配（见 buildProjectFind）：面板不在这里自己过滤 ——
   // 宿主那份列表本来就可能被截断，面板再筛一遍只会把"没列出来的"永远藏起来。
   var query = String(STATE.projectFind || '').trim();
@@ -7764,7 +7772,9 @@ function loadProjects() {
   }
   STATE.projectListToken = (STATE.projectListToken || 0) + 1;
   var ticket = STATE.projectListToken;
-  return Promise.resolve(bridge.request('projects/list', query ? { name: query } : {})).then(
+  var params = query ? { name: query } : {};
+  if (fresh === true) params.refresh = true;   // 不传就是吃快照：别给宿主多一个"我现在要现取"的信号
+  return Promise.resolve(bridge.request('projects/list', params)).then(
     function (response) {
       if (STATE.projectListToken !== ticket) return null;
       if (!response || response.ok !== true) {

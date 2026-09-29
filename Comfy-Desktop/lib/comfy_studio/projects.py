@@ -42,6 +42,7 @@ import inspect
 import json
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -72,6 +73,21 @@ MAX_READ_CHARS = 40000
 #: :meth:`ProjectLibrary.list` 一次最多列几部剧。
 DEFAULT_LIST_LIMIT = 200
 MAX_LIST_LIMIT = 1000
+
+#: 一次体检快照在内存里留几条（见 :meth:`ProjectLibrary._scan`）。
+#: 64 是"一整页的项目群"的两倍：面板一屏列得下的量级，再往上留也只是占地方。
+SNAPSHOT_MAX_ENTRIES = 64
+
+#: 一份体检快照最多"还算数"多少秒（见 :meth:`ProjectLibrary._scan`）。
+#:
+#: **为什么是时间窗口，而不是"项目目录的 mtime"**：设计稿 §5 那条建议以
+#: ``（项目路径 + 顶层 mtime）`` 为键，实测在本平台上撑不住 —— 往 `08_STORYBOARDS/`
+#: 里新写一份分镜，**那一格自己的 mtime 要过一会儿才变**（Windows 的目录时间戳是延迟
+#: 更新的：写入后 100ms 内读还是旧值，1.1s 后才变）。拿它当键，键会在"盘上已经变了"的
+#: 时候还说没变，于是列表给出旧数 —— 正是这条优化最该避免的那种错法。
+#: 窗口一秒是"人手够不着、连问够用"的量级：三个页面连着打开、抽屉来回切页签、
+#: 模型连着问两遍，都并成一次扫描；而任何人要"盘上此刻"的样子，有 ``refresh=True``。
+SNAPSHOT_MAX_AGE_SECONDS = 1.0
 
 #: 一集默认几集（建项目那一步要填进模板占位符）。
 DEFAULT_EPISODES = 12
@@ -485,6 +501,9 @@ class ProjectLibrary:
         #: 事实源模块（懒载入一次，见 :meth:`spec`）；载不上就把原因留在 ``_spec_error``。
         self._spec: Any = None
         self._spec_error = ""
+        #: 体检快照：``(取这份的时刻, scan_project 的原样结果)``，键是 ``(资料根, 产物根)``。
+        #: 字典的**顺序**就是使用顺序（命中挪到队尾，满了从队头丢），见 :meth:`_scan`。
+        self._snapshots: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 
     @property
     def single_root(self) -> bool:
@@ -638,7 +657,54 @@ class ProjectLibrary:
 
     # ---- 体检 -----------------------------------------------------------
 
-    def _summary(self, path: Path, spec: Any, out_path: Path | None = None) -> dict[str, Any]:
+    def _forget_snapshots(self) -> None:
+        """盘上刚动过东西（本库自己写的/搬的/建的）→ 全部快照作废。
+
+        一处全清，而不是按项目精确失效：写一次是"人点了一下"的量级，全清最多让下一次
+        列表多走几遍全树；而按项目算失效条件一旦算漏（两个根、名字大小写、移动端路径），
+        留下的是一份**看起来还有效**的旧快照 —— 那要贵得多。
+        """
+        self._snapshots.clear()
+
+    def _scan(self, spec: Any, path: Path, out: Path, *, refresh: bool = False) -> dict[str, Any]:
+        """``spec.scan_project`` 的结果，带一层**一秒窗口**的快照（见 :data:`SNAPSHOT_MAX_AGE_SECONDS`）。
+
+        省掉的是"整棵树走一遍"：单部上到上千文件时那一遍是毫秒级，几十部乘起来就是
+        列表页每次点开的固定代价（实测数据见 ``架构与性能设计.md`` §5）。
+        换来的是**上限一秒**的旧：窗口之内连着问几次（页面连开、页签来回切、模型连问两遍）
+        并成一次扫描。这层不承诺"现在"—— 要盘上此刻的样子，走 ``refresh=True``。
+
+        计时用 ``time.monotonic()`` 而不是墙钟：系统时间被改（对表、夏令时）不该让一份
+        "刚取的"快照忽然变成过期或永不过期。
+        """
+        key = (str(path), str(out))
+        now = time.monotonic()
+        if not refresh:
+            hit = self._snapshots.get(key)
+            if hit is not None and now - hit[0] < SNAPSHOT_MAX_AGE_SECONDS:
+                self._snapshots[key] = self._snapshots.pop(key)  # 命中挪到队尾（LRU）
+                return hit[1]
+        # `out_path` 是"两个根"这次加进来的：外部事实源可能还是老签名（只会查一个根），
+        # 那就退回老调用 —— 少查一个根是"结果不全"，传错参数是"整页报错"，后者更糟。
+        res = (
+            spec.scan_project(str(path), out_path=str(out))
+            if _accepts(spec.scan_project, "out_path")
+            else spec.scan_project(str(path))
+        )
+        _require_scan_keys(res, self.spec_path)
+        self._snapshots[key] = (now, res)
+        while len(self._snapshots) > SNAPSHOT_MAX_ENTRIES:
+            self._snapshots.pop(next(iter(self._snapshots)))  # 队头是最久没碰过的那条
+        return res
+
+    def _summary(
+        self,
+        path: Path,
+        spec: Any,
+        out_path: Path | None = None,
+        *,
+        refresh: bool = False,
+    ) -> dict[str, Any]:
         """一部剧的现状（列表与详情共用）。阶段判据整个交给 ``spec.scan_project``。
 
         ``files`` / ``mtime`` **直接取它那一遍遍历的结果**，不再自己各走一遍全树。
@@ -648,16 +714,11 @@ class ProjectLibrary:
         ``out_path`` 是产物根下那个同名目录；不给就跟着 ``path``（单树布局）。
         一并交给事实源，是因为**"落点齐不齐"要分两个根问** ——
         只查资料根的话，`09_SHOTS` / `12_FILMS` 永远是"缺"。
+
+        ``refresh`` 交给 :meth:`_scan`（那个遍历是可以走快照的）。
         """
         out = out_path if out_path is not None else path
-        # `out_path` 是"两个根"这次加进来的：外部事实源可能还是老签名（只会查一个根），
-        # 那就退回老调用 —— 少查一个根是"结果不全"，传错参数是"整页报错"，后者更糟。
-        res = (
-            spec.scan_project(str(path), out_path=str(out))
-            if _accepts(spec.scan_project, "out_path")
-            else spec.scan_project(str(path))
-        )
-        _require_scan_keys(res, self.spec_path)
+        res = self._scan(spec, path, out, refresh=refresh)
         stages = []
         done = 0
         for label, rel, hits in res["stages"]:
@@ -690,13 +751,24 @@ class ProjectLibrary:
             "mtime": res["mtime"],
         }
 
-    def list(self, name: Any = None, limit: Any = None) -> dict[str, Any]:
+    def list(self, name: Any = None, limit: Any = None, refresh: Any = None) -> dict[str, Any]:
         """项目根下有哪些剧、各自到什么程度。
 
         ``exists: false`` **不是错误**（这份检出还没建过项目）：面板照这个说人话，
         而不是弹一个"读取失败"。``name`` 是子串过滤（找一部剧时不用滚列表）。
+
+        ``refresh=True`` 强制重扫，不吃快照（见 :meth:`_scan`）。默认吃 —— 列表是
+        "扫全部项目"的动作，是这一页里唯一值得合并的。默认那一下最多旧
+        :data:`SNAPSHOT_MAX_AGE_SECONDS` 秒；**哪几条路必须传它**：
+
+        * 用户按了"刷新"：他要的就是"盘上此刻是什么样"，给了他上一条快照等于骗人；
+        * 刚写完/刚搬完之后的回读：本库自己的写会 :meth:`_forget_snapshots`，但**别的进程**
+          （引擎侧的技能脚本）往项目里写东西时不会 —— 面板看不见"新写的分镜"正是这条路；
+        * 对话里的模型：它刚用别的工具写过东西，再来问列表，就得看得见自己写的。
+          （它与别的调用方一样有上限一秒的旧，所以工具表上也留了这个参数。）
         """
         cap = _as_int(limit, DEFAULT_LIST_LIMIT, where="limit", low=1, high=MAX_LIST_LIMIT)
+        fresh = _as_bool(refresh, False, where="refresh")
         query = name.strip() if isinstance(name, str) else ""
         out: dict[str, Any] = {
             "dir": str(self.directory),
@@ -719,7 +791,14 @@ class ProjectLibrary:
                 continue
             if query and query.lower() not in entry.name.lower():
                 continue
-            rows.append(self._summary(Path(entry.path), spec, self.out_directory / entry.name))
+            rows.append(
+                self._summary(
+                    Path(entry.path),
+                    spec,
+                    self.out_directory / entry.name,
+                    refresh=fresh,
+                )
+            )
         out["matched"] = len(rows)
         rows.sort(key=lambda row: (-row["mtime"], row["name"]))
         out["projects"] = rows[:cap]
@@ -744,6 +823,9 @@ class ProjectLibrary:
         目录本身仍然逐项对着 ``spec.PROJECT_DIRS`` 查 —— 规范里加了落点而面板没加格，
         ``gaps`` 会如实带出来，不会悄悄少一格。
         """
+        # 这一页的文件清单是**当场逐格列**的，体检要是走快照，同一页上就会出现
+        # "文件列了 12 个、角落却说这一格没料"这种自相矛盾的说法。一部剧的详情本来
+        # 就只有一次遍历的量级，所以下面那份 summary 一律重扫（见 _summary 的 refresh）。
         spec = self.spec()
         root = self._path(name)
         # 两个根：`09_SHOTS` / `12_FILMS` 在产物根下，其余全在资料根下 ——
@@ -841,7 +923,7 @@ class ProjectLibrary:
             "scope_gaps": list(scope_gaps(spec)),
             "scopes": list(order),
             "shelves": shelves,
-            "summary": self._summary(root, spec, out_root),
+            "summary": self._summary(root, spec, out_root, refresh=True),
             "novel": self.linked_novel(root),
         }
 
@@ -1024,6 +1106,9 @@ class ProjectLibrary:
             except OSError:
                 pass
             raise ProjectsError(f"写不进 {rel_text}：{err}") from err
+        # 这一下可能在项目里添了一个新文件（`created`），也可能改动了某一格的体量：
+        # 不丢快照的话，紧接着的那次刷新会照着旧键给出旧数字。
+        self._forget_snapshots()
         return {
             "name": root.name,
             "rel": rel_text,
@@ -1163,7 +1248,10 @@ class ProjectLibrary:
         }
         if novel is not None:
             out["novel"] = self.link_novel(path.name, novel, novel_dir=novel_dir)
-        out["summary"] = self._summary(path, spec, self.out_directory / path.name)
+        # 刚落完盘：快照全作废。这一份自己就是重扫的 —— 刚建出来的项目要是回一份旧快照，
+        # 面板会照着它说"这一格已经有料了"或"还没建"，两种都是刚做的事的反话。
+        self._forget_snapshots()
+        out["summary"] = self._summary(path, spec, self.out_directory / path.name, refresh=True)
         return out
 
     # ---- 把老结构搬到当前结构 -------------------------------------------
@@ -1233,7 +1321,10 @@ class ProjectLibrary:
             "conflicts": [item["rel"] for item in actions if item["state"] == "conflict"],
         }
         # 建完顺手回一份体检：面板不用为了"搬完长什么样"再跑一趟。
-        out["summary"] = self._summary(path, spec, out_path)
+        # 搬家（非 dry）动过盘 → 快照全作废，再重扫这一部（理由同 create）。
+        if not allow:
+            self._forget_snapshots()
+        out["summary"] = self._summary(path, spec, out_path, refresh=True)
         return out
 
     # ---- 给对话用的简报 -------------------------------------------------
@@ -1318,6 +1409,14 @@ PROJECTS_TOOLS: tuple[_Spec, ...] = (
                     "type": "string",
                     "description": "可选：按名字子串过滤（找某部剧时用，别把整表拉回来）",
                 },
+                "refresh": {
+                    "type": "boolean",
+                    "description": (
+                        "可选：默认吃一秒之内的体检快照（连着问几遍不会重扫全树）。"
+                        "你**刚用别的工具往项目里写过东西**、要确认盘上真的变了，就传 true —— "
+                        "宿主只知道自己写的那几笔，别的进程动过盘它不知道。"
+                    ),
+                },
             },
         },
     ),
@@ -1350,7 +1449,10 @@ def _validate(name: str, args: dict[str, Any]) -> dict[str, Any]:
         query = args.get("name")
         if query is not None and not isinstance(query, str):
             raise McpError("name 必须是字符串（子串过滤）")
-        return {"name": query}
+        fresh = args.get("refresh")
+        if fresh is not None and not isinstance(fresh, bool):
+            raise McpError("refresh 必须是 true / false")
+        return {"name": query, "refresh": fresh}
     if name == "brief":
         return {"name": args.get("name")}
     raise McpError(f"项目工具表里没有 {name}")
@@ -1439,6 +1541,8 @@ __all__ = [
     "PROJECTS_TOOLS",
     "PROJECT_SHELVES",
     "PROJECT_SUFFIXES",
+    "SNAPSHOT_MAX_AGE_SECONDS",
+    "SNAPSHOT_MAX_ENTRIES",
     "SPEC_NAME",
     "ProjectLibrary",
     "ProjectsClient",

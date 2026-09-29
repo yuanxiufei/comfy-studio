@@ -95,7 +95,12 @@ function sendBrief(): void {
         <FolderOpen :size="13" />
         <input v-model="projects.filter" type="search" :placeholder="t('studio.project.filter')" />
       </label>
-      <button type="button" class="prj__btn" :disabled="projects.loadingShelf" @click="projects.refresh()">
+      <button
+        type="button"
+        class="prj__btn"
+        :disabled="projects.loadingShelf"
+        @click="projects.refresh({ fresh: true })"
+      >
         <LoaderCircle v-if="projects.loadingShelf" :size="13" class="is-spinning" />
         <RefreshCw v-else :size="13" />
         <span>{{ t('studio.project.refresh') }}</span>

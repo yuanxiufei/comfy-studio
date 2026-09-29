@@ -1369,11 +1369,19 @@ class StudioHost:
         return str(self.novels.directory) if self.novels is not None else None
 
     def projects_list(self, params: Any, _ctx: RpcContext) -> dict[str, Any]:
-        """项目根下有哪些剧、各自什么进度；``exists: false`` = 这个检出还没建过项目（不是错误）。"""
+        """项目根下有哪些剧、各自什么进度；``exists: false`` = 这个检出还没建过项目（不是错误）。
+
+        ``refresh: true`` 强制重扫（不吃 :class:`comfy_studio.projects.ProjectLibrary`
+        那份体检快照）：面板那个「刷新」键与"刚写完东西的回读"都传它 ——
+        缓存只服务"连着问几遍"的自动路径，用户自己按的那一下必须看得见盘上此刻的样子。
+        """
         args = _object(params, "projects/list")
         name = args.get("name")
         if name is not None and not isinstance(name, str):
             raise RpcError(INVALID_PARAMS, "name 必须是字符串")
+        fresh = args.get("refresh")
+        if fresh is not None and not isinstance(fresh, bool):
+            raise RpcError(INVALID_PARAMS, "projects/list 的 refresh 必须是布尔值")
         limit = _int_param(
             args,
             "limit",
@@ -1383,7 +1391,7 @@ class StudioHost:
             method="projects/list",
         )
         try:
-            return self._projects().list(name, limit)
+            return self._projects().list(name, limit, refresh=fresh)
         except ProjectsError as err:
             raise RpcError(INTERNAL_ERROR, str(err)) from err
 

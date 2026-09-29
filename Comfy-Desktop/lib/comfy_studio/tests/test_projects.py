@@ -306,6 +306,107 @@ class ProjectsLibraryTest(unittest.TestCase):
         self.assertEqual(self.library.list(name="甲")["matched"], 1)
         self.assertEqual(self.library.list(name="没有这个")["matched"], 0)
 
+    # ---- 体检快照（列表的合并） -----------------------------------------
+    #
+    # 这一组钉的是"快照管什么、不管什么"。它**不**承诺"现在"：管的是"窗口之内连着问就并成
+    # 一次扫描"（窗口见 SNAPSHOT_MAX_AGE_SECONDS），要"现在"的调用走 refresh=True。
+    # 用例把窗口放大 / 压成 0 来钉行为，不去 sleep 等钟走 —— 测试不等钟。
+    #
+    # 另外钉住一件事：**它不靠 mtime 判断"盘上动过没有"**。设计稿那条建议是以"项目路径 +
+    # 顶层 mtime"为键，实测在本平台上撑不住（Windows 的目录时间戳延迟更新：往
+    # 08_STORYBOARDS/ 里新写一份分镜，那一格自己的 mtime 过一会儿才变），于是改成时间窗口。
+
+    def _pin_window(self, seconds: float):
+        return mock.patch.object(projects_module, "SNAPSHOT_MAX_AGE_SECONDS", seconds)
+
+    def _count_scans(self) -> list[str]:
+        """把事实源那份 ``scan_project`` 包一层计数：真走了一遍全树才 +1。"""
+        spec = self.library.spec()
+        real = spec.scan_project
+        calls: list[str] = []
+
+        def counting(name_or_path, **_kwargs):
+            calls.append(name_or_path)
+            return real(name_or_path)
+
+        spec.scan_project = counting
+        return calls
+
+    def test_list_coalesces_repeat_asks_inside_the_window(self) -> None:
+        """窗口之内：连着问几遍，不会把每一部剧重扫一遍。"""
+        self.library.create("甲剧")
+        self.library.create("乙剧")
+        calls = self._count_scans()
+        with self._pin_window(60.0):
+            self.library.list()
+            self.assertEqual(len(calls), 1, "甲剧这一部还没存过快照")
+            self.library.list()
+            self.assertEqual(len(calls), 1, "窗口之内：这一遍并进上一次")
+            self.library.list(refresh=True)
+            self.assertEqual(len(calls), 3, "refresh 是不吃快照的那一下：两部都重扫")
+            self.library.list()
+            self.assertEqual(len(calls), 3, "刚重扫过的又成了最新的一份")
+
+    def test_a_snapshot_past_the_window_is_not_reused(self) -> None:
+        """窗口之外一律重扫：快照不是"一直有效"，是"窗口之内算数"。"""
+        self.library.create("剧甲")
+        calls = self._count_scans()
+        with self._pin_window(0.0):
+            self.library.list()
+            self.library.list()
+        self.assertEqual(len(calls), 2)
+
+    def test_a_change_is_invisible_inside_the_window_and_visible_after_refresh(self) -> None:
+        """窗口之内的写入看不见 —— 这是这条优化划出来的界，界外那条路是 ``refresh=True``。"""
+        self.library.create("剧甲")
+        shot = self.root / "剧甲/09_SHOTS/EP01/SH001.mp4"
+        shot.parent.mkdir(parents=True)
+        with self._pin_window(60.0):
+            self.library.list()
+            stale = self.library.list()["projects"][0]
+            shot.write_bytes(b"ftyp")
+            self.assertEqual(self.library.list()["projects"][0]["files"], stale["files"])
+            self.assertEqual(self.library.list()["projects"][0]["stages"][1]["files"], 0)
+            # 面板那个「刷新」键走的就是这条：看得见盘上此刻的样子。
+            fresh = self.library.list(refresh=True)["projects"][0]
+            self.assertEqual(fresh["files"], stale["files"] + 1)
+            self.assertEqual(fresh["stages"][1]["files"], 1)
+        self.assertEqual(len(self.library._snapshots), 1, "一部剧只留一条，重扫是原地替换")
+
+    def test_our_own_writes_invalidate_the_snapshot(self) -> None:
+        """本库自己写的那一下（面板上改剧本）不会留下一份"还算数"的旧快照。"""
+        self.library.create("剧乙")
+        self.library.list()  # 盘上先摆着一份有效快照（create 自己也顺手存过一份）
+        calls = self._count_scans()
+        with self._pin_window(60.0):
+            self.library.list()
+            self.assertEqual(len(calls), 0, "没动过盘：回的该是上一份")
+            # 面板新写一份剧本：`base_digest=""` 的读法是"我读到的是这份还不存在"。
+            self.library.write("剧乙", "00_PROJECT/01_剧本/第01集.md", "# 第01集\n人写的\n", "")
+            rows = self.library.list()["projects"]
+            self.assertEqual(len(calls), 1, "自己写过就得重扫（不等窗口过）")
+            self.assertEqual(rows[0]["files"], 3, "两张种子空表 + 刚写的这一份")
+
+    def test_the_snapshot_store_is_bounded(self) -> None:
+        """留着的快照有上限：几十部剧来回翻，内存不能跟着项目数一直长。"""
+        for index in range(4):
+            self.library.create(f"剧{index}")
+        with self._pin_window(60.0), mock.patch.object(projects_module, "SNAPSHOT_MAX_ENTRIES", 2):
+            self.library.list()
+        self.assertEqual(len(self.library._snapshots), 2)
+
+    def test_tree_always_rescans(self) -> None:
+        """详情页当场逐格列文件，体检要是吃快照，同一页就会出现"列了 12 个、却说这格没料"。"""
+        self.library.create("剧丙")
+        calls = self._count_scans()
+        with self._pin_window(60.0):
+            self.library.list()
+            before = len(calls)
+            self.library.tree("剧丙")
+            self.assertEqual(len(calls), before + 1)
+            self.library.tree("剧丙")
+            self.assertEqual(len(calls), before + 2)
+
     def test_tree_groups_the_drop_points_and_truncates_long_ones(self) -> None:
         self.library.create("剧甲")
         script_dir = self.root / "剧甲/00_PROJECT/01_剧本"
@@ -946,6 +1047,30 @@ class ProjectsToolTableTest(unittest.IsolatedAsyncioTestCase):
             await self.client.call_tool("list", {"name": 5})
         self.assertIn("必须是字符串", str(typed.exception))
 
+    async def test_the_model_can_ask_for_a_fresh_list(self) -> None:
+        """模型刚用别的工具往项目里写过东西时，它得能要到"盘上此刻"那一份。
+
+        宿主只知道自己写的那几笔（``_forget_snapshots``）；别的进程写的它不知道，
+        所以这个口子必须留在工具表上，而不是只留在面板里。
+        """
+        tools = await self.client.list_tools()
+        listings = next(tool for tool in tools if tool.name == "list")
+        self.assertIn("refresh", listings.input_schema["properties"])
+        self.library.create("剧甲")
+        shot = self.root / "剧甲/09_SHOTS/EP01/SH001.mp4"
+        shot.parent.mkdir(parents=True)
+        first = json.loads((await self.client.call_tool("list", {}))["content"][0]["text"])
+        shot.write_bytes(b"ftyp")
+        cached = json.loads((await self.client.call_tool("list", {}))["content"][0]["text"])
+        self.assertEqual(cached["projects"][0]["files"], first["projects"][0]["files"])
+        fresh = json.loads(
+            (await self.client.call_tool("list", {"refresh": True}))["content"][0]["text"]
+        )
+        self.assertEqual(fresh["projects"][0]["files"], first["projects"][0]["files"] + 1)
+        with self.assertRaises(McpError) as wrong:
+            await self.client.call_tool("list", {"refresh": "yes"})
+        self.assertIn("true / false", str(wrong.exception))
+
 
 class RealSpecTest(unittest.TestCase):
     """对**真**那份规范：面板的格子必须一个落点都不漏，种子空表必须都在。
@@ -1104,11 +1229,28 @@ class ProjectsRpcTest(unittest.TestCase):
             ("projects_write", {"name": "甲", "rel": "  ", "text": "x"}),
             ("projects_read", {"name": "甲", "rel": "x.md", "whole": 5}),
             ("projects_list", {"name": 5}),
+            ("projects_list", {"refresh": "yes"}),
         ):
             with self.subTest(method=method, params=params):
                 with self.assertRaises(RpcError) as err:
                     getattr(self.host, method)(params, None)
                 self.assertEqual(err.exception.code, INVALID_PARAMS)
+
+    def test_refresh_over_rpc_asks_for_the_disk_as_it_is(self) -> None:
+        """面板那个「刷新」键走的就是这条：不是"再问一遍同样的东西"。
+
+        默认那一下（不带 ``refresh``）是列表自己的优化；带上的那一下是用户自己要看的。
+        """
+        self.host.projects_create({"name": "剧丁"}, None)
+        shot = self.root / "剧丁/09_SHOTS/EP01/SH001.mp4"
+        shot.parent.mkdir(parents=True)
+        self.host.projects_list({}, None)
+        stale = self.host.projects_list({}, None)["projects"][0]
+        shot.write_bytes(b"ftyp")
+        again = self.host.projects_list({}, None)["projects"][0]
+        self.assertEqual(again["files"], stale["files"])
+        fresh = self.host.projects_list({"refresh": True}, None)["projects"][0]
+        self.assertEqual(fresh["files"], stale["files"] + 1)
 
     def test_a_missing_project_is_an_internal_error_with_a_readable_message(self) -> None:
         with self.assertRaises(RpcError) as err:

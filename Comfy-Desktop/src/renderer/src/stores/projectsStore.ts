@@ -95,10 +95,16 @@ export const useProjectsStore = defineStore('studioProjects', () => {
     lastLink.value = null
   }
 
-  async function refresh(): Promise<void> {
+  // `fresh: true` = "盘上此刻的样子"，绕开宿主那份体检快照（见 projects.py 的 _scan）。
+  // 只有**用户自己按的那一下**（列表上那个刷新键）配得上它：快照的上限是一秒，
+  // 人手动不着；而被动那几下往往是连着来的 —— 三个页面轮着打开、写完东西回读 ——
+  // 那正是值得并成一次扫描的地方。宿主自己写的那几笔本来就作废旧快照（_forget_snapshots），
+  // 所以"保存之后回读"不吃 `fresh` 也看得见新写的文件。
+  async function refresh(options: { fresh?: boolean } = {}): Promise<void> {
     loadingShelf.value = true
     const outcome = await callStudio<ProjectListPayload>('projects/list', {
-      limit: PROJECT_LIST_LIMIT
+      limit: PROJECT_LIST_LIMIT,
+      refresh: options.fresh === true
     })
     loadingShelf.value = false
     loadedShelf.value = true

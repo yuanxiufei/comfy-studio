@@ -5912,6 +5912,26 @@ describe('getComfyStudioChatContentScript', () => {
       expect(lastListParams(bridge), '只发最后停下来的那一串').toEqual({ name: '乙剧' })
     })
 
+    it('asks for the disk as it is only when the user presses refresh', async () => {
+      const bridge = installBridge({ request: filteringHost() })
+      setupDom()
+      new Function(script)()
+      await openPanel()
+      await openProjects()
+
+      // 被动那几下（打开这一页、切页签）吃宿主那份一秒窗口的体检快照（projects.py 的 _scan）：
+      // 三个页面轮着打开不至于每次都把几十部剧重扫一遍。它给的是"上限一秒的旧"，而人正看着
+      // 这一页时够不着 —— 所以这里**不传** refresh。
+      expect(lastListParams(bridge)).toEqual({})
+
+      button('刷新')?.click()
+      await flush()
+
+      // 用户自己按的"刷新"是另一句话：我现在要看盘上是什么样。这一下要是也吃快照，就等于
+      // 给他一份自己刚看到的旧数 —— 而"别的程序刚往项目里写了一份分镜"正是最需要看见的时候。
+      expect(lastListParams(bridge)).toEqual({ refresh: true })
+    })
+
     it('clears the filter with Escape and lists everything again', async () => {
       const bridge = installBridge({ request: filteringHost() })
       setupDom()

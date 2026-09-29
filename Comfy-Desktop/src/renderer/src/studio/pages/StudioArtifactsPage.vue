@@ -83,7 +83,7 @@ function sampleOf(paths: readonly string[]): string[] {
         type="button"
         class="artifacts__btn"
         :disabled="projects.loadingShelf"
-        @click="projects.refresh()"
+        @click="projects.refresh({ fresh: true })"
       >
         <LoaderCircle v-if="projects.loadingShelf" :size="13" class="is-spinning" />
         <RefreshCw v-else :size="13" />
