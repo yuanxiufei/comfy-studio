@@ -301,8 +301,8 @@
         "Node name for S&R": "EmptySD3LatentImage"
       },
       "widgets_values": [
-        1920,
-        1080,
+        1344,
+        768,
         1
       ],
       "title": "空潜空间 16:9"
@@ -460,7 +460,7 @@
         "Node name for S&R": "SaveImage"
       },
       "widgets_values": [
-        "AI漫剧/分镜首帧/Shot1"
+        "剑噬天下/第01集/分镜/Shot1"
       ],
       "title": "保存图片"
     },
