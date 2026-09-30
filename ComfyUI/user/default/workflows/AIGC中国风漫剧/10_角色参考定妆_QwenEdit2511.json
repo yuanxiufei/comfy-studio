@@ -1,0 +1,749 @@
+{
+ "id": "jstx-ref-edit-2511",
+ "revision": 0,
+ "last_node_id": 14,
+ "last_link_id": 19,
+ "nodes": [
+  {
+   "id": 1,
+   "type": "UNETLoader",
+   "title": "Qwen-Edit 2511 DiT",
+   "pos": [
+    40,
+    60
+   ],
+   "size": [
+    280,
+    120
+   ],
+   "flags": {},
+   "order": 0,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "MODEL",
+     "type": "MODEL",
+     "links": [
+      1
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "UNETLoader"
+   },
+   "widgets_values": [
+    "qwen_image_edit_2511_int8_convrot.safetensors",
+    "default"
+   ]
+  },
+  {
+   "id": 2,
+   "type": "ModelSamplingAuraFlow",
+   "title": "Shift 3.1",
+   "pos": [
+    40,
+    220
+   ],
+   "size": [
+    280,
+    120
+   ],
+   "flags": {},
+   "order": 1,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "model",
+     "type": "MODEL",
+     "link": 1
+    }
+   ],
+   "outputs": [
+    {
+     "name": "MODEL",
+     "type": "MODEL",
+     "links": [
+      2
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "ModelSamplingAuraFlow"
+   },
+   "widgets_values": [
+    3.1
+   ]
+  },
+  {
+   "id": 3,
+   "type": "LoraLoaderModelOnly",
+   "title": "角色 LoRA (0.8)",
+   "pos": [
+    40,
+    360
+   ],
+   "size": [
+    280,
+    120
+   ],
+   "flags": {},
+   "order": 2,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "model",
+     "type": "MODEL",
+     "link": 2
+    }
+   ],
+   "outputs": [
+    {
+     "name": "MODEL",
+     "type": "MODEL",
+     "links": [
+      3
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "LoraLoaderModelOnly"
+   },
+   "widgets_values": [
+    "Qwen-国漫短剧3D CG质感角色V1_Qwen-国漫短剧3D CG质感角色V1.safetensors",
+    0.8
+   ]
+  },
+  {
+   "id": 4,
+   "type": "CLIPLoader",
+   "title": "CLIP",
+   "pos": [
+    40,
+    520
+   ],
+   "size": [
+    280,
+    120
+   ],
+   "flags": {},
+   "order": 3,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "CLIP",
+     "type": "CLIP",
+     "links": [
+      4,
+      5
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "CLIPLoader"
+   },
+   "widgets_values": [
+    "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+    "qwen_image",
+    "default"
+   ]
+  },
+  {
+   "id": 5,
+   "type": "VAELoader",
+   "title": "VAE",
+   "pos": [
+    40,
+    660
+   ],
+   "size": [
+    280,
+    120
+   ],
+   "flags": {},
+   "order": 4,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "VAE",
+     "type": "VAE",
+     "links": [
+      6,
+      7,
+      8
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "VAELoader"
+   },
+   "widgets_values": [
+    "qwen_image_vae.safetensors"
+   ]
+  },
+  {
+   "id": 6,
+   "type": "LoadImage",
+   "title": "参考图",
+   "pos": [
+    460,
+    60
+   ],
+   "size": [
+    280,
+    120
+   ],
+   "flags": {},
+   "order": 5,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "IMAGE",
+     "type": "IMAGE",
+     "links": [
+      9,
+      10
+     ],
+     "slot_index": 0
+    },
+    {
+     "name": "MASK",
+     "type": "MASK",
+     "links": null,
+     "slot_index": 1
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "LoadImage"
+   },
+   "widgets_values": [
+    "jstx_ref_zhang.png",
+    "image"
+   ]
+  },
+  {
+   "id": 7,
+   "type": "TextEncodeQwenImageEditPlus",
+   "title": "正向提示词",
+   "pos": [
+    460,
+    300
+   ],
+   "size": [
+    280,
+    120
+   ],
+   "flags": {},
+   "order": 6,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "clip",
+     "type": "CLIP",
+     "link": 4
+    },
+    {
+     "name": "vae",
+     "type": "VAE",
+     "link": 6
+    },
+    {
+     "name": "image1",
+     "type": "IMAGE",
+     "link": 9
+    }
+   ],
+   "outputs": [
+    {
+     "name": "CONDITIONING",
+     "type": "CONDITIONING",
+     "links": [
+      11
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "TextEncodeQwenImageEditPlus"
+   },
+   "widgets_values": [
+    "K-GM, 3D次时代CG风格渲染, PBR材质渲染, 戏剧性体积光, 次表面散射皮肤, 电影级布光, Unreal Engine 5, Chinese Guoman 3D style, character sheet of the SAME character as the reference image, keep the same face, the same hairstyle and the same costume as the reference image, full body turnaround, front view + left side view + back view, full body complete from head to toe, feet fully visible, not cropped, no cut off, clean neutral dark grey studio background, no text, no watermark"
+   ]
+  },
+  {
+   "id": 8,
+   "type": "TextEncodeQwenImageEditPlus",
+   "title": "负面提示词",
+   "pos": [
+    460,
+    560
+   ],
+   "size": [
+    280,
+    120
+   ],
+   "flags": {},
+   "order": 7,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "clip",
+     "type": "CLIP",
+     "link": 5
+    },
+    {
+     "name": "vae",
+     "type": "VAE",
+     "link": 7
+    },
+    {
+     "name": "image1",
+     "type": "IMAGE",
+     "link": 10
+    }
+   ],
+   "outputs": [
+    {
+     "name": "CONDITIONING",
+     "type": "CONDITIONING",
+     "links": [
+      12
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "TextEncodeQwenImageEditPlus"
+   },
+   "widgets_values": [
+    "人物分身，复制人，多余人物，多人重叠，人物五官变动，服饰跳变，手部畸形，肢体扭曲，画面抖动，闪烁，模糊，低清晰度，水印，英文文字，different face, changed hairstyle, changed costume, extra person, clone face, cropped head, cropped feet, text, watermark, low quality"
+   ]
+  },
+  {
+   "id": 9,
+   "type": "EmptySD3LatentImage",
+   "title": "空潜空间",
+   "pos": [
+    960,
+    60
+   ],
+   "size": [
+    280,
+    120
+   ],
+   "flags": {},
+   "order": 8,
+   "mode": 0,
+   "inputs": [],
+   "outputs": [
+    {
+     "name": "LATENT",
+     "type": "LATENT",
+     "links": [
+      13,
+      14,
+      15
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "EmptySD3LatentImage"
+   },
+   "widgets_values": [
+    2048,
+    1152,
+    1
+   ]
+  },
+  {
+   "id": 10,
+   "type": "ReferenceLatent",
+   "title": "参考潜空间(正)",
+   "pos": [
+    960,
+    300
+   ],
+   "size": [
+    280,
+    120
+   ],
+   "flags": {},
+   "order": 9,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "conditioning",
+     "type": "CONDITIONING",
+     "link": 11
+    },
+    {
+     "name": "latent",
+     "type": "LATENT",
+     "link": 13
+    }
+   ],
+   "outputs": [
+    {
+     "name": "CONDITIONING",
+     "type": "CONDITIONING",
+     "links": [
+      16
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "ReferenceLatent"
+   },
+   "widgets_values": []
+  },
+  {
+   "id": 11,
+   "type": "ReferenceLatent",
+   "title": "参考潜空间(负)",
+   "pos": [
+    960,
+    460
+   ],
+   "size": [
+    280,
+    120
+   ],
+   "flags": {},
+   "order": 10,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "conditioning",
+     "type": "CONDITIONING",
+     "link": 12
+    },
+    {
+     "name": "latent",
+     "type": "LATENT",
+     "link": 14
+    }
+   ],
+   "outputs": [
+    {
+     "name": "CONDITIONING",
+     "type": "CONDITIONING",
+     "links": [
+      17
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "ReferenceLatent"
+   },
+   "widgets_values": []
+  },
+  {
+   "id": 12,
+   "type": "KSampler",
+   "title": "KSampler",
+   "pos": [
+    960,
+    640
+   ],
+   "size": [
+    280,
+    120
+   ],
+   "flags": {},
+   "order": 11,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "model",
+     "type": "MODEL",
+     "link": 3
+    },
+    {
+     "name": "positive",
+     "type": "CONDITIONING",
+     "link": 16
+    },
+    {
+     "name": "negative",
+     "type": "CONDITIONING",
+     "link": 17
+    },
+    {
+     "name": "latent_image",
+     "type": "LATENT",
+     "link": 15
+    }
+   ],
+   "outputs": [
+    {
+     "name": "LATENT",
+     "type": "LATENT",
+     "links": [
+      18
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "KSampler"
+   },
+   "widgets_values": [
+    42,
+    30,
+    4.0,
+    "euler",
+    "normal",
+    1.0
+   ]
+  },
+  {
+   "id": 13,
+   "type": "VAEDecode",
+   "title": "VAE Decode",
+   "pos": [
+    1400,
+    640
+   ],
+   "size": [
+    280,
+    120
+   ],
+   "flags": {},
+   "order": 12,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "samples",
+     "type": "LATENT",
+     "link": 18
+    },
+    {
+     "name": "vae",
+     "type": "VAE",
+     "link": 8
+    }
+   ],
+   "outputs": [
+    {
+     "name": "IMAGE",
+     "type": "IMAGE",
+     "links": [
+      19
+     ],
+     "slot_index": 0
+    }
+   ],
+   "properties": {
+    "Node name for S&R": "VAEDecode"
+   },
+   "widgets_values": []
+  },
+  {
+   "id": 14,
+   "type": "SaveImage",
+   "title": "保存图片",
+   "pos": [
+    1400,
+    800
+   ],
+   "size": [
+    280,
+    120
+   ],
+   "flags": {},
+   "order": 13,
+   "mode": 0,
+   "inputs": [
+    {
+     "name": "images",
+     "type": "IMAGE",
+     "link": 19
+    }
+   ],
+   "outputs": [],
+   "properties": {
+    "Node name for S&R": "SaveImage"
+   },
+   "widgets_values": [
+    "剑噬天下/第01集/定妆/REF_test"
+   ]
+  }
+ ],
+ "links": [
+  [
+   1,
+   1,
+   0,
+   2,
+   0,
+   "MODEL"
+  ],
+  [
+   2,
+   2,
+   0,
+   3,
+   0,
+   "MODEL"
+  ],
+  [
+   3,
+   3,
+   0,
+   12,
+   0,
+   "MODEL"
+  ],
+  [
+   4,
+   4,
+   0,
+   7,
+   0,
+   "CLIP"
+  ],
+  [
+   5,
+   4,
+   0,
+   8,
+   0,
+   "CLIP"
+  ],
+  [
+   6,
+   5,
+   0,
+   7,
+   1,
+   "VAE"
+  ],
+  [
+   7,
+   5,
+   0,
+   8,
+   1,
+   "VAE"
+  ],
+  [
+   8,
+   5,
+   0,
+   13,
+   1,
+   "VAE"
+  ],
+  [
+   9,
+   6,
+   0,
+   7,
+   2,
+   "IMAGE"
+  ],
+  [
+   10,
+   6,
+   0,
+   8,
+   2,
+   "IMAGE"
+  ],
+  [
+   11,
+   7,
+   0,
+   10,
+   0,
+   "CONDITIONING"
+  ],
+  [
+   12,
+   8,
+   0,
+   11,
+   0,
+   "CONDITIONING"
+  ],
+  [
+   13,
+   9,
+   0,
+   10,
+   1,
+   "LATENT"
+  ],
+  [
+   14,
+   9,
+   0,
+   11,
+   1,
+   "LATENT"
+  ],
+  [
+   15,
+   9,
+   0,
+   12,
+   3,
+   "LATENT"
+  ],
+  [
+   16,
+   10,
+   0,
+   12,
+   1,
+   "CONDITIONING"
+  ],
+  [
+   17,
+   11,
+   0,
+   12,
+   2,
+   "CONDITIONING"
+  ],
+  [
+   18,
+   12,
+   0,
+   13,
+   0,
+   "LATENT"
+  ],
+  [
+   19,
+   13,
+   0,
+   14,
+   0,
+   "IMAGE"
+  ]
+ ],
+ "groups": [],
+ "config": {},
+ "extra": {
+  "ds": {
+   "scale": 1.0,
+   "offset": [
+    0,
+    0
+   ]
+  }
+ },
+ "version": 0.4
+}

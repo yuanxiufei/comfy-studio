@@ -1,0 +1,571 @@
+{
+  "last_node_id": 10,
+  "last_link_id": 11,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "UNETLoader",
+      "pos": [
+        0,
+        0
+      ],
+      "size": [
+        360,
+        82
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "unet_name",
+          "type": "COMBO"
+        },
+        {
+          "name": "weight_dtype",
+          "type": "COMBO"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            1
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "UNETLoader"
+      },
+      "widgets_values": [
+        "qwen_image_2.1_int8_convrot.safetensors",
+        "default"
+      ],
+      "title": "Qwen-2.1 DiT (int8)"
+    },
+    {
+      "id": 2,
+      "type": "CLIPLoader",
+      "pos": [
+        420,
+        0
+      ],
+      "size": [
+        360,
+        106
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip_name",
+          "type": "COMBO"
+        },
+        {
+          "name": "type",
+          "type": "COMBO"
+        },
+        {
+          "name": "device",
+          "type": "COMBO"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "CLIP",
+          "type": "CLIP",
+          "links": [
+            2
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "CLIPLoader"
+      },
+      "widgets_values": [
+        "qwen3vl_8b_int8_convrot.safetensors",
+        "qwen_image",
+        "default"
+      ],
+      "title": "TE Qwen3-VL-8B (2.1 分支)"
+    },
+    {
+      "id": 3,
+      "type": "VAELoader",
+      "pos": [
+        840,
+        0
+      ],
+      "size": [
+        360,
+        58
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "vae_name",
+          "type": "COMBO"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "VAE",
+          "type": "VAE",
+          "links": [
+            3,
+            5
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAELoader"
+      },
+      "widgets_values": [
+        "qwen_image_2.1_vae_bf16.safetensors"
+      ],
+      "title": "VAE (2.1 专用)"
+    },
+    {
+      "id": 4,
+      "type": "LoadImage",
+      "pos": [
+        0,
+        160
+      ],
+      "size": [
+        360,
+        320
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "image",
+          "type": "COMBO",
+          "widget": {
+            "name": "image"
+          }
+        },
+        {
+          "name": "upload",
+          "type": "IMAGEUPLOAD",
+          "widget": {
+            "name": "upload"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            4
+          ]
+        },
+        {
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "jstx_ref_libaiwan.png",
+        "image"
+      ],
+      "title": "参考图（改这里）"
+    },
+    {
+      "id": 5,
+      "type": "TextEncodeQwenImage21",
+      "pos": [
+        420,
+        200
+      ],
+      "size": [
+        460,
+        380
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "clip",
+          "type": "CLIP",
+          "link": 2
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 3
+        },
+        {
+          "name": "image_1",
+          "type": "IMAGE",
+          "link": 4
+        }
+      ],
+      "outputs": [
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "links": [
+            7
+          ]
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "links": [
+            8
+          ]
+        },
+        {
+          "name": "latent",
+          "type": "LATENT",
+          "links": [
+            9
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "TextEncodeQwenImage21"
+      },
+      "widgets_values": [
+        "K-GM, 3D次时代CG风格渲染, PBR材质渲染, 浅景深, 高精度雕刻模型, 戏剧性体积光, 次表面散射皮肤, 烟雾模拟, 电影感氛围, 高精度3D模型, 中国风场景, 4K高清纹理, 电影级布光, Octane渲染器质感, Unreal Engine 5, Chinese Guoman 3D style, East Asian adult face, character reference sheet, 2048x1536, 4:3 horizontal board, four equal columns from left to right. Column 1: front upper-body portrait of [角色名], head and shoulders to waist, face clearly visible. Column 2: headless front full-body orthographic view of [角色名]. Column 3: headless exact 90-degree side full-body orthographic view of [角色名]. Column 4: headless exact back full-body orthographic view of [角色名]. Columns 2-4 have no head, no face, no eyes, no ears, no hair, no crown and no headwear; the neck is cut cleanly at the collar and the background passes through the former head area. Character details: [年龄/身份], [脸型/五官], [发型/发色], [眼睛], [身高体型], [服装], [配饰/道具]. Standard orthographic projection, no 3/4 view, no perspective distortion, same costume, same body proportion, same pose, full body from neck to feet, no clone, no text, no watermark, all labels in simplified Chinese.",
+        "heads in columns 2-4, faces in columns 2-4, hair in columns 2-4, crowns in columns 2-4, 后脑勺 in columns 2-4, 三视图带头, 人物分身, 复制人, 多余人物, 角色增殖, 多人重叠, 3/4侧视, 四分之三侧脸, 透视变形, 动态头发, 动态衣摆, 肢体畸形, 手部畸形, 多余手指, 画面抖动, 闪烁, 模糊, 低清晰度, 水印, 英文文字, 乱码, 错别字, 拼接痕迹, 蒙太奇, 版式混乱",
+        1536
+      ],
+      "title": "2.1 正/负词 + latent"
+    },
+    {
+      "id": 6,
+      "type": "ModelSamplingAuraFlow",
+      "pos": [
+        0,
+        520
+      ],
+      "size": [
+        280,
+        58
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 1
+        },
+        {
+          "name": "shift",
+          "type": "FLOAT",
+          "widget": {
+            "name": "shift"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "MODEL",
+          "type": "MODEL",
+          "links": [
+            6
+          ],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "ModelSamplingAuraFlow"
+      },
+      "widgets_values": [
+        3.1
+      ]
+    },
+    {
+      "id": 7,
+      "type": "KSampler",
+      "pos": [
+        940,
+        200
+      ],
+      "size": [
+        380,
+        262
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "model",
+          "type": "MODEL",
+          "link": 6
+        },
+        {
+          "name": "positive",
+          "type": "CONDITIONING",
+          "link": 7
+        },
+        {
+          "name": "negative",
+          "type": "CONDITIONING",
+          "link": 8
+        },
+        {
+          "name": "latent_image",
+          "type": "LATENT",
+          "link": 9
+        },
+        {
+          "name": "seed",
+          "type": "INT"
+        },
+        {
+          "name": "steps",
+          "type": "INT"
+        },
+        {
+          "name": "cfg",
+          "type": "FLOAT"
+        },
+        {
+          "name": "sampler_name",
+          "type": "COMBO"
+        },
+        {
+          "name": "scheduler",
+          "type": "COMBO"
+        },
+        {
+          "name": "denoise",
+          "type": "FLOAT"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "LATENT",
+          "type": "LATENT",
+          "links": [
+            10
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "KSampler"
+      },
+      "widgets_values": [
+        42,
+        30,
+        4.0,
+        "euler",
+        "simple",
+        1.0
+      ],
+      "title": "KSampler"
+    },
+    {
+      "id": 8,
+      "type": "VAEDecode",
+      "pos": [
+        1360,
+        200
+      ],
+      "size": [
+        210,
+        46
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "samples",
+          "type": "LATENT",
+          "link": 10
+        },
+        {
+          "name": "vae",
+          "type": "VAE",
+          "link": 5
+        }
+      ],
+      "outputs": [
+        {
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            11
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "VAEDecode"
+      },
+      "widgets_values": [],
+      "title": "VAE Decode"
+    },
+    {
+      "id": 9,
+      "type": "SaveImage",
+      "pos": [
+        1360,
+        300
+      ],
+      "size": [
+        380,
+        120
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "images",
+          "type": "IMAGE",
+          "link": 11
+        },
+        {
+          "name": "filename_prefix",
+          "type": "STRING"
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "SaveImage"
+      },
+      "widgets_values": [
+        "剑噬天下/第01集/编辑/Subject1"
+      ],
+      "title": "保存图片"
+    },
+    {
+      "id": 10,
+      "type": "MarkdownNote",
+      "pos": [
+        -620,
+        0
+      ],
+      "size": [
+        540,
+        620
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "title": "配方与选型依据（2.1 编辑线）",
+      "properties": {},
+      "color": "#432",
+      "bgcolor": "#653",
+      "widgets_values": [
+        "# 配方与选型依据（Qwen-Image 2.1 编辑线）\n\n## 为什么单开一支，而不是改 01_角色定妆板_Qwen2512\n01 的笔记已列两条实测反对理由：画风 LoRA 在 2.1 上仅 128/720 = 17.8% 命中；\n2.1 不挂参考图时 latent 只能是 resolution x resolution 正方形。\n所以本支**不承担定妆板职责**，只做 2.1 的原本定位 —— **参考图驱动**。\n\n## 三件套必须同代，别混\n- DiT `qwen_image_2.1_int8_convrot`：引擎按 `qwen_image21_keys` 自动识别\n  （`comfy/model_detection.py`），无需额外开关。\n- VAE `qwen_image_2.1_vae_bf16`：与 2512 的 `qwen_image_vae` 不通用。\n- 文本编码器 `qwen3vl_8b_int8_convrot`：**唯一能进 2.1 分支的档**。\n  `comfy/sd.py` 的 `CLIPType.QWEN_IMAGE` 分支要求权重被判成 `TEModel.QWEN3VL_8B`。\n  池子里 2026-09-29 新进的两支 `qwen3.5_9b_qwen_image_2.1_pe_t2i/i2i` 会被判成\n  `TEModel.QWEN35_9B`，走 `qwen35` 通用分支，**不是 2.1 的拼接分支**，不要用。\n  实测（读 safetensors 头）：`qwen3vl_8b` 含 18 个 deepstack 键，两支 9B 为 0 个。\n- `CLIPLoader` 的 type 仍填 `qwen_image`：引擎 type 列表里没有 `qwen_image21`。\n\n## 本支不挂画风 LoRA\n01 用的 `Qwen-国漫短剧3D CG质感角色V1` 在 2.1 上仅 17.8% 键名命中，注入等于噪声，\n故本支不接 LoRA，风格改由提示词承载（正面词沿用 01 原文）。\n池子里另有 2.1 专属的 `qwen-image-2.1-consistency` / `Qwen2.1_Anime_consistency`\n/ `qwen2.1_orbit_alpha` / `Qwen-Image-2.1-Fun-Acc-4Step`，但**本仓尚未实测**，别直接写进配方。\n\n## 采样参数：部分无出处，已标注\n- `ModelSamplingAuraFlow` shift=3.1：2.1 在本仓**没有官方蓝图**\n  （`blueprints/` 只有 Text to Image (Qwen-Image 2512) 与 Image Edit (Qwen 2511)），\n  此处沿用 2512 的 3.1，两者 model_sampling 同族（ModelType.FLUX）。**未经实跑验证。**\n- KSampler euler/simple、30 步、cfg 4.0：与 `10_角色参考定妆_QwenEdit2511` 编辑线一致。\n- `TextEncodeQwenImage21.resolution`：参考图按约 resolution x resolution 等比缩放；\n  latent 取**第一张参考图**的尺寸，填 0 则保留参考图原尺寸。\n\n## 已知风险（实跑后请回填）\n1. `image_1` 是 Autogrow 动态槽，此处按展开名写；前端若未接上，手动连 LoadImage -> image_1。\n2. 无 2.1 官方蓝图，shift / 步数 / cfg 均为借用，画质不达预期时优先调 shift。\n3. 本机 RTX A5000（SM 8.6 / 22.5GB）：凡 `*nvfp4*` / `*awq*` 档不要选。\n"
+      ]
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      6,
+      0,
+      "MODEL"
+    ],
+    [
+      2,
+      2,
+      0,
+      5,
+      0,
+      "CLIP"
+    ],
+    [
+      3,
+      3,
+      0,
+      5,
+      1,
+      "VAE"
+    ],
+    [
+      4,
+      4,
+      0,
+      5,
+      2,
+      "IMAGE"
+    ],
+    [
+      5,
+      3,
+      0,
+      8,
+      1,
+      "VAE"
+    ],
+    [
+      6,
+      6,
+      0,
+      7,
+      0,
+      "MODEL"
+    ],
+    [
+      7,
+      5,
+      0,
+      7,
+      1,
+      "CONDITIONING"
+    ],
+    [
+      8,
+      5,
+      1,
+      7,
+      2,
+      "CONDITIONING"
+    ],
+    [
+      9,
+      5,
+      2,
+      7,
+      3,
+      "LATENT"
+    ],
+    [
+      10,
+      7,
+      0,
+      8,
+      0,
+      "LATENT"
+    ],
+    [
+      11,
+      8,
+      0,
+      9,
+      0,
+      "IMAGE"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {},
+  "version": 0.4
+}
