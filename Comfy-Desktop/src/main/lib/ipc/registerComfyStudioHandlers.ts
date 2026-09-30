@@ -46,6 +46,18 @@ export type ComfyStudioRequestResult =
 
 const hosts = new Map<string, ComfyStudioHost>()
 
+/** Creation in flight, keyed like `hosts`.
+ *
+ *  Building a host awaits `installations.get`, so a bare `hosts.get` check is not
+ *  enough to make `hostFor` a get-or-create: every caller that arrives during that
+ *  await sees an empty map and builds its own process. A panel opening fires
+ *  several requests at once, and one sighting left eight hosts under a single
+ *  installation, spawned 41ms apart. Worse, they all `hosts.set` the same key —
+ *  the losers are unreachable, so `stopAllComfyStudioHosts` cannot stop them and
+ *  they outlive the app. This map is what makes the concurrent callers share one
+ *  creation instead of racing. */
+const hostsStarting = new Map<string, Promise<ComfyStudioHost>>()
+
 function resolveInstallationId(
   event: IpcMainInvokeEvent,
   explicit: string | null | undefined
@@ -81,11 +93,28 @@ async function statusFor(installationId: string | null): Promise<ComfyStudioStat
   return { installationId, available: true, running: false, comfyuiDir: command.comfyuiDir }
 }
 
-/** Get-or-create the host for an installation. Does not start the process. */
+/** Get-or-create the host for an installation. Does not start the process.
+ *
+ *  Concurrent callers share one creation: see `hostsStarting`. */
 async function hostFor(installationId: string): Promise<ComfyStudioHost> {
   const existing = hosts.get(installationId)
   if (existing) return existing
 
+  const starting = hostsStarting.get(installationId)
+  if (starting) return starting
+
+  const pending = createHost(installationId)
+  hostsStarting.set(installationId, pending)
+  try {
+    return await pending
+  } finally {
+    hostsStarting.delete(installationId)
+  }
+}
+
+/** Build the host for an installation. Callers go through `hostFor`, which is what
+ *  keeps two of these from landing under the same key. */
+async function createHost(installationId: string): Promise<ComfyStudioHost> {
   const installation = await installations.get(installationId)
   if (!installation) throw new ComfyStudioError(`找不到安装记录 ${installationId}`)
   const command = resolveStudioCommand(installation)
